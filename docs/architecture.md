@@ -280,3 +280,33 @@ Typography:
 - Chrome: `system-ui`, 13px.
 
 Theme follows `prefers-color-scheme`, overridable via `settings.theme` (`data-theme` on `<html>`).
+
+## Build & test
+
+Per-OS prerequisites are in `README.md`. From the repository root:
+
+```sh
+pnpm -C app install --frozen-lockfile
+cargo test --workspace                                  # or: cargo test -p mdgj-core
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+pnpm -C app check && pnpm -C app test && pnpm -C app build
+pnpm -C app tauri dev                                   # MDGJ_JOURNAL_DIR=/tmp/j for a scratch journal
+pnpm -C app dev                                         # UI only, in a browser, on the mock backend
+pnpm -C app tauri build                                 # bundles in target/release/bundle/
+pnpm -C app tauri ios build --target aarch64-sim --debug  # after `tauri ios init`; needs full Xcode
+```
+
+- Tests don't use the network: the crates test against a mock `Http` and against `file://` remotes. End-to-end tests that need github.com, such as those against `dcxSt/mdgitjournal-test`, are `#[ignore]`d. Run them with `cargo test --workspace -- --ignored`.
+- `MDGJ_GITHUB_CLIENT_ID` and `MDGJ_GITHUB_APP_SLUG` are read at compile time. The registered client ID goes in `.cargo/config.toml` `[env]`, and a real environment variable overrides it. `DEFAULT_CLIENT_ID` stays the placeholder.
+- `MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml` must equal `bundle.macOS.minimumSystemVersion`.
+- The version is repeated across several files; `RELEASING.md` lists them.
+
+CI (`.github/workflows/`):
+- **`ci.yml`** runs on pushes to `main` and on pull requests:
+  - Rust fmt, clippy and tests on Ubuntu and macOS.
+  - Frontend check, tests and build.
+  - Unsigned `tauri build` bundles on Ubuntu 22.04 and macOS, uploaded as artifacts.
+  - An iOS Simulator build, allowed to fail until `gen/apple` is committed.
+- **`release.yml`** runs on `v*` tags. It creates a draft GitHub Release with a universal macOS `.dmg` and the Linux AppImage, `.deb` and `.rpm`.
+- **`pages.yml`** deploys `site/` to GitHub Pages.

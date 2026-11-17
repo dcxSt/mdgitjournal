@@ -1,0 +1,42 @@
+# Maintainer: Stephen Fay <dcxstephen at gmail dot com>
+
+pkgname=mdgitjournal-bin
+_pkgname=mdgitjournal
+_appid=xyz.stephenfay.mdgitjournal
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A minimal markdown journal synced with git (release build)'
+arch=('x86_64')
+url='https://mdgitjournal.stephenfay.xyz'
+license=('MIT')
+depends=('cairo' 'dbus' 'gcc-libs' 'gdk-pixbuf2' 'glib2' 'glibc' 'gtk3' 'hicolor-icon-theme'
+         'libsoup3' 'pango' 'webkit2gtk-4.1' 'zlib')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+options=('!debug')
+# The binary comes from the release .deb; the desktop file, metainfo, icons and licence come
+# from the same tag's source, so both packages install identical files.
+_repo=https://github.com/dcxSt/mdgitjournal
+source=("$_pkgname-$pkgver-amd64.deb::$_repo/releases/download/v$pkgver/${_pkgname}_${pkgver}_amd64.deb"
+        "$_pkgname-$pkgver.tar.gz::$_repo/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP'
+            'SKIP')
+
+package() {
+  # makepkg has already unpacked the .deb, leaving data.tar.gz.
+  bsdtar -xf data.tar.gz
+  install -Dm755 "usr/bin/$_pkgname" -t "$pkgdir/usr/bin/"
+
+  cd "$_pkgname-$pkgver"
+  install -Dm644 "packaging/linux/$_appid.desktop" -t "$pkgdir/usr/share/applications/"
+  install -Dm644 "packaging/linux/$_appid.metainfo.xml" -t "$pkgdir/usr/share/metainfo/"
+
+  local icons=app/src-tauri/icons hicolor="$pkgdir/usr/share/icons/hicolor"
+  install -Dm644 "$icons/32x32.png" "$hicolor/32x32/apps/$_appid.png"
+  install -Dm644 "$icons/128x128.png" "$hicolor/128x128/apps/$_appid.png"
+  install -Dm644 "$icons/128x128@2x.png" "$hicolor/256x256/apps/$_appid.png"
+  install -Dm644 "$icons/icon.png" "$hicolor/512x512/apps/$_appid.png"
+  install -Dm644 assets/icon.svg "$hicolor/scalable/apps/$_appid.svg"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

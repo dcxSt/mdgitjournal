@@ -2379,11 +2379,13 @@ dependencies = [
  "mdgj-core",
  "mdgj-git",
  "mdgj-github",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
 ]
 
 [[package]]

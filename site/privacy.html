@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy · mdgitjournal</title>
+  <meta name="description" content="mdgitjournal collects no data.">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <p><a href="./">mdgitjournal</a></p>
+    <h1>Privacy</h1>
+
+    <p><strong>mdgitjournal collects no data.</strong></p>
+
+    <p>Your journal lives on your device and, if you connect one, in the GitHub repository you choose. There is no mdgitjournal server. Nobody else receives a copy, the developer included.</p>
+
+    <ul>
+      <li><strong>No tracking.</strong> No analytics, telemetry, crash reports, advertising or accounts.</li>
+      <li><strong>Network.</strong> Without GitHub, the app makes no network connections. With GitHub connected, it talks only to <code>github.com</code> and <code>api.github.com</code>, and only to:
+        <ul>
+          <li>sign you in, and renew that sign-in;</li>
+          <li>read your GitHub user name for commit authorship, and list the repositories you installed the app on;</li>
+          <li>fetch, which it does on launch, when its window regains focus, and every 5 minutes by default (adjustable or off in Settings);</li>
+          <li>pull, push, or connect a repository when you ask.</li>
+        </ul>
+      </li>
+      <li><strong>Tokens</strong> stay on your device, in the Keychain on macOS and iOS or the Secret Service on Linux. Without a Secret Service, they go in a file only your user can read. They are never written into your journal or its git configuration.</li>
+      <li><strong>Images</strong> you add are re-encoded on your device, and all their metadata, including location, is removed.</li>
+    </ul>
+
+    <p>GitHub's handling of your repository and account is covered by the <a href="https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>. If you install from the App Store, Apple's privacy policy covers the store.</p>
+
+    <p>This website sets no cookies and loads nothing from third parties. It is hosted on GitHub Pages, which may log visitors' IP addresses for security.</p>
+
+    <p>Questions: <a href="https://github.com/dcxSt/mdgitjournal/issues">open an issue</a>.</p>
+
+    <p>Last updated: 16 November 2026.</p>
+  </main>
+
+  <footer>
+    <a href="./">mdgitjournal</a> ·
+    <a href="https://github.com/dcxSt/mdgitjournal">GitHub</a>
+  </footer>
+</body>
+</html>

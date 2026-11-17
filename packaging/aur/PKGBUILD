@@ -1,0 +1,49 @@
+# Maintainer: Stephen Fay <dcxstephen at gmail dot com>
+
+pkgname=mdgitjournal
+_appid=xyz.stephenfay.mdgitjournal
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A minimal markdown journal synced with git'
+arch=('x86_64' 'aarch64')
+url='https://mdgitjournal.stephenfay.xyz'
+license=('MIT')
+depends=('cairo' 'dbus' 'gcc-libs' 'gdk-pixbuf2' 'glib2' 'glibc' 'gtk3' 'hicolor-icon-theme'
+         'libsoup3' 'pango' 'webkit2gtk-4.1' 'zlib')
+makedepends=('cargo' 'nodejs' 'pnpm')
+# The release profile strips and runs LTO itself; makepkg's -flto CFLAGS often break linking
+# the bundled C code (libgit2, OpenSSL) into a Rust binary.
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/dcxSt/mdgitjournal/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+  pnpm -C app install --frozen-lockfile
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="$PWD/target"
+  # Everything after `--` goes to cargo; prepare() already fetched all crates.
+  pnpm -C app tauri build --no-bundle -- --frozen
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/mdgitjournal -t "$pkgdir/usr/bin/"
+  install -Dm644 "packaging/linux/$_appid.desktop" -t "$pkgdir/usr/share/applications/"
+  install -Dm644 "packaging/linux/$_appid.metainfo.xml" -t "$pkgdir/usr/share/metainfo/"
+
+  local icons=app/src-tauri/icons hicolor="$pkgdir/usr/share/icons/hicolor"
+  install -Dm644 "$icons/32x32.png" "$hicolor/32x32/apps/$_appid.png"
+  install -Dm644 "$icons/128x128.png" "$hicolor/128x128/apps/$_appid.png"
+  install -Dm644 "$icons/128x128@2x.png" "$hicolor/256x256/apps/$_appid.png"
+  install -Dm644 "$icons/icon.png" "$hicolor/512x512/apps/$_appid.png"
+  install -Dm644 assets/icon.svg "$hicolor/scalable/apps/$_appid.svg"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}

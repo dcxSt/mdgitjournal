@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=mdgitjournal
+GenericName=Journal
+Comment=A minimal markdown journal synced with git
+Exec=mdgitjournal
+Icon=xyz.stephenfay.mdgitjournal
+Terminal=false
+Categories=Office;
+Keywords=markdown;journal;diary;notes;git;
+StartupWMClass=mdgitjournal

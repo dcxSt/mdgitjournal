@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libdbus-1-dev pkg-config
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy -c rustfmt --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # End-to-end tests against github.com are #[ignore]d, so this stays offline.
+      - run: cargo test --workspace
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: app/package.json
+          cache: true
+          cache_dependency_path: app/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - run: pnpm -C app install --frozen-lockfile
+      - run: pnpm -C app check
+      - run: pnpm -C app test
+      - run: pnpm -C app build
+
+  bundle:
+    name: Bundle (${{ matrix.os }})
+    needs: [rust, frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Older glibc than ubuntu-latest, so the packages run on more distributions.
+          - os: ubuntu-22.04
+            artifacts: |
+              target/release/bundle/appimage/*.AppImage
+              target/release/bundle/deb/*.deb
+              target/release/bundle/rpm/*.rpm
+          # The .app ships inside the .dmg; upload-artifact would drop its executable bits.
+          - os: macos-latest
+            artifacts: target/release/bundle/dmg/*.dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libdbus-1-dev pkg-config librsvg2-dev
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: app/package.json
+          cache: true
+          cache_dependency_path: app/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - run: pnpm -C app install --frozen-lockfile
+      - name: Build unsigned bundles
+        run: pnpm -C app tauri build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mdgitjournal-${{ runner.os }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+
+  ios-sim:
+    name: iOS Simulator
+    needs: [rust, frontend]
+    runs-on: macos-latest
+    # Allowed to fail for now: until app/src-tauri/gen/apple is committed, this job builds a
+    # throwaway Xcode project from `tauri ios init`.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: app/package.json
+          cache: true
+          cache_dependency_path: app/pnpm-lock.yaml
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - run: pnpm -C app install --frozen-lockfile
+      - name: Generate the Xcode project
+        if: hashFiles('app/src-tauri/gen/apple/project.yml') == ''
+        run: pnpm -C app tauri ios init --ci
+      - run: pnpm -C app tauri ios build --target aarch64-sim --debug --no-sign

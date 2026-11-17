@@ -19,7 +19,11 @@ chrono.workspace = true
 mdgj-core.workspace = true
 mdgj-git.workspace = true
 mdgj-github.workspace = true
+percent-encoding = "2.3.2"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = ["protocol-asset"] }
 tauri-plugin-opener.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

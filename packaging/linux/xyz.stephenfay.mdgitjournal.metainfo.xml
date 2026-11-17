@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>xyz.stephenfay.mdgitjournal</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>mdgitjournal</name>
+  <summary>Minimal markdown journal synced with git</summary>
+  <developer id="xyz.stephenfay">
+    <name>Stephen Fay</name>
+  </developer>
+  <description>
+    <p>
+      A small, fast markdown journal. Every entry is a plain .md file in an ordinary git
+      repository, so you have version history from the first keystroke, offline and without an
+      account.
+    </p>
+    <ul>
+      <li>Two views of the same text: monospace source, or a quiet serif view that keeps the markdown visible</li>
+      <li>Never changes a byte you didn't touch</li>
+      <li>Optional sync with one GitHub repository, with explicit Pull and Commit and Push</li>
+      <li>When edits collide, both versions are kept; text is never lost</li>
+      <li>Images are stored as small JPEGs with all metadata removed</li>
+      <li>No telemetry, no analytics, no server</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">xyz.stephenfay.mdgitjournal.desktop</launchable>
+  <url type="homepage">https://mdgitjournal.stephenfay.xyz</url>
+  <url type="bugtracker">https://github.com/dcxSt/mdgitjournal/issues</url>
+  <url type="vcs-browser">https://github.com/dcxSt/mdgitjournal</url>
+  <provides>
+    <binary>mdgitjournal</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-16"/>
+  </releases>
+</component>
