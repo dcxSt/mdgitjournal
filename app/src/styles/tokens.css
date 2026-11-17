@@ -1,0 +1,43 @@
+/* Design tokens shared by the UI and the editor (docs/architecture.md). */
+
+:root {
+  color-scheme: light;
+
+  --color-bg: #fbfaf7;
+  --color-text: #2b2a27;
+  --color-muted: #8a867d;
+  --color-syntax: #b8b3a8;
+  --color-accent: #3d6fb4;
+  --color-danger: #b5483b;
+
+  --font-styled: ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif;
+  --font-source: ui-monospace, "SF Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace;
+  --font-ui: system-ui, sans-serif;
+
+  --text-styled: 18px;
+  --leading-styled: 1.6;
+  --measure-styled: 66ch;
+  --text-source: 14px;
+  --text-ui: 13px;
+}
+
+/* Dark values are repeated: once for the system preference, once for the explicit override. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --color-bg: #1b1a18;
+    --color-text: #e6e2d9;
+    --color-muted: #8f8a80;
+    --color-syntax: #5f5b54;
+    --color-accent: #7ea6e0;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --color-bg: #1b1a18;
+  --color-text: #e6e2d9;
+  --color-muted: #8f8a80;
+  --color-syntax: #5f5b54;
+  --color-accent: #7ea6e0;
+}

@@ -1,0 +1,7 @@
+/target/
+node_modules/
+/app/dist/
+*.timestamp-*.mjs
+.env
+.env.*
+.DS_Store

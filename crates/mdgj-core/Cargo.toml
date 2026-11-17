@@ -1,0 +1,24 @@
+[package]
+name = "mdgj-core"
+description = "Journal entries, filenames, search, word count, images and settings for mdgitjournal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chrono.workspace = true
+deunicode = "1.6.2"
+hex = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+# image's own JPEG encoder is baseline 4:4:4 only; this one does progressive 4:2:0.
+jpeg-encoder = "0.7.1"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11.1"
+tempfile.workspace = true
+thiserror.workspace = true
+unicode-segmentation = "1.13.3"
+
+[lints]
+workspace = true

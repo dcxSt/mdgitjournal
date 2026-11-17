@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mdgj-core",
+  "crates/mdgj-git",
+  "crates/mdgj-github",
+  "app/src-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+mdgj-core = { path = "crates/mdgj-core" }
+mdgj-git = { path = "crates/mdgj-git" }
+mdgj-github = { path = "crates/mdgj-github" }
+
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+
+tauri = "2.12.6"
+tauri-build = "2.7.5"
+tauri-plugin-opener = "2.7.3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+# Image decode + resize is ~30x slower unoptimized; keep image tests and `tauri dev` imports fast.
+[profile.dev.package]
+fdeflate.opt-level = 3
+gif.opt-level = 3
+image.opt-level = 3
+image-webp.opt-level = 3
+jpeg-encoder.opt-level = 3
+miniz_oxide.opt-level = 3
+png.opt-level = 3
+weezl.opt-level = 3
+zune-jpeg.opt-level = 3

@@ -1,0 +1,4 @@
+# Keep equal to bundle.macOS.minimumSystemVersion in app/src-tauri/tauri.conf.json, which the
+# Tauri CLI exports; otherwise cargo and tauri builds invalidate each other's C build caches.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "11.0"

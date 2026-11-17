@@ -1,0 +1,25 @@
+[package]
+name = "mdgitjournal"
+description = "A minimal markdown journal synced with git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# Distinct from the binary name; iOS links the staticlib.
+name = "mdgitjournal_lib"
+crate-type = ["staticlib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+chrono.workspace = true
+mdgj-core.workspace = true
+mdgj-git.workspace = true
+mdgj-github.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { workspace = true, features = ["protocol-asset"] }
+tauri-plugin-opener.workspace = true

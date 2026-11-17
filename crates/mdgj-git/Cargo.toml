@@ -1,0 +1,21 @@
+[package]
+name = "mdgj-git"
+description = "libgit2 wrapper for mdgitjournal: commit, fetch, pull with keep-both merges, push, connect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chrono.workspace = true
+# TLS is Apple's on macOS/iOS and OpenSSL's on Linux, but libgit2-sys links OpenSSL on every Unix
+# target; vendoring it keeps builds from picking up a non-portable system copy (e.g. Homebrew's).
+git2 = { version = "0.21.0", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
