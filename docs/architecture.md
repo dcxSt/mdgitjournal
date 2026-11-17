@@ -76,7 +76,7 @@ All serde structs use `#[serde(rename_all = "camelCase")]`, so they cross the Ta
 
 ## Crate: `mdgj-git`
 
-The crate uses libgit2 via `git2 = { default-features = false, features = ["https", "vendored-libgit2"] }`, plus `vendored-openssl` on Linux only. No SSH.
+The crate uses libgit2 via `git2 = { default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }`. OpenSSL is built from source on every target because libgit2-sys links it on all Unix targets, though macOS and iOS use Apple's TLS. No SSH.
 
 ```rust
 pub struct Creds { pub username: String /*"x-access-token"*/, pub password: String /*token*/ }  // None for local/file:// remotes
@@ -238,6 +238,7 @@ The commit author is taken from settings `authorName`/`authorEmail`. If those ar
 - It flushes pending autosave **before** `pull`, `commit` and `commit_and_push`.
 - After `pull` it reloads the open entry if it is in `updated` or `merged`.
 - On focus it re-lists entries, and reloads the open entry from disk if the hash changed and the buffer is clean.
+- It flushes pending autosave when the page is hidden and before the window closes. If that save fails, the window stays open and says why, offering "Close anyway". On macOS, Quit (⌘Q) closes the window instead of ending the app at once, so it goes through the same save.
 
 ## Editor module (`app/src/editor/index.ts`)
 
@@ -259,9 +260,10 @@ export interface EditorHandle {
   destroy(): void;
 }
 export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHandle;
+export function imageLink(relPath: string): string;  // "![](path)", or "![](<path>)" if the path has spaces or parentheses
 ```
 
-**Lossless invariant:** the editor never alters text it was given. `getDoc()` after any sequence of `setMode`, `setVim` or `setDark` returns exactly the string passed to `setDoc`, including `\r\n` and a missing final newline. Use CodeMirror's `EditorState.lineSeparator` detection so CRLF is preserved.
+**Lossless invariant:** the editor never alters text it was given. `getDoc()` after any sequence of `setMode`, `setVim` or `setDark` returns exactly the string passed to `setDoc`, including `\r\n` and a missing final newline. A file with one kind of line break is edited as plain lines and written back with that break (`linebreaks.ts`), so vim, paste and IME can't mix in another; a file that already mixes them is split on `\n` and keeps its `\r` characters.
 
 ## Design tokens (UI + editor share `app/src/styles/tokens.css`)
 
@@ -275,7 +277,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
 | danger | `#b5483b` | — |
 
 Typography:
-- Styled mode: `ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif`, 18px / 1.6, `max-width: 66ch`.
+- Styled mode: `ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif`, 18px / 1.6, `max-width: 28em` (about 66 characters; `66ch` would be 66 zeros, some 90 characters of serif prose).
 - Source mode: `ui-monospace, "SF Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace`, 14px.
 - Chrome: `system-ui`, 13px.
 
@@ -291,6 +293,7 @@ cargo test --workspace                                  # or: cargo test -p mdgj
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 pnpm -C app check && pnpm -C app test && pnpm -C app build
+pnpm -C app e2e                                         # Playwright + WebKit on the mock backend (app/e2e/)
 pnpm -C app tauri dev                                   # MDGJ_JOURNAL_DIR=/tmp/j for a scratch journal
 pnpm -C app dev                                         # UI only, in a browser, on the mock backend
 pnpm -C app tauri build                                 # bundles in target/release/bundle/

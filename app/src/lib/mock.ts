@@ -450,6 +450,13 @@ export function createMockApi(options: MockOptions = {}): MockApi {
         unlistenVisible();
       };
     },
+    // A browser tab closes without asking, and the mock keeps nothing anyway.
+    async onCloseRequested() {
+      return () => {};
+    },
+    async closeWindow() {
+      window.close();
+    },
     async openUrl(url) {
       window.open(url, "_blank", "noopener");
     },

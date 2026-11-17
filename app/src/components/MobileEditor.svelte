@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { EditorHandle } from "../editor";
+  import { imageLink, type EditorHandle } from "../editor";
   import type { AppState } from "../lib/app.svelte";
   import { entryTimestamp } from "../lib/journal";
   import AccessoryBar from "./AccessoryBar.svelte";
@@ -23,7 +23,7 @@
     const file = app.current.file;
     const paths = await app.importImages(files);
     if (paths.length && editor && app.current.file === file) {
-      editor.insertAtCursor(paths.map((path) => `![](${path})`).join("\n"));
+      editor.insertAtCursor(paths.map(imageLink).join("\n"));
     }
   }
 </script>

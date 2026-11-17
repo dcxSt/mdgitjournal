@@ -78,6 +78,10 @@
     border-color: var(--color-line);
   }
 
+  input:focus {
+    border-color: var(--color-accent);
+  }
+
   .preview {
     flex: none;
     color: var(--color-muted);

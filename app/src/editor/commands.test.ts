@@ -114,4 +114,8 @@ describe("insertImageLinks", () => {
     expect(insert("|text", ["a.jpg"])).toBe("![](a.jpg)|\ntext");
     expect(insert("te|xt", ["a.jpg"])).toBe("te\n![](a.jpg)|\nxt");
   });
+
+  it("brackets paths with spaces or parentheses", () => {
+    expect(insert("|", ["assets/My notes (old)-1.jpg"])).toBe("![](<assets/My notes (old)-1.jpg>)|");
+  });
 });

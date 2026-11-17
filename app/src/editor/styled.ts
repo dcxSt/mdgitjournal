@@ -3,7 +3,7 @@
 
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState, Extension, Range } from "@codemirror/state";
-import { StateField } from "@codemirror/state";
+import { Prec, StateField } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -168,10 +168,12 @@ interface StyledOptions {
   resolveImageUrl?(relPath: string): string;
 }
 
-/** http(s) images load as they are, relative paths through the app; absolute paths never. */
+/**
+ * Only images inside the journal get a preview: remote ones would contact their host whenever an
+ * entry is shown, and the app talks to no one but GitHub.
+ */
 function imageSource(target: string, opts: StyledOptions): string | null {
   const url = target.startsWith("<") && target.endsWith(">") ? target.slice(1, -1) : target;
-  if (/^https?:\/\//i.test(url)) return url;
   if (!opts.resolveImageUrl || /^([a-z][a-z\d+.-]*:|\/)/i.test(url)) return null;
   // Link targets are URLs, so "my%20photo.jpg" names the file "my photo.jpg".
   let path = url;
@@ -226,7 +228,8 @@ const proseInput = EditorView.contentAttributes.of({
 export function styledMode(opts: StyledOptions): Extension {
   return [
     styledTheme,
-    opts.mobile ? mobileStyledTheme : [],
+    // Without the precedence, the later theme is mounted first and loses the cascade.
+    opts.mobile ? Prec.high(mobileStyledTheme) : [],
     proseInput,
     decorations,
     imagePreviews(opts),

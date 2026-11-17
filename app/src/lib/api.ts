@@ -62,6 +62,10 @@ export interface Api {
   onEntriesChanged(cb: () => void): Promise<Unlisten>;
   /** The window (or the iOS app) came back to the foreground. */
   onWindowFocus(cb: () => void): Promise<Unlisten>;
+  /** The window is about to close (on macOS, also on Quit); it stays open if `cb` says false. */
+  onCloseRequested(cb: () => Promise<boolean>): Promise<Unlisten>;
+  /** Closes the window without asking `onCloseRequested`. */
+  closeWindow(): Promise<void>;
   openUrl(url: string): Promise<void>;
   revealPath(path: string): Promise<void>;
   /** URL the WebView can load for an absolute file path inside the journal. */
@@ -105,8 +109,17 @@ async function call<T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions):
 
 /** Runs `cb` when the page becomes visible again, which is also how iOS reports foregrounding. */
 export function onVisible(cb: () => void): Unlisten {
+  return onVisibility("visible", cb);
+}
+
+/** Runs `cb` when the page is hidden: minimised, hidden, or on iOS sent to the background. */
+export function onHidden(cb: () => void): Unlisten {
+  return onVisibility("hidden", cb);
+}
+
+function onVisibility(state: DocumentVisibilityState, cb: () => void): Unlisten {
   const handler = () => {
-    if (document.visibilityState === "visible") cb();
+    if (document.visibilityState === state) cb();
   };
   document.addEventListener("visibilitychange", handler);
   return () => document.removeEventListener("visibilitychange", handler);
@@ -159,6 +172,11 @@ export function createTauriApi(): Api {
         unlistenVisible();
       };
     },
+    onCloseRequested: (cb) =>
+      getCurrentWindow().onCloseRequested(async (event) => {
+        if (!(await cb())) event.preventDefault();
+      }),
+    closeWindow: () => getCurrentWindow().destroy(),
     openUrl: async (url) => {
       try {
         await openUrl(url);

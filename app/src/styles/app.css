@@ -79,27 +79,30 @@ button:disabled {
   color: var(--color-danger);
 }
 
-input[type="text"],
-input[type="search"],
-input[type="password"],
-input[type="email"],
-input[type="number"],
-textarea {
+/* :where() keeps these defaults below any component's own rules for its fields. */
+:where(
+    input[type="text"],
+    input[type="search"],
+    input[type="password"],
+    input[type="email"],
+    input[type="number"],
+    textarea
+  ) {
   padding: 5px 8px;
   border: 1px solid var(--color-line);
   border-radius: var(--radius);
   background: transparent;
-  outline: none;
-}
-
-input:focus-visible,
-textarea:focus-visible {
-  border-color: var(--color-accent);
 }
 
 :focus-visible {
   outline: 2px solid var(--color-accent-soft);
   outline-offset: 1px;
+}
+
+/* Fields show focus with their border instead of the ring. */
+:where(input, textarea):focus-visible {
+  border-color: var(--color-accent);
+  outline: none;
 }
 
 ::placeholder {

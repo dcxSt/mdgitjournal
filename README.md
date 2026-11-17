@@ -86,7 +86,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 pnpm -C app test
 pnpm -C app check
+pnpm -C app e2e      # the UI in WebKit, on the mock backend; once: pnpm -C app exec playwright install webkit
 ```
+
+`MDGJ_SHOTS_DIR=/tmp/shots pnpm -C app e2e` also saves screenshots of the main screens, light and dark, desktop and phone.
 
 End-to-end tests that need github.com are marked `#[ignore]`, so these commands run offline.
 

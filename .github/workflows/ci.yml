@@ -57,6 +57,8 @@ jobs:
       - run: pnpm -C app check
       - run: pnpm -C app test
       - run: pnpm -C app build
+      - run: pnpm -C app exec playwright install --with-deps webkit
+      - run: pnpm -C app e2e
 
   bundle:
     name: Bundle (${{ matrix.os }})

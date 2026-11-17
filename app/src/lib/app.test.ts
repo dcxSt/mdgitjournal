@@ -257,6 +257,36 @@ describe("entries", () => {
   });
 });
 
+describe("closing the window", () => {
+  it("saves the last edit first", async () => {
+    const { api, app } = await start();
+    app.current.edit("typed just before closing");
+    expect(await app.beforeClose()).toBe(true);
+    expect(api.mock.files.get(RUN)).toBe("typed just before closing");
+  });
+
+  it("stays open, saying why, when the save fails; Close anyway closes", async () => {
+    const { api, app } = await start();
+    const closeWindow = vi.spyOn(api, "closeWindow").mockResolvedValue();
+    app.current.edit("unsaved");
+    api.mock.failNext("writeEntry", "io", "Disk full.");
+    expect(await app.beforeClose()).toBe(false);
+    const notice = app.notices.list.find((n) => n.key === "close")!;
+    expect(notice.text).toContain("Disk full.");
+    notice.action!.run();
+    expect(closeWindow).toHaveBeenCalledOnce();
+  });
+
+  it("stays open while a sync holds back autosave", async () => {
+    const { app } = await start();
+    app.current.edit("typed during a pull");
+    app.current.pause();
+    expect(await app.beforeClose()).toBe(false);
+    app.current.resume();
+    expect(await app.beforeClose()).toBe(true);
+  });
+});
+
 describe("perform", () => {
   it("toggles the mode, the sidebar and overlays", async () => {
     const { app } = await start();

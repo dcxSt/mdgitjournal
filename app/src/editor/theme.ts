@@ -85,6 +85,8 @@ export const styledTheme = EditorView.theme({
   ".cm-md-em": { fontStyle: "italic" },
   ".cm-md-strong": { fontWeight: "bold" },
   ".cm-md-strike": { textDecoration: "line-through" },
+  // Text decorations reach inline descendants only, so this keeps the "~~" themselves unstruck.
+  ".cm-md-strike .cm-md-mark": { display: "inline-block" },
   ".cm-md-code": {
     fontFamily: "var(--font-source)",
     fontSize: "0.85em",

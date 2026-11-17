@@ -86,11 +86,17 @@ function selectedLines(state: EditorState): Line[] {
   return lines;
 }
 
+/**
+ * The markdown for an image. Hand-named entries can give asset names with spaces or
+ * parentheses, which need `<…>`.
+ */
+export const imageLink = (path: string) => (/[\s()]/.test(path) ? `![](<${path}>)` : `![](${path})`);
+
 /** Inserts one `![](path)` line per path at `pos`, breaking the surrounding line if needed. */
 export function insertImageLinks(state: EditorState, pos: number, paths: string[]): TransactionSpec {
   const line = state.doc.lineAt(pos);
   const lb = state.lineBreak;
-  const links = (pos > line.from ? lb : "") + paths.map((path) => `![](${path})`).join(lb);
+  const links = (pos > line.from ? lb : "") + paths.map(imageLink).join(lb);
   const insert = links + (pos < line.to ? lb : "");
   return {
     changes: { from: pos, insert },

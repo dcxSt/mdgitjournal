@@ -129,7 +129,7 @@ describe("image previews", () => {
     expect(lines(view).map((el) => el.textContent)).toEqual(text.split("\n"));
   });
 
-  it("load http(s) as is, relative paths through the app, and nothing else", () => {
+  it("load relative paths through the app, and nothing else", () => {
     const resolve = vi.fn(resolveImageUrl);
     const text = [
       "![](https://example.com/a.png)",
@@ -142,7 +142,6 @@ describe("image previews", () => {
     ].join("\n");
     const { view } = mount({ doc: text, mode: "styled", resolveImageUrl: resolve });
     expect(previews(view)).toEqual([
-      "https://example.com/a.png",
       "asset://localhost/journal/assets/my photo.jpg",
       "asset://localhost/journal/assets/my photo.jpg",
     ]);

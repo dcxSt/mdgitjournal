@@ -26,6 +26,8 @@ import { fileText, lineBreaks, normalizeBreaks } from "./linebreaks";
 import { styledMode } from "./styled";
 import { baseTheme, highlighters, sourceTheme } from "./theme";
 
+export { imageLink } from "./commands";
+
 export type EditorMode = "source" | "styled";
 
 export interface EditorOptions {

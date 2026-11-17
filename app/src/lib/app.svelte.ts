@@ -2,7 +2,7 @@
 // timing"): fetch on launch, focus and an interval; flush autosave before git work; reload the open
 // entry after a pull. Operations that touch the working tree run one at a time.
 
-import { ApiError, toApiError, type Api, type Unlisten } from "./api";
+import { ApiError, onHidden, toApiError, type Api, type Unlisten } from "./api";
 import { DEFAULT_SETTINGS, EMPTY_VIEW, SIGNED_OUT } from "./defaults";
 import { CurrentEntry, SaveError } from "./entry.svelte";
 import { Notices, type Notice } from "./notices.svelte";
@@ -101,7 +101,10 @@ export class AppState {
         this.api.onSyncState((view) => (this.sync = view)),
         this.api.onEntriesChanged(() => void this.refresh()),
         this.api.onWindowFocus(() => void this.onFocus()),
+        this.api.onCloseRequested(() => this.beforeClose()),
       ]);
+      // A failed save shows in the status bar and is retried.
+      this.#unlisten.push(onHidden(() => void this.current.flush().catch(() => {})));
     } catch (e) {
       this.initError = toApiError(e).message;
       return;
@@ -342,6 +345,26 @@ export class AppState {
       } while (this.#syncRefreshAgain);
       this.#syncRefresh = null;
     })();
+  }
+
+  /** Saves pending edits before the window closes; it stays open, saying why, if that fails. */
+  async beforeClose(): Promise<boolean> {
+    let error: string;
+    try {
+      await this.current.settle();
+      if (!this.current.dirty) return true;
+      // Autosave is paused while a pull or commit runs; the edits are written when it ends.
+      error = "Your latest edits will be saved when the sync in progress finishes.";
+    } catch (e) {
+      error = toApiError(e).message;
+    }
+    this.notices.show({
+      key: "close",
+      tone: "error",
+      text: error,
+      action: { label: "Close anyway", run: () => void this.api.closeWindow() },
+    });
+    return false;
   }
 
   async onFocus(): Promise<void> {

@@ -17,7 +17,8 @@
   --text-styled: 18px;
   --text-styled-mobile: 17px;
   --leading-styled: 1.6;
-  --measure-styled: 66ch;
+  /* About 66 characters of prose; 66ch would be 66 zeros, some 90 characters in a serif. */
+  --measure-styled: 28em;
   --text-source: 14px;
   --text-ui: 13px;
 }
