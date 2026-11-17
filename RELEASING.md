@@ -24,17 +24,21 @@ git tag -a vX.Y.Z -m "mdgitjournal X.Y.Z"
 git push origin main vX.Y.Z
 ```
 
+`packaging/THIRD-PARTY-NOTICES.md` lists the licences of everything compiled into the app, and CI fails when it is out of date. After changing dependencies, regenerate it with `packaging/notices/generate.sh` and commit it. The script needs jq and cargo-about (`cargo install cargo-about --version 0.9.3 --locked --features cli`).
+
 ## 2. GitHub Release
 
 Pushing the tag runs `.github/workflows/release.yml`, which:
 
-1. Fails if the tag doesn't match the versions above.
+1. Fails if the tag doesn't match the versions above, or if `Cargo.lock` is out of date.
 2. Creates a **draft** release with generated notes.
 3. Builds a universal macOS `.dmg` and the Linux AppImage, `.deb` and `.rpm`, and attaches them.
 
 Check the assets, edit the notes and click **Publish**. If a job fails, delete the draft and the tag (`gh release delete vX.Y.Z --cleanup-tag --yes && git tag -d vX.Y.Z`), fix the problem and tag again.
 
-The `.dmg` is signed and notarized only if the Apple secrets below are set. Otherwise it is unsigned, and users have to allow it in *System Settings › Privacy & Security* the first time they open it.
+The `.dmg` is signed with Developer ID and notarized only if the Apple secrets below are set. Otherwise it is only ad-hoc signed and not notarized, and the run shows a warning. Its first launch is then blocked, and users choose *Open Anyway* in *System Settings › Privacy & Security*.
+
+The Linux packages are built on `ubuntu-24.04` rather than `ubuntu-latest`, so they run on any distribution with glibc 2.39 or newer. When GitHub deprecates that image, move `release.yml` and `ci.yml` to the next LTS.
 
 ## 3. AUR
 
@@ -92,7 +96,7 @@ Repeat for `mdgitjournal-bin`, using `packaging/aur/mdgitjournal-bin/PKGBUILD`. 
 3. *Settings › Pages › Custom domain*: `mdgitjournal.stephenfay.xyz`, then tick **Enforce HTTPS** once the certificate is issued. Workflow deployments ignore `site/CNAME`, so this setting is what counts.
 4. Recommended: verify `stephenfay.xyz` at <https://github.com/settings/pages>, so no other account can claim the subdomain.
 
-The privacy policy is then at <https://mdgitjournal.stephenfay.xyz/privacy.html>.
+The privacy policy is then at <https://mdgitjournal.stephenfay.xyz/privacy.html>. Until step 1 is done, every Pages run fails with *Failed to create deployment (status: 404) … Ensure GitHub Pages has been enabled*. The site's *Download* and AUR links point at the first release and the AUR packages, so they lead nowhere until those are published.
 
 ## 5. Mac App Store, iOS App Store and TestFlight
 
@@ -121,6 +125,7 @@ The Team ID, certificates and keys stay out of the repository. Keep them in the 
    ```sh
    export APPLE_API_KEY=<KEY_ID> APPLE_API_ISSUER=<Issuer ID>
    ```
+   Tauri also takes this key as notarization credentials, so the Mac App Store build below unsets these variables.
 
 Every upload needs a new, higher build number, even when the version is unchanged.
 
@@ -146,8 +151,9 @@ cat > target/mas/tauri.conf.json <<EOF
 }
 EOF
 
-# Store builds are reviewed, not notarized: keep notarization credentials out of this build.
-env -u APPLE_ID -u APPLE_PASSWORD \
+# Store builds are reviewed, not notarized. Unset every variable Tauri reads for notarization;
+# otherwise it finds the API key from step 7 and sends this build to Apple's notary service.
+env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_API_KEY -u APPLE_API_ISSUER -u APPLE_API_KEY_PATH \
   pnpm -C app tauri build --bundles app --target universal-apple-darwin --config "$PWD/target/mas/tauri.conf.json"
 
 xcrun productbuild --sign "3rd Party Mac Developer Installer: <Team name> ($APPLE_TEAM_ID)" \
@@ -163,7 +169,7 @@ Instead of `altool`, you can drag the `.pkg` into Apple's **Transporter** app. `
 
 This needs full Xcode with its licence accepted (`sudo xcodebuild -license accept`), and you signed in to Xcode with your Apple ID (*Settings › Accounts*).
 
-1. Run `pnpm -C app tauri ios init` once, and commit `app/src-tauri/gen/apple`.
+1. Run `pnpm -C app tauri ios init` once, and commit `app/src-tauri/gen/apple`. It is generated from `app/src-tauri/project.ios.yml` (see the README's iOS section), which links libz and libiconv for libgit2.
 2. Install the iOS icons (see [Icons](#icons)).
 3. Check that `Info.ios.plist` sets `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace` to `true`, so the journal shows up in the Files app.
 4. Build and upload:

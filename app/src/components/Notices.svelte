@@ -14,9 +14,13 @@
           <p>{notice.text}</p>
           {#if notice.files?.length}
             <ul>
-              {#each notice.files as link (link.file)}
+              {#each notice.files as { label, file }, i (i)}
                 <li>
-                  <button type="button" class="link" onclick={() => app.openEntry(link.file)}>{link.label}</button>
+                  {#if file}
+                    <button type="button" class="link" onclick={() => app.openEntry(file)}>{label}</button>
+                  {:else}
+                    <code>{label}</code>
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -94,13 +98,21 @@
     list-style: none;
   }
 
-  .link {
+  .link,
+  code {
     padding: 1px 0;
-    color: var(--color-accent);
     font-family: var(--font-source);
     font-size: 12px;
     text-align: left;
     overflow-wrap: anywhere;
+  }
+
+  .link {
+    color: var(--color-accent);
+  }
+
+  code {
+    display: block;
   }
 
   .link:hover {

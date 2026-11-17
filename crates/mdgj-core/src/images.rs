@@ -2,12 +2,22 @@
 
 use std::io::Cursor;
 
+use image::error::{LimitError, LimitErrorKind};
 use image::imageops::FilterType;
-use image::{DynamicImage, ImageDecoder, ImageError, ImageReader, ImageResult, Rgb, RgbImage};
+use image::{
+    DynamicImage, ImageDecoder, ImageError, ImageReader, ImageResult, Limits, Rgb, RgbImage,
+};
 use jpeg_encoder::{ChromaSubsamplingMethod, ColorType, Encoder, SamplingFactor};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
+
+/// Larger images are refused before decoding: a small, highly compressible file can otherwise
+/// decode to gigabytes. 64 MP still covers 48 MP phones and 61 MP cameras.
+const MAX_PIXELS: u64 = 64_000_000;
+/// The most the decoded pixels may take: as much as the largest 8-bit RGBA image, so 16-bit
+/// images must be smaller.
+const MAX_DECODED_BYTES: u64 = MAX_PIXELS * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,7 +31,7 @@ pub struct ImageOpts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedImage {
-    /// Relative to the journal root, e.g. `"assets/2026-11-16-1402-morning-run-1.jpg"`.
+    /// Relative to the journal root, e.g. `"assets/2026-11-16-1402-morning-run-5f3a09c2.jpg"`.
     pub path: String,
     pub bytes: u64,
     pub width: u32,
@@ -31,7 +41,8 @@ pub struct ImportedImage {
 /// Re-encodes a JPEG, PNG, WebP or GIF (first frame) as a small JPEG: EXIF orientation applied,
 /// alpha flattened onto white, downscaled with Lanczos3 so the longest edge is at most
 /// `opts.max_edge`, then encoded progressive 4:2:0 at `opts.quality`. Nothing but pixels is
-/// carried over, so EXIF (including GPS), XMP and ICC data are all dropped.
+/// carried over, so EXIF (including GPS), XMP and ICC data are all dropped. Images over 64
+/// megapixels are refused.
 ///
 /// Returns the JPEG and its width and height.
 pub fn compress_image(bytes: &[u8], opts: ImageOpts) -> Result<(Vec<u8>, u32, u32)> {
@@ -55,9 +66,19 @@ pub fn compress_image(bytes: &[u8], opts: ImageOpts) -> Result<(Vec<u8>, u32, u3
 }
 
 fn decode(bytes: &[u8]) -> ImageResult<DynamicImage> {
-    let mut decoder = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()?
-        .into_decoder()?;
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(ImageError::Limits(LimitError::from_kind(
+            LimitErrorKind::DimensionError,
+        )));
+    }
+    // `ImageReader::decode` checks this too, but `into_decoder` leaves it to the caller.
+    limits.reserve(decoder.total_bytes())?;
     let orientation = decoder.orientation()?;
     let mut image = DynamicImage::from_decoder(decoder)?;
     image.apply_orientation(orientation);
@@ -396,6 +417,15 @@ mod tests {
             err.to_string().starts_with("could not read the image: "),
             "{err}"
         );
+    }
+
+    #[test]
+    fn refuses_huge_images_before_decoding() {
+        // 72 MP of grey: a PNG of about 70 KB that would decode to over 200 MB of RGB.
+        let gray = DynamicImage::ImageLuma8(image::GrayImage::new(9000, 8000));
+        let err = compress_image(&encode(&gray, ImageFormat::Png), OPTS).unwrap_err();
+        assert!(matches!(err, Error::Image(_)), "{err:?}");
+        assert_eq!(err.to_string(), "the image is too large to import");
     }
 
     #[test]

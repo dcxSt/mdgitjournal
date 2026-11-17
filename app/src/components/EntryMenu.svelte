@@ -1,24 +1,11 @@
-<!-- The "…" menu in the entry header: delete (with a confirm), and the mode switch on the phone. -->
+<!-- The "…" menu in the entry header: delete (confirmed in DeleteSheet), and the mode switch on the phone. -->
 <script lang="ts">
   import type { AppState } from "../lib/app.svelte";
   import Icon from "./Icon.svelte";
-  import Sheet from "./Sheet.svelte";
 
   let { app }: { app: AppState } = $props();
 
   let open = $state(false);
-  let confirming = $state(false);
-  let deleting = $state(false);
-
-  const file = $derived(app.current.file);
-  const change = $derived(app.sync.changes.find((c) => c.path === file));
-  const consequence = $derived(
-    change?.kind === "added"
-      ? "It has never been committed, so it can't be recovered."
-      : change
-        ? "Its last committed version stays in the git history; changes since then are lost."
-        : "It stays in the git history.",
-  );
 
   function closeOnOutside(node: HTMLElement) {
     const onpointerdown = (e: PointerEvent) => {
@@ -26,13 +13,6 @@
     };
     document.addEventListener("pointerdown", onpointerdown);
     return () => document.removeEventListener("pointerdown", onpointerdown);
-  }
-
-  async function remove() {
-    deleting = true;
-    await app.remove();
-    deleting = false;
-    confirming = false;
   }
 </script>
 
@@ -74,7 +54,7 @@
         class="danger"
         onclick={() => {
           open = false;
-          confirming = true;
+          app.overlay = "delete";
         }}
       >
         Delete entry…
@@ -82,20 +62,6 @@
     </div>
   {/if}
 </div>
-
-{#if confirming && file !== null}
-  <Sheet label="Delete entry" onclose={() => !deleting && (confirming = false)}>
-    <h2>Delete this entry?</h2>
-    <p class="file">{file}</p>
-    <p class="muted">{consequence}</p>
-    <div class="actions">
-      <button type="button" class="button" data-autofocus disabled={deleting} onclick={() => (confirming = false)}>
-        Cancel
-      </button>
-      <button type="button" class="button danger" disabled={deleting} onclick={remove}>Delete</button>
-    </div>
-  </Sheet>
-{/if}
 
 <style>
   .wrap {
@@ -135,28 +101,5 @@
 
   .danger {
     color: var(--color-danger);
-  }
-
-  h2 {
-    margin: 0 0 8px;
-    font-size: 15px;
-    font-weight: 500;
-  }
-
-  p {
-    margin: 0 0 8px;
-  }
-
-  .file {
-    font-family: var(--font-source);
-    font-size: 12px;
-    overflow-wrap: anywhere;
-  }
-
-  .actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 16px;
   }
 </style>

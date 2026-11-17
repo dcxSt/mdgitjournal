@@ -69,6 +69,11 @@
     background: var(--color-selected);
   }
 
+  /* Inside the row: the scrolling list would clip a ring drawn outside it. */
+  button:focus-visible {
+    outline-offset: -2px;
+  }
+
   .day {
     color: var(--color-muted);
     text-align: right;

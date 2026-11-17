@@ -24,7 +24,8 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Writes `bytes` to the first of `dir/name(1)`, `dir/name(2)`, … that doesn't exist yet, and
-/// returns that name. Never replaces an existing file.
+/// returns that name; a file that already holds exactly `bytes` is used as it is. Never
+/// replaces an existing file.
 pub(crate) fn write_new(
     dir: &Path,
     bytes: &[u8],
@@ -34,9 +35,15 @@ pub(crate) fn write_new(
     let mut n = 1;
     loop {
         let candidate = name(n);
-        match file.persist_noclobber(dir.join(&candidate)) {
+        let path = dir.join(&candidate);
+        match file.persist_noclobber(&path) {
             Ok(_) => return Ok(candidate),
-            Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => file = err.file,
+            Err(err) if err.error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::read(&path).is_ok_and(|existing| existing == bytes) {
+                    return Ok(candidate);
+                }
+                file = err.file;
+            }
             Err(err) => return Err(err.error),
         }
         n += 1;

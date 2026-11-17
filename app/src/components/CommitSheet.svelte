@@ -177,10 +177,8 @@
     min-height: 28px;
   }
 
-  @media (max-width: 699px) {
-    .actions .button {
-      min-height: var(--touch);
-      padding: 0 14px;
-    }
+  :global([data-layout="phone"]) .actions .button {
+    min-height: var(--touch);
+    padding: 0 14px;
   }
 </style>

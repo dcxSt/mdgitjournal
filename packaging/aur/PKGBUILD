@@ -7,7 +7,9 @@ pkgrel=1
 pkgdesc='A minimal markdown journal synced with git'
 arch=('x86_64' 'aarch64')
 url='https://mdgitjournal.stephenfay.xyz'
-license=('MIT')
+# MIT for the app itself; the rest covers what it compiles in (THIRD-PARTY-NOTICES.md).
+license=('MIT' 'Apache-2.0' 'BSD-3-Clause' 'GPL-2.0-only WITH GCC-exception-2.0' 'IJG' 'ISC'
+         'MPL-2.0' 'Unicode-3.0' 'Zlib')
 depends=('cairo' 'dbus' 'gcc-libs' 'gdk-pixbuf2' 'glib2' 'glibc' 'gtk3' 'hicolor-icon-theme'
          'libsoup3' 'pango' 'webkit2gtk-4.1' 'zlib')
 makedepends=('cargo' 'nodejs' 'pnpm')
@@ -45,5 +47,5 @@ package() {
   install -Dm644 "$icons/icon.png" "$hicolor/512x512/apps/$_appid.png"
   install -Dm644 assets/icon.svg "$hicolor/scalable/apps/$_appid.svg"
 
-  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 LICENSE packaging/THIRD-PARTY-NOTICES.md -t "$pkgdir/usr/share/licenses/$pkgname/"
 }

@@ -2,9 +2,11 @@
 // timing"): fetch on launch, focus and an interval; flush autosave before git work; reload the open
 // entry after a pull. Operations that touch the working tree run one at a time.
 
+import { imageLink } from "../editor/commands";
 import { ApiError, onHidden, toApiError, type Api, type Unlisten } from "./api";
 import { DEFAULT_SETTINGS, EMPTY_VIEW, SIGNED_OUT } from "./defaults";
 import { CurrentEntry, SaveError } from "./entry.svelte";
+import { conflictCopyName, isEntryFile } from "./journal";
 import { Notices, type Notice } from "./notices.svelte";
 import { Search } from "./search.svelte";
 import type { Action } from "./shortcuts";
@@ -22,7 +24,7 @@ import type {
   SyncView,
 } from "./types";
 
-export type Overlay = "commit" | "settings" | "quickOpen";
+export type Overlay = "commit" | "settings" | "quickOpen" | "delete";
 
 /** Below this width a browser preview uses the phone layout. */
 export const MOBILE_MAX_WIDTH = 700;
@@ -75,10 +77,23 @@ export class AppState {
   #lastFocusRefresh = 0;
   #syncRefresh: Promise<void> | null = null;
   #syncRefreshAgain = false;
+  /** Bumped whenever a git operation or the backend reports the sync state. */
+  #syncReports = 0;
+  /** The fetch in flight, if any; pull and commit wait for it before pausing autosave. */
+  #fetching: Promise<unknown> = Promise.resolve();
   #settingsWrites: Promise<void> = Promise.resolve();
 
   constructor(readonly api: Api) {
-    this.current = new CurrentEntry(api, () => this.refreshSync());
+    this.current = new CurrentEntry(
+      api,
+      () => this.#saved(),
+      (file, message, retrying) =>
+        this.notices.show({
+          key: "save-error",
+          tone: "error",
+          text: `Couldn't save ${file}: ${message}. Your text is kept here${retrying ? ", and saving is retried" : ""}.`,
+        }),
+    );
     this.search = new Search(api);
   }
 
@@ -94,16 +109,16 @@ export class AppState {
       this.info = info;
       this.settings = settings;
       this.entries = entries;
-      this.sync = sync;
+      this.#setSync(sync);
       this.auth = auth;
       this.mode = this.mobile ? settings.modeMobile : settings.modeDesktop;
       this.#unlisten = await Promise.all([
-        this.api.onSyncState((view) => (this.sync = view)),
+        this.api.onSyncState((view) => this.#setSync(view)),
         this.api.onEntriesChanged(() => void this.refresh()),
         this.api.onWindowFocus(() => void this.onFocus()),
         this.api.onCloseRequested(() => this.beforeClose()),
       ]);
-      // A failed save shows in the status bar and is retried.
+      // A failed save is reported by the entry and retried.
       this.#unlisten.push(onHidden(() => void this.current.flush().catch(() => {})));
     } catch (e) {
       this.initError = toApiError(e).message;
@@ -164,15 +179,19 @@ export class AppState {
     if ((await this.open(file)) && !this.mobile) this.focusEditor = true;
   }
 
-  /** Phone layout: leaves the editor for the list once the entry is safely on disk. */
+  /**
+   * Phone layout: leaves the editor for the list once the entry is safely on disk. It waits for
+   * a pull or commit in progress, which holds autosave back.
+   */
   async back(): Promise<void> {
     try {
-      await this.current.settle();
+      await this.#serial(async () => {
+        await this.current.settle();
+        this.current.close();
+      });
     } catch (e) {
       this.#report(e);
-      return;
     }
-    this.current.close();
   }
 
   async create(title: string): Promise<boolean> {
@@ -214,14 +233,15 @@ export class AppState {
     return true;
   }
 
-  async remove(): Promise<void> {
-    const file = this.current.file;
-    if (file === null) return;
+  /** Deletes `file` if it is still the open entry. */
+  async remove(file: string): Promise<void> {
+    if (file !== this.current.file) return;
     try {
       await this.#serial(() =>
         this.#withSavesPaused(async () => {
           await this.api.deleteEntry(file);
           this.current.close();
+          this.notices.dismiss("save-error");
           await this.refreshEntries();
         }),
       );
@@ -233,15 +253,23 @@ export class AppState {
     if (!this.mobile && this.entries.length) await this.open(this.entries[0].file);
   }
 
-  /** Imports pasted, dropped or picked images into assets/ and returns their relative paths. */
+  /**
+   * Imports pasted, dropped or picked images into assets/ and returns their relative paths. Each
+   * import waits for a pull or commit in progress, and none starts once another entry is open.
+   */
   async importImages(files: File[]): Promise<string[]> {
     const entry = this.current.file;
     if (entry === null) return [];
     const paths: string[] = [];
+    let skipped = 0;
     for (const file of files) {
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        paths.push((await this.api.importImage(entry, bytes)).path);
+        const path = await this.#serial(async () =>
+          this.current.file === entry ? (await this.api.importImage(entry, bytes)).path : null,
+        );
+        if (path === null) skipped++;
+        else paths.push(path);
       } catch (e) {
         this.notices.show({
           tone: "error",
@@ -249,8 +277,26 @@ export class AppState {
         });
       }
     }
+    if (skipped) {
+      this.notices.show({
+        tone: "info",
+        text: `${plural(skipped, "image")} not added: the open entry changed while importing. Add ${skipped === 1 ? "it" : "them"} again.`,
+      });
+    }
     if (paths.length) this.refreshSync();
     return paths;
+  }
+
+  /** Images that were imported, but whose entry left the editor before they could be linked. */
+  imagesUnlinked(paths: string[]): void {
+    const one = paths.length === 1;
+    this.notices.show({
+      tone: "info",
+      text: one
+        ? `Saved ${paths[0]} but didn't link it: the entry changed while it was importing. Add this link where you want it, or delete the file:`
+        : `Saved ${paths.length} images but didn't link them: the entry changed while they were importing. Add these links where you want them, or delete the files:`,
+      files: paths.map((path) => ({ label: imageLink(path) })),
+    });
   }
 
   imageUrl(relPath: string): string {
@@ -261,23 +307,23 @@ export class AppState {
 
   async fetch(userInitiated = false): Promise<void> {
     if (!this.sync.connected || this.ops.length) return;
-    const error = await this.#track("fetch", async () => {
-      this.sync = await this.api.fetch();
+    const fetched = this.#track("fetch", async () => {
+      this.#setSync(await this.api.fetch());
     });
+    this.#fetching = fetched;
+    const error = await fetched;
     if (error && userInitiated) this.#report(error);
   }
 
   async pull(): Promise<void> {
     if (!this.sync.connected || this.ops.includes("pull")) return;
     const error = await this.#track("pull", () =>
-      this.#serial(() =>
-        this.#withSavesPaused(async () => {
-          const result = await this.api.pull();
-          this.sync = result.view;
-          this.notices.dismiss("needs-pull");
-          await this.#afterIncoming(result);
-        }),
-      ),
+      this.#gitWork(async () => {
+        const result = await this.api.pull();
+        this.#setSync(result.view);
+        this.notices.dismiss("needs-pull");
+        await this.#afterIncoming(result);
+      }),
     );
     if (error) this.#report(error);
   }
@@ -291,7 +337,7 @@ export class AppState {
     }
     try {
       await this.current.flush();
-      this.sync = await this.api.syncState();
+      await this.#readSync();
     } catch (e) {
       this.#report(e);
       return;
@@ -310,19 +356,17 @@ export class AppState {
     }
     const text = message.trim();
     const error = await this.#track("commit", () =>
-      this.#serial(() =>
-        this.#withSavesPaused(async () => {
-          if (!this.sync.connected) {
-            this.sync = await this.api.commit(text);
-            this.#toast("Committed.");
-            return;
-          }
-          const { view, result } = await this.api.commitAndPush(text);
-          this.sync = view;
-          if (result === "needs_pull") this.notices.show({ key: "needs-pull", tone: "info", text: NEEDS_PULL_TEXT });
-          else this.#toast(result === "pushed" ? `Pushed to ${view.repo ?? "GitHub"}.` : "Nothing to commit.");
-        }),
-      ),
+      this.#gitWork(async () => {
+        if (!this.sync.connected) {
+          this.#setSync(await this.api.commit(text));
+          this.#toast("Committed.");
+          return;
+        }
+        const { view, result } = await this.api.commitAndPush(text);
+        this.#setSync(view);
+        if (result === "needs_pull") this.notices.show({ key: "needs-pull", tone: "info", text: NEEDS_PULL_TEXT });
+        else this.#toast(result === "pushed" ? `Pushed to ${view.repo ?? "GitHub"}.` : "Nothing to commit.");
+      }),
     );
     if (error?.kind === "reauth") this.#report(error);
     return error;
@@ -338,7 +382,8 @@ export class AppState {
       do {
         this.#syncRefreshAgain = false;
         try {
-          this.sync = await this.api.syncState();
+          // A reply overtaken by a git operation's report may be older; read again after it.
+          if (!(await this.#readSync())) this.#syncRefreshAgain = true;
         } catch (e) {
           this.syncError = toApiError(e);
         }
@@ -349,22 +394,18 @@ export class AppState {
 
   /** Saves pending edits before the window closes; it stays open, saying why, if that fails. */
   async beforeClose(): Promise<boolean> {
-    let error: string;
     try {
       await this.current.settle();
-      if (!this.current.dirty) return true;
-      // Autosave is paused while a pull or commit runs; the edits are written when it ends.
-      error = "Your latest edits will be saved when the sync in progress finishes.";
+      return true;
     } catch (e) {
-      error = toApiError(e).message;
+      this.notices.show({
+        key: "close",
+        tone: "error",
+        text: toApiError(e).message,
+        action: { label: "Close anyway", run: () => void this.api.closeWindow() },
+      });
+      return false;
     }
-    this.notices.show({
-      key: "close",
-      tone: "error",
-      text: error,
-      action: { label: "Close anyway", run: () => void this.api.closeWindow() },
-    });
-    return false;
   }
 
   async onFocus(): Promise<void> {
@@ -383,15 +424,13 @@ export class AppState {
 
   /** Connects the journal to `owner/repo`; errors are thrown for the connect flow to show. */
   async connect(fullName: string): Promise<PullResult> {
-    const result = await this.#serial(() =>
-      this.#withSavesPaused(async () => {
-        const result = await this.api.githubConnect(fullName);
-        this.sync = result.view;
-        this.syncError = null;
-        await this.#afterIncoming(result);
-        return result;
-      }),
-    );
+    const result = await this.#gitWork(async () => {
+      const result = await this.api.githubConnect(fullName);
+      this.#setSync(result.view);
+      this.syncError = null;
+      await this.#afterIncoming(result);
+      return result;
+    });
     // The backend records the remote in settings.
     [this.settings, this.auth] = await Promise.all([this.api.getSettings(), this.api.authStatus()]);
     return result;
@@ -399,7 +438,7 @@ export class AppState {
 
   async disconnect(signOut: boolean): Promise<void> {
     try {
-      this.sync = await this.api.githubDisconnect(signOut);
+      this.#setSync(await this.api.githubDisconnect(signOut));
       [this.settings, this.auth] = await Promise.all([this.api.getSettings(), this.api.authStatus()]);
       this.syncError = null;
       this.notices.dismiss("needs-pull");
@@ -427,6 +466,13 @@ export class AppState {
     return this.#settingsWrites;
   }
 
+  /** Closes the open sheet, first committing an edit in its focused field (its `change` event). */
+  closeOverlay(): void {
+    const field = document.activeElement;
+    if (field instanceof HTMLElement && field.closest("dialog")) field.blur();
+    this.overlay = null;
+  }
+
   // Keyboard
 
   perform(action: Action): void {
@@ -442,7 +488,7 @@ export class AppState {
         break;
       case "quickOpen":
       case "settings":
-        if (this.overlay === action) this.overlay = null;
+        if (this.overlay === action) this.closeOverlay();
         else if (this.overlay === null) this.overlay = action;
         break;
       case "search":
@@ -466,18 +512,6 @@ export class AppState {
     this.#report(e);
   }
 
-  /** The red dot on Pull: shows what went wrong, with a way to try again. */
-  showSyncError(): void {
-    const error = this.lastError;
-    if (!error) return;
-    this.notices.show({
-      key: "sync-error",
-      tone: "error",
-      text: error.message,
-      action: this.sync.connected ? { label: "Pull now", run: () => void this.pull() } : undefined,
-    });
-  }
-
   // Internals
 
   /** Runs `fn` after every earlier working-tree operation has finished. */
@@ -485,6 +519,17 @@ export class AppState {
     const run = this.#lock.then(fn);
     this.#lock = run.catch(() => {});
     return run;
+  }
+
+  /**
+   * A pull, commit or connect: after earlier operations and any fetch in flight (which holds the
+   * backend's git lock, so autosave isn't paused while waiting for it), with autosave paused.
+   */
+  #gitWork<T>(fn: () => Promise<T>): Promise<T> {
+    return this.#serial(async () => {
+      await this.#fetching;
+      return this.#withSavesPaused(fn);
+    });
   }
 
   /** Writes pending edits, then runs `fn` with autosave paused so no write races the git work. */
@@ -516,22 +561,57 @@ export class AppState {
     }
   }
 
+  #setSync(view: SyncView): void {
+    this.#syncReports++;
+    this.sync = view;
+  }
+
+  /** Reads the sync state; false if a git operation reported it meanwhile, which then stands. */
+  async #readSync(): Promise<boolean> {
+    const before = this.#syncReports;
+    const view = await this.api.syncState();
+    if (this.#syncReports !== before) return false;
+    this.#setSync(view);
+    return true;
+  }
+
+  /** After every successful save. A save can create the file, so the list may need it. */
+  #saved(): void {
+    this.notices.dismiss("save-error");
+    if (this.currentMeta) this.refreshSync();
+    else void this.refresh();
+  }
+
+  /** Runs with autosave paused; the open entry is reloaded, or kept next to the pulled version. */
   async #afterIncoming({ updated, merged, conflicts }: PullResult): Promise<void> {
     await this.refreshEntries();
     const file = this.current.file;
     const touched =
       file !== null && (updated.includes(file) || merged.includes(file) || conflicts.some((c) => c.path === file));
     if (touched) {
-      if (this.current.dirty) {
+      const exists = this.entries.some((e) => e.file === file);
+      if (!this.current.dirty) {
+        if (exists) await this.current.reloadIfClean();
+        else this.current.close();
+      } else if (exists) {
+        // Typed during the pull. As in any conflict, GitHub's version keeps the name and the local
+        // one goes next to it: the buffer moves to a copy, which autosave writes when the pause ends.
+        const names = new Set(this.entries.map((e) => e.file));
+        const copy = conflictCopyName(file, (name) => names.has(name), new Date());
+        this.current.renamed(copy);
         this.notices.show({
           key: "kept-buffer",
           tone: "info",
-          text: "This entry changed on GitHub while you were typing. Your version is kept; the pulled one is in the git history.",
+          text: `This entry changed on GitHub while you were typing. GitHub's version keeps the name; what you have open is saved next to it as ${copy}.`,
+          files: [{ label: `${file} (GitHub's version)`, file }],
         });
-      } else if (this.entries.some((e) => e.file === file)) {
-        await this.current.reloadIfClean();
       } else {
-        this.current.close();
+        // Removed on GitHub. A changed file is kept, so autosave writes the buffer back.
+        this.notices.show({
+          key: "kept-buffer",
+          tone: "info",
+          text: `${file} was removed on GitHub while you were typing. Your text is kept and saved under its name again.`,
+        });
       }
     }
     if (conflicts.length) this.notices.show(conflictNotice(conflicts));
@@ -557,20 +637,21 @@ export class AppState {
         action: { label: "Settings", run: () => (this.overlay = "settings") },
       });
     } else {
-      this.notices.show({ tone: "error", text: error.message });
+      // A failed save replaces the entry's own notice about it, which a later save dismisses.
+      this.notices.show({ key: e instanceof SaveError ? "save-error" : undefined, tone: "error", text: error.message });
     }
   }
 }
 
+/** Entries in the list link to them; other files (images) are only named. */
 function conflictNotice(conflicts: Conflict[]): Omit<Notice, "id"> {
+  const named = (path: string, label = path) => ({ label, file: isEntryFile(path) ? path : undefined });
   return {
     key: "conflicts",
     tone: "info",
     text: `${plural(conflicts.length, "file")} changed on both sides. GitHub's version keeps the name; yours is saved next to it, so nothing was lost:`,
     files: conflicts.map((c) =>
-      c.copy
-        ? { file: c.copy, label: c.copy }
-        : { file: c.path, label: `${c.path} (deleted here, kept GitHub's version)` },
+      c.copy ? named(c.copy) : named(c.path, `${c.path} (deleted here, kept GitHub's version)`),
     ),
   };
 }

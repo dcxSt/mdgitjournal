@@ -34,6 +34,14 @@ export function shortcutAction(e: KeyInput, mac: boolean): Action | null {
   return BINDINGS.find((b) => b.key === key && b.shift === e.shiftKey)?.action ?? null;
 }
 
+/** Mod keys Vim binds outside insert mode: Ctrl-E scrolls, Ctrl-N and Ctrl-P move down and up. */
+const VIM_KEYS: readonly Action[] = ["toggleMode", "new", "quickOpen"];
+
+/** On Linux (Mod is Ctrl) with Vim keys on, the editor keeps the Ctrl keys Vim uses. */
+export function yieldsToVim(action: Action, target: EventTarget | null, mac: boolean, vim: boolean): boolean {
+  return !mac && vim && VIM_KEYS.includes(action) && target instanceof Element && target.closest(".cm-editor") !== null;
+}
+
 export function shortcutLabel(action: Action, mac: boolean): string {
   const binding = BINDINGS.find((b) => b.action === action)!;
   const key = binding.key.toUpperCase();

@@ -4,7 +4,7 @@
 
 import { ApiError, onVisible, type Api, type Unlisten } from "./api";
 import { DEFAULT_SETTINGS, SIGNED_OUT } from "./defaults";
-import { slugPreview, wordCount } from "./journal";
+import { conflictCopyName, slugPreview, wordCount } from "./journal";
 import type {
   AuthStatus,
   Conflict,
@@ -188,8 +188,7 @@ export function createMockApi(options: MockOptions = {}): MockApi {
       if (local === undefined && base !== undefined) {
         conflicts.push({ path: file, copy: null });
       } else if (local !== undefined && local !== base && local !== content) {
-        const stem = file.replace(/\.md$/, "");
-        const copy = dedupe(`${stem}.conflict-${pad(stamp.getHours())}${pad(stamp.getMinutes())}`, ".md");
+        const copy = conflictCopyName(file, (name) => files.has(name), stamp);
         write(copy, local);
         conflicts.push({ path: file, copy });
       }
@@ -303,12 +302,15 @@ export function createMockApi(options: MockOptions = {}): MockApi {
     async importImage(entryFile, bytes) {
       await step("importImage", 2);
       existing(entryFile);
-      const stem = entryFile.replace(/\.md$/, "");
-      let n = 1;
-      while (files.has(`assets/${stem}-${n}.jpg`)) n++;
-      const path = `assets/${stem}-${n}.jpg`;
-      const url = typeof URL.createObjectURL === "function" ? URL.createObjectURL(new Blob([bytes])) : "";
-      files.set(path, url);
+      // Named by content like the backend's (which hashes the JPEG it made, not the input); the
+      // same image again is the same file.
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      const hex = [...digest.slice(0, 4)].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const path = `assets/${entryFile.replace(/\.md$/, "")}-${hex}.jpg`;
+      if (!files.has(path)) {
+        const url = typeof URL.createObjectURL === "function" ? URL.createObjectURL(new Blob([bytes])) : "";
+        files.set(path, url);
+      }
       return { path, bytes: bytes.length, width: 0, height: 0 };
     },
 
@@ -432,6 +434,10 @@ export function createMockApi(options: MockOptions = {}): MockApi {
         newRepo: "https://github.com/new?name=journal&visibility=private",
         install: "https://github.com/apps/mdgitjournal/installations/new",
       };
+    },
+    async thirdPartyNotices() {
+      await step("thirdPartyNotices");
+      return "# Third-party notices\n\nThe app shows packaging/THIRD-PARTY-NOTICES.md here.\n";
     },
 
     async onSyncState(cb) {

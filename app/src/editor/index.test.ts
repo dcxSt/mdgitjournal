@@ -27,9 +27,10 @@ function drop(view: EditorView, clipboard: Clipboard): Event {
   return event;
 }
 
-function key(view: EditorView, init: KeyboardEventInit) {
+function key(view: EditorView, init: KeyboardEventInit): Event {
   const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
   view.contentDOM.dispatchEvent(event);
+  return event;
 }
 
 const png = (name = "shot.png") =>
@@ -73,15 +74,48 @@ describe("image paste and drop", () => {
     await vi.waitFor(() => expect(handle.getDoc()).toBe("typed ab\n![](assets/x-1.jpg)"));
   });
 
-  it("drops the links when another entry was loaded meanwhile", async () => {
+  it("drops the links when another entry was loaded meanwhile, and says so", async () => {
     const { onImageFiles, settle } = importer();
-    const { handle, view, onChange } = mount({ doc: "one", onImageFiles });
+    const onImagesUnlinked = vi.fn();
+    const { handle, view, onChange } = mount({ doc: "one", onImageFiles, onImagesUnlinked });
     paste(view, { files: [png()] });
     handle.setDoc("two");
     settle(["assets/one-1.jpg"]);
-    await new Promise((resolve) => setTimeout(resolve));
+    await vi.waitFor(() => expect(onImagesUnlinked).toHaveBeenCalledWith(["assets/one-1.jpg"]));
     expect(handle.getDoc()).toBe("two");
     expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("reports nothing when the links were inserted or the import gave none", async () => {
+    const { onImageFiles, settle } = importer();
+    const onImagesUnlinked = vi.fn();
+    const { handle, view } = mount({ doc: "", onImageFiles, onImagesUnlinked });
+    paste(view, { files: [png()] });
+    settle(["assets/x-1.jpg"]);
+    await vi.waitFor(() => expect(handle.getDoc()).toBe("![](assets/x-1.jpg)"));
+    paste(view, { files: [png()] });
+    handle.setDoc("two");
+    settle([]);
+    await new Promise((resolve) => setTimeout(resolve));
+    expect(onImagesUnlinked).not.toHaveBeenCalled();
+  });
+
+  it("importImages (the phone's photo picker) keeps the selected text", async () => {
+    const { onImageFiles, settle } = importer();
+    const onImagesUnlinked = vi.fn();
+    const { view, handle } = mount({ doc: "Five miles", onImageFiles, onImagesUnlinked });
+    view.dispatch({ selection: { anchor: 0, head: 4 } });
+    const file = png();
+    handle.importImages([file]);
+    expect(onImageFiles).toHaveBeenCalledWith([file]);
+    settle(["assets/x-1.jpg"]);
+    await vi.waitFor(() => expect(handle.getDoc()).toBe("Five\n![](assets/x-1.jpg)\n miles"));
+
+    // Destroyed before the import finished: reported, like a paste.
+    handle.importImages([png()]);
+    handle.destroy();
+    settle(["assets/x-2.jpg"]);
+    await vi.waitFor(() => expect(onImagesUnlinked).toHaveBeenCalledWith(["assets/x-2.jpg"]));
   });
 
   it("pastes text, not the picture of it, from rich-text apps", () => {
@@ -182,6 +216,72 @@ describe("vim", () => {
     handle.setVim(false);
     expect(getCM(view)).toBeNull();
     expect(handle.getDoc()).toBe("text");
+  });
+
+  it("jumps in a shorter entry after jumping far into a longer one", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const long = Array.from({ length: 200 }, (_, n) => `line ${n}`).join("\n");
+    const { view, handle } = mount({ doc: long, vim: true });
+    expect(key(view, { key: "G", shiftKey: true }).defaultPrevented).toBe(true);
+    Vim.handleKey(getCM(view)!, "y", "user");
+    Vim.handleKey(getCM(view)!, "y", "user");
+
+    const short = "short\nentry\n";
+    handle.setDoc(short);
+    view.dispatch({ selection: { anchor: 3 } });
+    // A key vim fails on is not consumed, and the browser types it into the entry.
+    expect(key(view, { key: "g" }).defaultPrevented).toBe(true);
+    expect(key(view, { key: "g" }).defaultPrevented).toBe(true);
+    expect(view.state.selection.main.head).toBe(0);
+    expect(key(view, { key: "G", shiftKey: true }).defaultPrevented).toBe(true);
+    expect(view.state.selection.main.head).toBe(short.length);
+    expect(error).not.toHaveBeenCalled();
+    expect(handle.getDoc()).toBe(short);
+    // Registers carry over to the next entry.
+    expect(Vim.getRegisterController().getRegister('"').toString()).toBe("line 199\n");
+  });
+
+  it("jumps after the document shrank while vim was off", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const long = Array.from({ length: 200 }, (_, n) => `line ${n}`).join("\n");
+    const { view, handle } = mount({ doc: long, vim: true });
+    key(view, { key: "G", shiftKey: true });
+    handle.setVim(false);
+    view.dispatch({ changes: { from: 10, to: long.length } });
+    handle.setVim(true);
+    expect(key(view, { key: "g" }).defaultPrevented).toBe(true);
+    expect(key(view, { key: "g" }).defaultPrevented).toBe(true);
+    expect(error).not.toHaveBeenCalled();
+    expect(handle.getDoc()).toBe(long.slice(0, 10));
+  });
+
+  it("puts over a backward visual selection (codemirror-vim threw there, after deleting it)", () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { view, handle } = mount({ doc: "hello world", vim: true });
+    for (const k of "0yiwwvb") key(view, { key: k });
+    expect(key(view, { key: "p" }).defaultPrevented).toBe(true);
+    expect(handle.getDoc()).toBe("helloorld");
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it("drops text that reaches the document outside insert mode, such as a key vim failed on", () => {
+    const { view, handle } = mount({ doc: "hello", vim: true });
+    const input = (text: string) =>
+      view.state.facet(EditorView.inputHandler).some((handler) =>
+        handler(view, 0, 0, text, () => view.state.update({ changes: { from: 0, insert: text } })),
+      );
+    expect(input("p")).toBe(true);
+    key(view, { key: "i" });
+    expect(input("p")).toBe(false);
+    expect(handle.getDoc()).toBe("hello");
+  });
+
+  it("keeps :set options across entries", () => {
+    const { view, handle } = mount({ vim: true });
+    Vim.handleEx(getCM(view) as CodeMirrorV, "set nopcre");
+    handle.setDoc("next");
+    expect(Vim.getOption("pcre")).toBe(false);
+    Vim.setOption("pcre", true);
   });
 
   it("is never enabled on mobile", () => {

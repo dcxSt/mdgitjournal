@@ -798,3 +798,125 @@ fn rebase_and_uncommitted_edits_merge_together() {
     );
     assert_eq!(b.changes(), [("entry.md".into(), ChangeKind::Modified)]);
 }
+
+#[test]
+fn a_remote_symlink_is_refused_and_nothing_is_written() {
+    let (_remote, a, b) = two_devices(&[("base.md", "base\n")]);
+    let outside = tempfile::tempdir().unwrap();
+    // Committed with plain git: the app never makes links.
+    let git = a.git();
+    let link = git
+        .blob(outside.path().to_str().unwrap().as_bytes())
+        .unwrap();
+    let note = git.blob(b"note\n").unwrap();
+    let head = git.head().unwrap().peel_to_commit().unwrap();
+    let mut builder = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    builder.insert("assets", link, 0o120000).unwrap();
+    builder.insert("note.md", note, 0o100644).unwrap();
+    let tree = git.find_tree(builder.write().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test Author", "test@example.com").unwrap();
+    git.commit(Some("HEAD"), &sig, &sig, "Link", &tree, &[&head])
+        .unwrap();
+    a.repo.push(None).unwrap();
+
+    let before = b.head();
+    let result = b.repo.pull(None, &author());
+    assert!(
+        matches!(&result, Err(Error::Git(m)) if m.contains("symbolic link")),
+        "{result:?}"
+    );
+    assert_eq!(b.head(), before);
+    assert_eq!(b.files(), ["base.md"]);
+    assert!(b.root().join("assets").symlink_metadata().is_err());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_remote_rename_and_edit_with_a_local_edit_is_reported() {
+    let body = "A long enough entry for rename detection to recognise it.\n".repeat(4);
+    let (old, new) = ("2026-11-16-1402-old.md", "2026-11-16-1402-new.md");
+    let (_remote, a, b) = two_devices(&[(old, &body)]);
+    a.remove(old);
+    a.write(new, format!("Top line from a.\n{body}"));
+    commit_and_push(&a, "Rename and edit");
+    let local = format!("{body}Bottom line from b.\n");
+    b.write(old, &local);
+
+    let out = pull(&b);
+    assert_eq!(
+        b.text(new),
+        format!("Top line from a.\n{body}Bottom line from b.\n")
+    );
+    assert_eq!(b.text(old), local, "b's exact bytes stay on disk");
+    assert_eq!(
+        out.conflicts,
+        [Conflict {
+            path: new.into(),
+            copy: Some(old.into())
+        }]
+    );
+}
+
+/// A small PNG with some texture; `seed` changes it.
+fn png(seed: u32) -> Vec<u8> {
+    let image = image::RgbImage::from_fn(96, 64, |x, y| {
+        image::Rgb([
+            ((x + seed) % 256) as u8,
+            (y % 256) as u8,
+            ((x ^ y) % 256) as u8,
+        ])
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    bytes.into_inner()
+}
+
+#[test]
+fn photos_added_to_one_entry_on_two_devices_both_survive() {
+    use mdgj_core::{ImageOpts, Journal};
+    const OPTS: ImageOpts = ImageOpts {
+        max_edge: 1024,
+        quality: 60,
+    };
+    let entry = "2026-11-16-1402-run.md";
+    let base = "Line one.\nLine two.\nLine three.\n";
+    for (b_commits_first, b_seed) in [(false, 1), (true, 1), (false, 0), (true, 0)] {
+        let (_remote, a, b) = two_devices(&[(entry, base)]);
+        let from_a = Journal::open(a.root())
+            .unwrap()
+            .import_image(entry, &png(0), OPTS)
+            .unwrap()
+            .path;
+        a.write(
+            entry,
+            format!("Line one.\n![]({from_a})\nLine two.\nLine three.\n"),
+        );
+        commit_and_push(&a, "Photo on a");
+
+        let from_b = Journal::open(b.root())
+            .unwrap()
+            .import_image(entry, &png(b_seed), OPTS)
+            .unwrap()
+            .path;
+        let b_bytes = b.read(&from_b);
+        b.write(entry, format!("{base}![]({from_b})\n"));
+        if b_commits_first {
+            b.commit("Photo on b");
+        }
+
+        let out = pull(&b);
+        let case = format!(
+            "b commits first: {b_commits_first}, same photo: {}",
+            b_seed == 0
+        );
+        assert_eq!(out.conflicts, [], "{case}");
+        assert_eq!(
+            b.text(entry),
+            format!("Line one.\n![]({from_a})\nLine two.\nLine three.\n![]({from_b})\n"),
+            "{case}"
+        );
+        assert_eq!(b.read(&from_a), a.read(&from_a), "{case}");
+        assert_eq!(b.read(&from_b), b_bytes, "{case}");
+        assert_eq!(from_a == from_b, b_seed == 0, "{case}");
+    }
+}

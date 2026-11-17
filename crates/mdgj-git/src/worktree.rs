@@ -1,6 +1,6 @@
 //! The working tree as git sees it: an in-memory snapshot, and writing a merge result back to disk.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -23,6 +23,8 @@ const TEMP_FILE: &str = "mdgitjournal-write.tmp";
 const MEMPACK_PRIORITY: i32 = 1000;
 /// Submodules are recorded, never written; git leaves them alone on checkout too.
 const GITLINK: u32 = 0o160000;
+/// Symbolic links are never written: a link from the remote could point the journal anywhere.
+const LINK: u32 = 0o120000;
 /// The merge stage bits of an index entry's flags; 0 for a resolved entry.
 pub(crate) const STAGE_MASK: u16 = 0x3000;
 
@@ -75,9 +77,17 @@ pub(crate) fn apply(
 
     // Every path is checked before the first change, so an unsafe path or a folder in the way
     // aborts with the working tree untouched.
+    no_case_collisions(target.keys())?;
     let mut writes = Vec::new();
     for (path, &(id, mode)) in target {
         if mode != GITLINK && current.get(path) != Some(&(id, mode)) {
+            if mode == LINK {
+                return Err(Error::Git(format!(
+                    "the remote has a symbolic link at \"{}\"; mdgitjournal does not write links. \
+                     Remove it from the repository with git and pull again",
+                    lossy(path)
+                )));
+            }
             let full = checked_path(workdir, path)?;
             not_a_folder(&full)?;
             writes.push((path, full, id, mode));
@@ -101,6 +111,8 @@ pub(crate) fn apply(
             let copy = copy_path(path, stamp, |p| {
                 target.contains_key(p) || current.contains_key(p) || exists(workdir, p)
             });
+            checked_path(workdir, path)?;
+            make_parents(workdir, &copy)?;
             fs::rename(&full, workdir.join(OsStr::from_bytes(&copy)))?;
             touched.push(lossy(&copy));
             conflicts.push(Conflict {
@@ -108,9 +120,7 @@ pub(crate) fn apply(
                 copy: Some(lossy(&copy)),
             });
         }
-        if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        make_parents(workdir, path)?;
         write_blob(repo, &full, id, mode)?;
         written.insert(file_id(&fs::symlink_metadata(&full)?));
         touched.push(lossy(path));
@@ -122,6 +132,7 @@ pub(crate) fn apply(
         // On a case-insensitive file system the old name can reach a file just written under
         // another spelling.
         if !written.contains(&file_id(&meta)) && !differs_on_disk(repo, &full, Some(id))? {
+            checked_path(workdir, path)?;
             remove_file(workdir, &full)?;
             touched.push(lossy(path));
         }
@@ -200,6 +211,60 @@ fn checked_path(workdir: &Path, path: &[u8]) -> Result<PathBuf> {
     Ok(full)
 }
 
+/// Creates the missing folders above `path`, checking each one as it goes, so a folder never
+/// resolves through a symlink, even one that appeared after planning.
+fn make_parents(workdir: &Path, path: &[u8]) -> Result<()> {
+    let mut full = workdir.to_path_buf();
+    let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+    for part in &parts[..parts.len().saturating_sub(1)] {
+        full.push(OsStr::from_bytes(part));
+        match fs::create_dir(&full) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        }
+        if !full.symlink_metadata()?.is_dir() {
+            return Err(Error::Io(format!(
+                "cannot write \"{}\": {} is not a folder",
+                lossy(path),
+                full.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses paths that name the same file on a case-insensitive file system (APFS's default), such
+/// as `A` and `a/x.md`: writing one could go through the other.
+fn no_case_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>) -> Result<()> {
+    let mut seen: HashMap<String, &[u8]> = HashMap::new();
+    for path in paths {
+        let ends = path
+            .iter()
+            .enumerate()
+            .filter(|&(_, &b)| b == b'/')
+            .map(|(i, _)| i);
+        for end in ends.chain([path.len()]) {
+            let prefix = &path[..end];
+            let folded = String::from_utf8_lossy(prefix).to_lowercase();
+            match seen.get(folded.as_str()) {
+                Some(other) if *other != prefix => {
+                    return Err(Error::Git(format!(
+                        "the remote has both \"{}\" and \"{}\", which are the same name on this \
+                         device; rename one of them with git and pull again",
+                        lossy(other),
+                        lossy(prefix)
+                    )))
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(folded, prefix);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Atomically replaces `full` with the blob's bytes, exactly as stored.
 fn write_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<()> {
     let blob = repo.find_blob(id)?;
@@ -212,10 +277,6 @@ fn write_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<()> 
         0o666
     } else if mode == u32::from(FileMode::BlobExecutable) {
         0o777
-    } else if mode == u32::from(FileMode::Link) {
-        std::os::unix::fs::symlink(OsStr::from_bytes(blob.content()), &temp)?;
-        fs::rename(&temp, full)?;
-        return Ok(());
     } else {
         return Err(Error::Git(format!(
             "{} has an unsupported file type (mode {mode:o})",
@@ -315,5 +376,59 @@ mod tests {
             assert!(apply(&snapshot, &target, "0000", &mut Vec::new()).is_err());
             assert!(!dir.path().join("aaa-first.md").exists());
         }
+    }
+
+    #[test]
+    fn remote_symlinks_are_refused_before_anything_is_written() {
+        let (dir, repo) = setup();
+        let snapshot = Snapshot::take(&repo).unwrap();
+        let link = snapshot.repo.blob(b"../outside").unwrap();
+        let blob = snapshot.repo.blob(b"x").unwrap();
+        let target = Files::from([
+            (b"aaa-first.md".to_vec(), (blob, u32::from(FileMode::Blob))),
+            (b"link".to_vec(), (link, LINK)),
+        ]);
+        let result = apply(&snapshot, &target, "0000", &mut Vec::new());
+        assert!(
+            matches!(&result, Err(Error::Git(m)) if m.contains("symbolic link")),
+            "{result:?}"
+        );
+        assert!(!dir.path().join("aaa-first.md").exists());
+        assert!(dir.path().join("link").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn writes_never_go_through_a_symlinked_folder() {
+        let (dir, repo) = setup();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).unwrap();
+        let snapshot = Snapshot::take(&repo).unwrap();
+        let blob = snapshot.repo.blob(b"x").unwrap();
+        let target = Files::from([(b"a/x.md".to_vec(), (blob, u32::from(FileMode::Blob)))]);
+        assert!(apply(&snapshot, &target, "0000", &mut Vec::new()).is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        // A link that appears after planning is caught when the folder is made.
+        fs::remove_file(dir.path().join("a")).unwrap();
+        let snapshot = Snapshot::take(&repo).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).unwrap();
+        assert!(make_parents(dir.path(), b"a/x.md").is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        drop(snapshot);
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_are_refused() {
+        let (dir, repo) = setup();
+        let snapshot = Snapshot::take(&repo).unwrap();
+        let blob = snapshot.repo.blob(b"x").unwrap();
+        let target = Files::from([
+            (b"A".to_vec(), (blob, u32::from(FileMode::Blob))),
+            (b"a/x.md".to_vec(), (blob, u32::from(FileMode::Blob))),
+            (b"aaa-first.md".to_vec(), (blob, u32::from(FileMode::Blob))),
+        ]);
+        assert!(apply(&snapshot, &target, "0000", &mut Vec::new()).is_err());
+        assert!(!dir.path().join("aaa-first.md").exists());
+        assert!(!dir.path().join("A").exists());
     }
 }

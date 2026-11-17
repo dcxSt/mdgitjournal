@@ -165,7 +165,11 @@ impl Journal {
     }
 
     /// Compresses an image (see [`compress_image`]) and saves it as
-    /// `assets/<entry-stem>-N.jpg` with the first free N, starting at 1.
+    /// `assets/<entry-stem>-<hash>.jpg`, where `<hash>` is the first 8 hex digits of the JPEG's
+    /// SHA-256. Named by content, different images added on two devices get different names
+    /// (barring a 1 in 4 billion clash), and the same image added twice is saved once. If the
+    /// name holds a different file, `-2`, `-3`, … is appended. A symlink or a file named `assets`
+    /// is refused, so an image is never written outside the journal.
     pub fn import_image(
         &self,
         entry_file: &str,
@@ -175,9 +179,9 @@ impl Journal {
         validate(entry_file)?;
         let (jpeg, width, height) = compress_image(bytes, opts)?;
         let dir = self.root.join(ASSETS);
-        let stem = stem(entry_file);
-        let name = fs::create_dir_all(&dir)
-            .and_then(|()| atomic::write_new(&dir, &jpeg, |n| format!("{stem}-{n}.jpg")))
+        let base = format!("{}-{}", stem(entry_file), &hash(&jpeg)[..8]);
+        let name = assets_dir(&dir)
+            .and_then(|()| atomic::write_new(&dir, &jpeg, |n| numbered(&base, n) + ".jpg"))
             .map_err(|err| Error::io("could not save the image", err))?;
         Ok(ImportedImage {
             path: format!("{ASSETS}/{name}"),
@@ -261,6 +265,16 @@ fn validate(file: &str) -> Result<()> {
 }
 
 /// Device and inode: equal for two names of the same file.
+/// Creates `dir` if it is missing; anything there but a real folder (a symlink, a file) is refused.
+fn assets_dir(dir: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::other(format!("{ASSETS} is not a folder"))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir(dir),
+        Err(err) => Err(err),
+    }
+}
+
 fn file_id(meta: &Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }

@@ -1,8 +1,12 @@
 import { expect, type Page } from "@playwright/test";
 
-/** The parts of `window.mdgjMock` (src/lib/mock.ts) the tests read. */
+/** The parts of `window.mdgjMock` (src/lib/mock.ts) the tests use. */
 interface MockWindow {
-  mdgjMock: { files: Map<string, string>; calls: string[] };
+  mdgjMock: {
+    files: Map<string, string>;
+    calls: string[];
+    failNext(method: string, kind: string, message: string): void;
+  };
 }
 
 export const SAMPLE = "2026-11-16-1402-morning-run.md";
@@ -21,6 +25,19 @@ export async function modKey(page: Page): Promise<"Meta" | "Control"> {
 
 export function fileText(page: Page, file: string): Promise<string | undefined> {
   return page.evaluate((f) => (window as unknown as MockWindow).mdgjMock.files.get(f), file);
+}
+
+/** Puts a file in the mock's journal folder, as git or another program would. */
+export function addFile(page: Page, file: string, content: string): Promise<void> {
+  return page.evaluate(([f, c]) => void (window as unknown as MockWindow).mdgjMock.files.set(f, c), [file, content]);
+}
+
+/** Makes the next call of `method` fail. */
+export function failNext(page: Page, method: string, kind: string, message: string): Promise<void> {
+  return page.evaluate(
+    ([m, k, text]) => (window as unknown as MockWindow).mdgjMock.failNext(m, k, text),
+    [method, kind, message],
+  );
 }
 
 export function callCount(page: Page, method: string): Promise<number> {

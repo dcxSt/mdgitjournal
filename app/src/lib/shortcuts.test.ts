@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { commitSheetKey, shortcutAction, shortcutLabel, type Action, type KeyInput } from "./shortcuts";
+import { commitSheetKey, shortcutAction, shortcutLabel, yieldsToVim, type Action, type KeyInput } from "./shortcuts";
 
 function key(k: string, mods: Partial<KeyInput> = {}): KeyInput {
   const code = /^[a-z]$/i.test(k) ? `Key${k.toUpperCase()}` : ({ "\\": "Backslash", ",": "Comma" }[k] ?? k);
@@ -45,6 +45,27 @@ describe("shortcutAction", () => {
 
   it("falls back to the physical key on non-Latin layouts", () => {
     expect(shortcutAction({ ...key("n", { ctrlKey: true }), key: "т" }, false)).toBe("new");
+  });
+});
+
+describe("yieldsToVim", () => {
+  const editor = document.createElement("div");
+  editor.className = "cm-editor";
+  const text = editor.appendChild(document.createElement("div"));
+  const outside = document.createElement("input");
+
+  it("leaves Ctrl-E, Ctrl-N and Ctrl-P to Vim in the text on Linux", () => {
+    for (const action of ["toggleMode", "new", "quickOpen"] as const) {
+      expect(yieldsToVim(action, text, false, true)).toBe(true);
+    }
+  });
+
+  it("keeps the app's shortcuts otherwise", () => {
+    expect(yieldsToVim("commit", text, false, true)).toBe(false);
+    expect(yieldsToVim("toggleMode", outside, false, true)).toBe(false);
+    expect(yieldsToVim("toggleMode", text, false, false)).toBe(false);
+    // On a Mac Mod is Cmd, which Vim doesn't use.
+    expect(yieldsToVim("toggleMode", text, true, true)).toBe(false);
   });
 });
 

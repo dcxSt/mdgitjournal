@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { imageLink, type EditorHandle } from "../editor";
+  import type { EditorHandle } from "../editor";
   import type { AppState } from "../lib/app.svelte";
   import { entryTimestamp } from "../lib/journal";
   import AccessoryBar from "./AccessoryBar.svelte";
@@ -17,14 +17,10 @@
   let photoInput = $state<HTMLInputElement>();
   const stamp = $derived(app.currentMeta && entryTimestamp(app.currentMeta));
 
-  async function addPhotos(input: HTMLInputElement) {
+  function addPhotos(input: HTMLInputElement) {
     const files = [...(input.files ?? [])];
     input.value = "";
-    const file = app.current.file;
-    const paths = await app.importImages(files);
-    if (paths.length && editor && app.current.file === file) {
-      editor.insertAtCursor(paths.map(imageLink).join("\n"));
-    }
+    editor?.importImages(files);
   }
 </script>
 

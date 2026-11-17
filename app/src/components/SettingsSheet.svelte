@@ -26,6 +26,7 @@
 
   let connecting = $state(false);
   let confirmDisconnect = $state(false);
+  let notices = $state<string | null>(null);
 
   const settings = $derived(app.settings);
   const info = $derived(app.info);
@@ -59,16 +60,27 @@
     }
   }
 
+  /** Loaded when first shown: some 500 KB of licence text. */
+  async function showNotices(details: HTMLDetailsElement) {
+    if (!details.open || notices !== null) return;
+    try {
+      notices = await app.api.thirdPartyNotices();
+    } catch (e) {
+      details.open = false;
+      app.showError(e);
+    }
+  }
+
   async function disconnect(signOut: boolean) {
     confirmDisconnect = false;
     await app.disconnect(signOut);
   }
 </script>
 
-<Sheet label="Settings" wide onclose={() => (app.overlay = null)}>
+<Sheet label="Settings" wide onclose={() => app.closeOverlay()}>
   <div class="head">
     <h2>Settings</h2>
-    <button type="button" class="close" aria-label="Close settings" onclick={() => (app.overlay = null)}>
+    <button type="button" class="close" aria-label="Close settings" onclick={() => app.closeOverlay()}>
       <Icon name="close" />
     </button>
   </div>
@@ -88,6 +100,11 @@
           onchange={(e) => app.saveSettings({ vim: e.currentTarget.checked })}
         />
       </label>
+      {#if settings.vim && !app.mac}
+        <p class="hint">
+          In the text, Ctrl+E, Ctrl+N and Ctrl+P are Vim's; outside it they are the app's shortcuts.
+        </p>
+      {/if}
     {/if}
     <div class="row">
       <span>Theme</span>
@@ -239,7 +256,17 @@
         <p class="hint">An ordinary git repository: the git command line works on it too.</p>
       {/if}
     </section>
-    <p class="version muted">mdgitjournal {info.version}</p>
+    <section class="about">
+      <h3>About</h3>
+      <p>mdgitjournal {info.version} · MIT licence · © 2026 Stephen Fay</p>
+      <p class="hint">This software is based in part on the work of the Independent JPEG Group.</p>
+      <details ontoggle={(e) => showNotices(e.currentTarget)}>
+        <summary>Third-party notices</summary>
+        {#if notices !== null}
+          <pre class="notices">{notices}</pre>
+        {/if}
+      </details>
+    </section>
   {/if}
 </Sheet>
 
@@ -334,24 +361,34 @@
     gap: 8px;
   }
 
-  .version {
-    margin-top: 12px;
-    font-size: 11px;
+  .about {
+    border-bottom: none;
   }
 
-  @media (max-width: 699px) {
-    .row {
-      min-height: var(--touch);
-    }
+  summary {
+    color: var(--color-accent);
+    cursor: default;
+  }
 
-    .button {
-      min-height: var(--touch);
-    }
+  .notices {
+    max-height: 50vh;
+    margin: 8px 0 0;
+    overflow: auto;
+    font-family: var(--font-source);
+    font-size: 11px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    color: var(--color-muted);
+  }
 
-    .close {
-      width: var(--touch);
-      height: var(--touch);
-      margin-right: -8px;
-    }
+  :global([data-layout="phone"]) .row,
+  :global([data-layout="phone"]) .button {
+    min-height: var(--touch);
+  }
+
+  :global([data-layout="phone"]) .close {
+    width: var(--touch);
+    height: var(--touch);
+    margin-right: -8px;
   }
 </style>

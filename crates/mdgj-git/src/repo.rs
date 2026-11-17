@@ -311,7 +311,7 @@ fn file_change(delta: DiffDelta<'_>) -> Option<FileChange> {
 }
 
 /// "https://user:secret@host/x.git" -> "https://host/x.git", so credentials never reach .git/config.
-fn without_userinfo(url: &str) -> String {
+pub(crate) fn without_userinfo(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };

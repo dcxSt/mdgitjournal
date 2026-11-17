@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import CommitSheet from "./components/CommitSheet.svelte";
+  import DeleteSheet from "./components/DeleteSheet.svelte";
   import Desktop from "./components/Desktop.svelte";
   import Mobile from "./components/Mobile.svelte";
   import Notices from "./components/Notices.svelte";
   import QuickOpen from "./components/QuickOpen.svelte";
   import SettingsSheet from "./components/SettingsSheet.svelte";
   import type { AppState } from "./lib/app.svelte";
-  import { shortcutAction } from "./lib/shortcuts";
+  import { shortcutAction, yieldsToVim } from "./lib/shortcuts";
 
   let { app }: { app: AppState } = $props();
 
@@ -30,11 +31,16 @@
     else root.dataset.theme = app.settings.theme;
   });
 
-  // Capture phase: app shortcuts win over the editor's own keymaps.
+  // Phone-sized sheets and fields follow the layout, not the window width (styles/app.css).
+  $effect(() => {
+    document.documentElement.dataset.layout = app.mobile ? "phone" : "desktop";
+  });
+
+  // Capture phase: app shortcuts win over the editor's own keymaps, except the few Vim needs.
   function onkeydown(e: KeyboardEvent) {
     if (!app.ready) return;
     const action = shortcutAction(e, app.mac);
-    if (!action) return;
+    if (!action || yieldsToVim(action, e.target, app.mac, app.settings.vim && !app.mobile)) return;
     e.preventDefault();
     e.stopPropagation();
     app.perform(action);
@@ -58,6 +64,8 @@
     <SettingsSheet {app} />
   {:else if app.overlay === "quickOpen"}
     <QuickOpen {app} />
+  {:else if app.overlay === "delete"}
+    <DeleteSheet {app} />
   {/if}
 {/if}
 

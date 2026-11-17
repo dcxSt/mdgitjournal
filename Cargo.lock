@@ -2376,6 +2376,8 @@ name = "mdgitjournal"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "git2",
+ "keyring",
  "mdgj-core",
  "mdgj-git",
  "mdgj-github",
@@ -2411,6 +2413,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "git2",
+ "image",
+ "mdgj-core",
  "serde",
  "tempfile",
  "thiserror 2.0.21",

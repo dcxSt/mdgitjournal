@@ -8,6 +8,9 @@ import type { EntryContent } from "./types";
 export const AUTOSAVE_MS = 400;
 const RETRY_MS = 3000;
 const WORDS_MS = 250;
+const PAUSED_TEXT = "Your latest edits will be saved when the sync in progress finishes.";
+/** Half of a UTF-16 surrogate pair: no file can hold it, so it is never sent to be saved. */
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 
 export class SaveError extends Error {
   override name = "SaveError";
@@ -34,6 +37,11 @@ export class CurrentEntry {
   constructor(
     private readonly api: Api,
     private readonly onSaved: () => void = () => {},
+    /**
+     * The first failure after a successful save; the retries that follow don't call it again.
+     * `retrying` is false when only an edit can fix it.
+     */
+    private readonly onSaveFailed: (file: string, message: string, retrying: boolean) => void = () => {},
   ) {}
 
   load(entry: EntryContent): void {
@@ -82,10 +90,14 @@ export class CurrentEntry {
     }
   }
 
-  /** Like `flush`, but also writes edits typed while a write was in flight. */
+  /**
+   * Like `flush`, but also writes edits typed while a write was in flight. Throws unless the
+   * buffer is on disk afterwards, which includes while a sync holds autosave back.
+   */
   async settle(): Promise<void> {
     do await this.flush();
     while (this.dirty && !this.#paused);
+    if (this.dirty) throw new SaveError(PAUSED_TEXT);
   }
 
   /** Stops autosave until `resume`; edits keep accumulating in the buffer. */
@@ -93,8 +105,11 @@ export class CurrentEntry {
     this.#paused++;
   }
 
+  /** Edits held back by the pause are written at once. */
   resume(): void {
-    if (--this.#paused === 0 && this.dirty) this.#schedule(AUTOSAVE_MS);
+    if (--this.#paused > 0 || !this.dirty) return;
+    clearTimeout(this.#timer);
+    void this.#enqueue();
   }
 
   /** Reloads from disk if the file changed and the buffer has no unsaved edits. */
@@ -124,6 +139,12 @@ export class CurrentEntry {
     const file = this.file;
     if (this.#paused || !this.dirty || file === null) return;
     const text = this.content;
+    const broken = text.search(LONE_SURROGATE);
+    if (broken >= 0) {
+      const line = text.slice(0, broken).split("\n").length;
+      this.#failed(file, `line ${line} has half of a character (such as an emoji); delete it or undo to save`, false);
+      return;
+    }
     this.saving = true;
     try {
       const { hash } = await this.api.writeEntry(file, text);
@@ -134,10 +155,16 @@ export class CurrentEntry {
       this.saveError = null;
       this.onSaved();
     } catch (e) {
-      this.saveError = e instanceof Error ? e.message : String(e);
-      if (this.file === file) this.#schedule(RETRY_MS);
+      this.#failed(file, e instanceof Error ? e.message : String(e), true);
     } finally {
       this.saving = false;
     }
+  }
+
+  #failed(file: string, message: string, retry: boolean): void {
+    const first = this.saveError === null;
+    this.saveError = message;
+    if (first) this.onSaveFailed(file, message, retry);
+    if (retry && this.file === file) this.#schedule(RETRY_MS);
   }
 }

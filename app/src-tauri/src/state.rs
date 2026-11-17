@@ -29,6 +29,9 @@ pub struct AppState {
     pub journal: Journal,
     /// Held for every git operation, so they never overlap.
     repo: Mutex<Repo>,
+    /// A second handle on the same repository, so reading the sync state never waits for `repo`,
+    /// which a fetch or push holds for as long as the network takes.
+    reader: Mutex<Repo>,
     settings: Mutex<Settings>,
     settings_path: PathBuf,
     pub tokens: TokenManager<KeyringStore, LazyHttp>,
@@ -42,22 +45,31 @@ pub struct AppState {
 
 impl AppState {
     pub fn open(app: &AppHandle) -> Result<Self> {
-        let journal = Journal::open(journal_dir(app)?)?;
-        let repo = Repo::open_or_init(journal.root())?;
-        // Only a safeguard: a journal that can't take it still opens.
-        let _ = exclude_temp_files(journal.root());
-        app.asset_protocol_scope()
-            .allow_directory(journal.root().join("assets"), true)
-            .map_err(|err| Error::io("could not allow image previews", err))?;
+        let dir = journal_dir(app)?;
         let config = app
             .path()
             .app_config_dir()
             .map_err(|err| Error::io("could not find the settings folder", err))?;
+        let state = Self::new(dir, &config)?;
+        app.asset_protocol_scope()
+            .allow_directory(state.journal.root().join("assets"), true)
+            .map_err(|err| Error::io("could not allow image previews", err))?;
+        Ok(state)
+    }
+
+    /// The journal in `dir`, with the settings and the sign-in kept in `config`.
+    fn new(dir: PathBuf, config: &Path) -> Result<Self> {
+        let journal = Journal::open(dir)?;
+        let repo = Repo::open_or_init(journal.root())?;
+        let reader = Repo::open_or_init(journal.root())?;
+        // Only a safeguard: a journal that can't take it still opens.
+        let _ = exclude_clutter(journal.root());
         let settings_path = config.join("settings.json");
         let store = KeyringStore::new(config.join("credentials.json"));
         Ok(Self {
             journal,
             repo: Mutex::new(repo),
+            reader: Mutex::new(reader),
             settings: Mutex::new(Settings::load(&settings_path)),
             settings_path,
             tokens: TokenManager::new(store, GitHub::new(LazyHttp::default())),
@@ -135,9 +147,10 @@ impl AppState {
         Ok(())
     }
 
-    /// The sync state, from local data only.
+    /// The sync state, from local data only. It doesn't wait for an operation in progress, so it
+    /// may show the state from before one; the operation sends the new state when it ends.
     pub fn sync_view(&self) -> Result<SyncView> {
-        let repo = lock(&self.repo);
+        let repo = lock(&self.reader);
         let state = repo.sync_state()?;
         Ok(self.view(&repo, state))
     }
@@ -224,11 +237,13 @@ fn journal_dir(app: &AppHandle) -> Result<PathBuf> {
     Ok(base.join("journal"))
 }
 
-/// mdgj-core saves through `.mdgj-tmp-*` files, which a crash can leave behind. Listing them in
-/// `.git/info/exclude`, which belongs to this clone and is never committed, keeps them out of
-/// commits without changing the journal.
-fn exclude_temp_files(root: &Path) -> io::Result<()> {
-    const PATTERN: &str = ".mdgj-tmp-*";
+/// Keeps files the user never wrote out of commits: the `.mdgj-tmp-*` files mdgj-core saves
+/// through, which a crash can leave behind, and the `.DS_Store` files Finder leaves in folders it
+/// shows. They are listed in `.git/info/exclude`, which belongs to this clone and is never
+/// committed, so no tracked file changes. Excluding never untracks: a journal that already tracks
+/// such a file keeps it.
+fn exclude_clutter(root: &Path) -> io::Result<()> {
+    const PATTERNS: &[&str] = &[".mdgj-tmp-*", ".DS_Store"];
     let git = root.join(".git");
     // `.git` is a file in linked worktrees and submodules; leave those alone.
     if !git.is_dir() {
@@ -241,7 +256,12 @@ fn exclude_temp_files(root: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
-    if existing.lines().any(|line| line.trim() == PATTERN) {
+    let missing: String = PATTERNS
+        .iter()
+        .filter(|pattern| !existing.lines().any(|line| line.trim() == **pattern))
+        .map(|pattern| format!("{pattern}\n"))
+        .collect();
+    if missing.is_empty() {
         return Ok(());
     }
     let newline = if existing.is_empty() || existing.ends_with('\n') {
@@ -254,7 +274,31 @@ fn exclude_temp_files(root: &Path) -> io::Result<()> {
         .create(true)
         .append(true)
         .open(&path)?
-        .write_all(format!("{newline}{PATTERN}\n").as_bytes())
+        .write_all(format!("{newline}{missing}").as_bytes())
+}
+
+const GIT_CONNECT_TIMEOUT_MS: i32 = 15_000;
+/// Per read or write, not for the whole transfer: a slow network that still moves data is fine.
+const GIT_IO_TIMEOUT_MS: i32 = 30_000;
+
+/// Bounds how long libgit2 waits to connect, and then for each read or write. By default it waits
+/// as long as the OS does to connect (75 s on macOS), and forever for a server that stops
+/// answering, all the while holding the repository that every git command needs.
+///
+/// # Safety
+///
+/// Sets libgit2 globals without synchronization: call it before any other thread uses libgit2.
+pub unsafe fn limit_git_waits() {
+    set_git_timeouts(GIT_CONNECT_TIMEOUT_MS, GIT_IO_TIMEOUT_MS);
+}
+
+/// # Safety
+///
+/// As for [`limit_git_waits`].
+unsafe fn set_git_timeouts(connect_ms: i32, io_ms: i32) {
+    // Setting these options can't fail.
+    let _ = git2::opts::set_server_connect_timeout_in_milliseconds(connect_ms);
+    let _ = git2::opts::set_server_timeout_in_milliseconds(io_ms);
 }
 
 /// The commit author: the name and email in settings, else the GitHub account's name and no-reply
@@ -278,10 +322,12 @@ fn non_blank(text: Option<&str>) -> Option<&str> {
     text.map(str::trim).filter(|text| !text.is_empty())
 }
 
+/// The GitHub token as git credentials, which go to github.com only.
 pub fn token_creds(token: String) -> Creds {
     Creds {
         username: "x-access-token".into(),
         password: token,
+        url_prefix: GITHUB.into(),
     }
 }
 
@@ -331,6 +377,11 @@ impl Http for LazyHttp {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
 
     fn user(name: Option<&str>) -> User {
@@ -407,29 +458,36 @@ mod tests {
     fn token_creds_use_the_github_convention() {
         let creds = token_creds("ghu_secret".into());
         assert_eq!(
-            (creds.username.as_str(), creds.password.as_str()),
-            ("x-access-token", "ghu_secret")
+            (
+                creds.username.as_str(),
+                creds.password.as_str(),
+                creds.url_prefix.as_str()
+            ),
+            ("x-access-token", "ghu_secret", "https://github.com/")
         );
     }
 
     #[test]
-    fn temp_files_are_excluded_once() {
+    fn clutter_is_excluded_once() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         Repo::open_or_init(root).unwrap();
         let exclude = root.join(".git/info/exclude");
         fs::write(&exclude, "# user rules\n*.swp").unwrap();
-        exclude_temp_files(root).unwrap();
-        exclude_temp_files(root).unwrap();
+        exclude_clutter(root).unwrap();
+        exclude_clutter(root).unwrap();
         assert_eq!(
             fs::read_to_string(&exclude).unwrap(),
-            "# user rules\n*.swp\n.mdgj-tmp-*\n"
+            "# user rules\n*.swp\n.mdgj-tmp-*\n.DS_Store\n"
         );
 
-        // A temp file left by a crash, at the top and in assets/, is never staged.
+        // Temp files left by a crash and Finder's files, at the top and in assets/, are never
+        // staged.
         fs::write(root.join(".mdgj-tmp-a1b2c3"), "half a save").unwrap();
+        fs::write(root.join(".DS_Store"), "Bud1").unwrap();
         fs::create_dir(root.join("assets")).unwrap();
         fs::write(root.join("assets/.mdgj-tmp-d4e5f6"), "half an image").unwrap();
+        fs::write(root.join("assets/.DS_Store"), "Bud1").unwrap();
         fs::write(root.join("2026-11-16-1402-run.md"), "ran\n").unwrap();
         let repo = Repo::open_or_init(root).unwrap();
         let changed: Vec<_> = repo.status().unwrap().into_iter().map(|c| c.path).collect();
@@ -437,15 +495,30 @@ mod tests {
     }
 
     #[test]
-    fn temp_files_exclude_is_created_if_missing() {
+    fn clutter_exclude_adds_only_what_is_missing() {
+        // As left by a version that excluded only its temp files.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        Repo::open_or_init(root).unwrap();
+        let exclude = root.join(".git/info/exclude");
+        fs::write(&exclude, "*.swp\n  .mdgj-tmp-*  \n").unwrap();
+        exclude_clutter(root).unwrap();
+        assert_eq!(
+            fs::read_to_string(&exclude).unwrap(),
+            "*.swp\n  .mdgj-tmp-*  \n.DS_Store\n"
+        );
+    }
+
+    #[test]
+    fn clutter_exclude_is_created_if_missing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         Repo::open_or_init(root).unwrap();
         fs::remove_dir_all(root.join(".git/info")).unwrap();
-        exclude_temp_files(root).unwrap();
+        exclude_clutter(root).unwrap();
         assert_eq!(
             fs::read_to_string(root.join(".git/info/exclude")).unwrap(),
-            ".mdgj-tmp-*\n"
+            ".mdgj-tmp-*\n.DS_Store\n"
         );
     }
 
@@ -453,10 +526,61 @@ mod tests {
     fn linked_worktrees_are_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
-        exclude_temp_files(dir.path()).unwrap();
+        exclude_clutter(dir.path()).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".git")).unwrap(),
             "gitdir: /elsewhere\n"
         );
+    }
+
+    #[test]
+    fn sync_state_does_not_wait_for_a_git_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().join("journal"), &dir.path().join("config")).unwrap();
+        fs::write(state.journal.root().join("2026-11-16-1402-run.md"), "ran\n").unwrap();
+        // As a fetch waiting on the network does.
+        let busy = lock(&state.repo);
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| tx.send(state.sync_view()).ok());
+            let view = rx.recv_timeout(Duration::from_secs(10));
+            drop(busy);
+            let view = view.expect("sync_state waited for the operation").unwrap();
+            let changed: Vec<_> = view.changes.into_iter().map(|c| c.path).collect();
+            assert_eq!(changed, ["2026-11-16-1402-run.md"]);
+        });
+
+        // It sees what operations change.
+        let repo = lock(&state.repo);
+        repo.set_remote("https://github.com/dcxSt/journal.git")
+            .unwrap();
+        repo.commit_all("Run", &author(&Settings::default(), None))
+            .unwrap();
+        drop(repo);
+        let view = state.sync_view().unwrap();
+        assert!(view.connected && view.changes.is_empty(), "{view:?}");
+    }
+
+    #[test]
+    fn a_server_that_stops_answering_fails_the_fetch() {
+        // Accepted by the OS, then never answered.
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repo::open_or_init(dir.path()).unwrap();
+        let url = format!("http://{}/journal.git", server.local_addr().unwrap());
+        repo.set_remote(&url).unwrap();
+        // SAFETY: no other test in this binary uses the network. Shorter than the app's limits,
+        // to keep the test quick.
+        unsafe { set_git_timeouts(1_000, 1_000) };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(repo.fetch(None)).ok());
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the fetch is still waiting");
+        assert!(
+            matches!(result, Err(mdgj_git::Error::Network(_))),
+            "{result:?}"
+        );
+        drop(server);
     }
 }

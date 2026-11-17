@@ -6,8 +6,8 @@ export interface Notice {
   key?: string;
   tone: "info" | "error";
   text: string;
-  /** Entries the notice links to, e.g. conflict copies. */
-  files?: { file: string; label: string }[];
+  /** Files the notice names, e.g. conflict copies; those with `file` set are entries it opens. */
+  files?: { label: string; file?: string }[];
   action?: { label: string; run: () => void };
 }
 
@@ -25,6 +25,7 @@ export class Notices {
 
   /** Removes the notice with this id, or every notice with this key. */
   dismiss(idOrKey: number | string): void {
-    this.list = this.list.filter((n) => n.id !== idOrKey && n.key !== idOrKey);
+    const rest = this.list.filter((n) => n.id !== idOrKey && n.key !== idOrKey);
+    if (rest.length < this.list.length) this.list = rest;
   }
 }

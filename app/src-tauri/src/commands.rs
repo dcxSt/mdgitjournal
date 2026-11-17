@@ -505,6 +505,13 @@ pub async fn github_urls(app: AppHandle) -> Result<GithubUrls> {
     .await
 }
 
+/// The licences of everything compiled into the app (Settings › About). Built into the binary,
+/// so every build has them, including the AUR's, which installs only the executable.
+#[tauri::command]
+pub async fn third_party_notices() -> &'static str {
+    include_str!("../../../packaging/THIRD-PARTY-NOTICES.md")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -512,6 +519,14 @@ mod tests {
 
     use super::*;
     use crate::error::Kind;
+
+    #[test]
+    fn third_party_notices_are_built_in() {
+        let notices = tauri::async_runtime::block_on(third_party_notices());
+        assert!(notices.starts_with("# Third-party notices\n"));
+        assert!(notices.contains("based in part on the work of the Independent JPEG Group"));
+        assert!(notices.contains("## C libraries"));
+    }
 
     #[test]
     fn entry_file_is_percent_decoded() {

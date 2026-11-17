@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  conflictCopyName,
   dayOfMonth,
   entryTimestamp,
   filterByName,
   groupByMonth,
   groupHits,
+  isEntryFile,
   quickOpen,
   slugPreview,
   snippetParts,
@@ -95,10 +97,67 @@ describe("slugPreview", () => {
   });
 });
 
+describe("conflictCopyName", () => {
+  const at1402 = new Date(2026, 10, 16, 14, 2);
+
+  it("names copies like mdgj-git's keep-both copies, never reusing a name", () => {
+    const taken = new Set(["x.conflict-1402.md", "x.conflict-1402-2.md"]);
+    expect(conflictCopyName("2026-11-16-1402-run.md", () => false, at1402)).toBe(
+      "2026-11-16-1402-run.conflict-1402.md",
+    );
+    expect(conflictCopyName("x.md", (name) => taken.has(name), at1402)).toBe("x.conflict-1402-3.md");
+  });
+});
+
+describe("isEntryFile", () => {
+  it("is true only for what the entry list can open", () => {
+    for (const name of ["2026-11-16-1402-run.md", "notes.md", "x.conflict-1402.md"]) {
+      expect(isEntryFile(name), name).toBe(true);
+    }
+    for (const name of ["assets/x-1a2b3c4d.jpg", "x.conflict-1402.jpg", "sub/x.md", ".hidden.md", ".md", "a..md"]) {
+      expect(isEntryFile(name), name).toBe(false);
+    }
+  });
+});
+
+// The same cases as mdgj-core's word_count tests (crates/mdgj-core/src/entries.rs), so the status
+// bar agrees with EntryMeta.words. CJK differs: ICU counts 日本語 as one word, mdgj-core as three.
 describe("wordCount", () => {
   it("counts words and ignores markdown punctuation", () => {
     expect(wordCount("# Hello world\n\n- [ ] one **two** _three_\n")).toBe(5);
     expect(wordCount("")).toBe(0);
+    expect(wordCount("--- *** ### > - [ ] [x]")).toBe(0);
+    expect(wordCount("# Title\n\n- one *two* **three**\n- [ ] four")).toBe(5);
+    expect(wordCount("> quoted _text_ ~~gone~~ `code`")).toBe(4);
+    expect(wordCount("don't stop")).toBe(2);
+    expect(wordCount("pi is 3.14, not 1,000")).toBe(5);
+    expect(wordCount("line one\r\nline two\r\n")).toBe(4);
+  });
+
+  it("ignores task marks", () => {
+    expect(wordCount("- [x] buy milk")).toBe(wordCount("- [ ] buy milk"));
+    expect(wordCount("- [X] buy milk\n  - [x] and eggs")).toBe(4);
+    expect(wordCount("[x]")).toBe(0);
+    expect(wordCount("x [xy] [x x] x]")).toBe(5);
+  });
+
+  it("skips link and image destinations", () => {
+    expect(wordCount("Ran 5km. ![](assets/2026-11-16-0800-run-1.jpg)")).toBe(2);
+    expect(wordCount("![a sunset](x.jpg) over the bay")).toBe(5);
+    expect(wordCount('see [the docs](https://example.com/a-b-c "Title") now')).toBe(4);
+    expect(wordCount("[a](b)[c](d)")).toBe(2);
+    expect(wordCount("[Rust](https://w.org/Rust_(lang)) end")).toBe(2);
+    expect(wordCount("[x](https://x.org) [x] done")).toBe(2);
+    expect(wordCount("a](b c\nd)")).toBe(4);
+    expect(wordCount("a](b c")).toBe(3);
+    expect(wordCount("](")).toBe(0);
+    expect(wordCount("one ](two) three\r\n")).toBe(2);
+  });
+
+  it("counts letters of any script, but not emoji", () => {
+    expect(wordCount("Café crème")).toBe(2);
+    expect(wordCount("Привет мир")).toBe(2);
+    expect(wordCount("🦀 🎉")).toBe(0);
   });
 });
 
@@ -118,6 +177,17 @@ describe("search hits", () => {
       match: "frost",
       after: "",
     });
+  });
+
+  it("cuts long context before the match to its last words, so the match stays in view", () => {
+    const line = "…long the towpath to the lock, and saw a heron standing in the reeds by the far bank.";
+    const at = line.indexOf("heron"); // no astral characters before it, so also the code-point offset
+    expect(snippetParts(hit("a.md", 1, line, at, at + 5))).toEqual({
+      before: "…and saw a ",
+      match: "heron",
+      after: " standing in the reeds by the far bank.",
+    });
+    expect(snippetParts(hit("a.md", 1, "saw a heron", 6, 11)).before).toBe("saw a ");
   });
 
   it("groups by file in order; a filename match adds no snippet", () => {

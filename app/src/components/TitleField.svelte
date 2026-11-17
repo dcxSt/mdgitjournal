@@ -12,7 +12,9 @@
   let draft = $derived(title);
   let editing = $state(false);
   const slug = $derived(slugPreview(draft));
-  const changed = $derived(meta !== null && draft.trim() !== "" && slug !== meta.title);
+  // Only text the user changed renames: a file whose name isn't in slug form (a conflict copy,
+  // "My_Notes") keeps it when the field merely gains and loses focus.
+  const changed = $derived(meta !== null && draft !== meta.title && draft.trim() !== "" && slug !== meta.title);
 
   async function commit() {
     editing = false;

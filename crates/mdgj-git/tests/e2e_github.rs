@@ -25,6 +25,7 @@ fn two_devices_sync_through_github() {
     let creds = Creds {
         username: "x-access-token".into(),
         password: token,
+        url_prefix: "https://github.com/".into(),
     };
     let (a, b) = (Device::new(), Device::new());
     for device in [&a, &b] {

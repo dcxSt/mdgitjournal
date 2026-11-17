@@ -1,5 +1,16 @@
-import { expect, test, type Page } from "@playwright/test";
-import { callCount, connect, editorText, fileText, modKey, refocus, SAMPLE, start } from "./helpers.ts";
+import { devices, expect, test, type Page } from "@playwright/test";
+import {
+  addFile,
+  callCount,
+  connect,
+  editorText,
+  failNext,
+  fileText,
+  modKey,
+  refocus,
+  SAMPLE,
+  start,
+} from "./helpers.ts";
 
 const entries = (page: Page) => page.getByRole("navigation", { name: "Entries" });
 const selected = (page: Page) => entries(page).locator("button[aria-current=page]");
@@ -112,6 +123,130 @@ test("when GitHub is ahead, Pull lights up and Commit & Push says Pull first", a
   await expect(entries(page).getByRole("button", { name: /dawn/ })).toBeVisible();
 });
 
+test("with the red dot showing, Pull still pulls", async ({ page }) => {
+  await start(page);
+  await connect(page);
+  await failNext(page, "fetch", "network", "Couldn't reach github.com.");
+  await refocus(page);
+  const pull = page.locator("footer").getByRole("button", { name: /^Pull/ });
+  await expect(pull.locator(".dot")).toBeVisible();
+
+  const pulls = await callCount(page, "pull");
+  await pull.click();
+  await expect(entries(page).getByRole("button", { name: /dawn/ })).toBeVisible();
+  expect(await callCount(page, "pull")).toBe(pulls + 1);
+  await expect(pull.locator(".dot")).toHaveCount(0);
+});
+
+test("focusing and leaving the title renames nothing, even a name not in slug form", async ({ page }) => {
+  await start(page);
+  const files = ["2026-11-15-0900-My_Notes.md", "2026-11-14-2130-ideas.conflict-1825.md"];
+  for (const file of files) await addFile(page, file, "Text.\n");
+  await refocus(page);
+  const title = page.getByLabel("Title");
+  for (const file of files) {
+    await entries(page).locator(`button[title="${file}"]`).click();
+    await expect(title).toHaveValue(file.slice(16, -3));
+    await title.click();
+    await page.locator(".cm-content").click();
+  }
+  expect(await callCount(page, "renameEntry")).toBe(0);
+  for (const file of files) expect(await fileText(page, file)).toBe("Text.\n");
+
+  // Typing a title does rename.
+  await title.fill("My notes");
+  await title.press("Enter");
+  await expect(selected(page)).toHaveAttribute("title", "2026-11-14-2130-my-notes.md");
+});
+
+test("Settings keeps what was typed when closed with Esc or Mod-,", async ({ page }) => {
+  await start(page);
+  const mod = await modKey(page);
+  const sheet = page.getByRole("dialog", { name: "Settings" });
+  const fields = [
+    { label: "Author name", value: "Stephen Fay", close: "Escape" },
+    { label: "Author email", value: "s@example.com", close: `${mod}+Comma` },
+    { label: "Check GitHub every", value: "10", close: "Escape" },
+  ];
+  for (const { label, value, close } of fields) {
+    await page.keyboard.press(`${mod}+Comma`);
+    await sheet.getByLabel(label).fill(value);
+    await page.keyboard.press(close);
+    await expect(sheet).toBeHidden();
+    await page.keyboard.press(`${mod}+Comma`);
+    await expect(sheet.getByLabel(label)).toHaveValue(value);
+    await sheet.getByRole("button", { name: "Close settings" }).click();
+  }
+});
+
+test("shortcuts do nothing behind the delete confirmation", async ({ page }) => {
+  await start(page);
+  const mod = await modKey(page);
+  await page.locator(".cm-content").click();
+  await page.keyboard.type("x");
+  await page.getByRole("button", { name: "Entry actions" }).click();
+  await page.getByRole("menuitem", { name: "Delete entry…" }).click();
+  const sheet = page.getByRole("dialog", { name: "Delete entry" });
+  await expect(sheet.getByText(SAMPLE)).toBeVisible();
+
+  for (const key of ["k", "p", "Comma", "n", "e", "Backslash"]) await page.keyboard.press(`${mod}+${key}`);
+  await expect(page.locator("dialog[open]")).toHaveCount(1);
+  await expect(page.getByLabel("New entry title")).toHaveCount(0);
+  await expect(page.locator(".cm-gutters")).toHaveCount(1);
+  await expect(page.locator("aside")).toHaveCount(1);
+
+  await sheet.getByRole("button", { name: "Cancel" }).click();
+  await expect(sheet).toBeHidden();
+  await expect.poll(() => fileText(page, SAMPLE)).toContain("x");
+});
+
+test("a full-text match deep inside a long line is visible in its result", async ({ page }) => {
+  await start(page);
+  const mod = await modKey(page);
+  await page.locator(".cm-content").click();
+  await page.keyboard.press(`${mod}+End`);
+  await page.keyboard.type("We walked along the towpath to the lock, and saw a heron standing in the reeds by the far bank.");
+  await expect.poll(() => fileText(page, SAMPLE)).toContain("heron");
+
+  await page.keyboard.press(`${mod}+Shift+f`);
+  await page.keyboard.type("heron");
+  const snippet = page.locator(".snippet").first();
+  const mark = snippet.locator("mark");
+  await expect(mark).toHaveText("heron");
+  const [row, match] = [await snippet.boundingBox(), await mark.boundingBox()];
+  expect(match!.x + match!.width).toBeLessThanOrEqual(row!.x + row!.width);
+});
+
+test("a failed save says why in a notice, which goes once a retry succeeds", async ({ page }) => {
+  await start(page);
+  await failNext(page, "writeEntry", "io", "Disk full (os error 28)");
+  await page.locator(".cm-content").click();
+  await page.keyboard.type("x");
+  const alert = page.getByRole("alert").filter({ hasText: "Disk full (os error 28)" });
+  await expect(alert).toBeVisible();
+  await expect(page.locator("footer .save")).toHaveText("Not saved");
+  await expect(alert).toBeHidden({ timeout: 10_000 });
+  await expect(page.locator("footer .save")).toHaveText("Saved");
+});
+
+test("keyboard focus shows a ring in the accent colour, inside list rows", async ({ page }) => {
+  await start(page);
+  const row = entries(page).getByRole("button", { name: /ideas/ });
+  await page.keyboard.press("Shift"); // keyboard modality, so programmatic focus is focus-visible
+  await row.focus();
+  const ring = await row.evaluate((el) => {
+    const style = getComputedStyle(el);
+    const accent = document.createElement("i");
+    accent.style.color = "var(--color-accent)";
+    el.append(accent);
+    const color = getComputedStyle(accent).color;
+    accent.remove();
+    return { outline: style.outlineColor, offset: style.outlineOffset, accent: color };
+  });
+  expect(ring.outline).toBe(ring.accent);
+  expect(ring.offset).toBe("-2px");
+});
+
 test.describe("phone layout", () => {
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
@@ -126,4 +261,25 @@ test.describe("phone layout", () => {
     await page.getByRole("button", { name: "Entries" }).click();
     await expect(page.getByRole("button", { name: "New entry" })).toBeVisible();
   });
+});
+
+test.describe("iPhone in landscape", () => {
+  const { viewport, userAgent, deviceScaleFactor, isMobile, hasTouch } = devices["iPhone 13 landscape"];
+  test.use({ viewport, userAgent, deviceScaleFactor, isMobile, hasTouch });
+
+  test("still gets the phone's sheets and 16px fields, though wider than 700px", async ({ page }) => {
+    await page.goto("/");
+    expect(page.viewportSize()!.width).toBeGreaterThan(700);
+    await page.getByRole("button", { name: "Settings" }).click();
+    const sheet = page.getByRole("dialog", { name: "Settings" });
+    await expect(sheet).toBeVisible();
+    expect((await sheet.boundingBox())!.width).toBe(page.viewportSize()!.width);
+    await expect(sheet.getByLabel("Author name")).toHaveCSS("font-size", "16px");
+  });
+});
+
+test("desktop fields keep the desktop text size", async ({ page }) => {
+  await start(page);
+  await page.locator("footer").getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Settings" }).getByLabel("Author name")).toHaveCSS("font-size", "13px");
 });

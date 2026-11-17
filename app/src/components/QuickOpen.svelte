@@ -34,7 +34,7 @@
   }
 </script>
 
-<Sheet label="Open entry" onclose={() => (app.overlay = null)}>
+<Sheet label="Open entry" onclose={() => app.closeOverlay()}>
   <input
     data-autofocus
     type="text"

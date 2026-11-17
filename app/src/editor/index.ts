@@ -18,13 +18,16 @@ import {
   highlightSpecialChars,
   keymap,
   lineNumbers,
+  ViewPlugin,
 } from "@codemirror/view";
 import { GFM } from "@lezer/markdown";
 import { Vim, vim } from "@replit/codemirror-vim";
 import { insertImageLinks, toggleLinePrefix, wrapSelection } from "./commands";
 import { fileText, lineBreaks, normalizeBreaks } from "./linebreaks";
 import { styledMode } from "./styled";
+import { wholeCharacters } from "./surrogates";
 import { baseTheme, highlighters, sourceTheme } from "./theme";
+import { vimGuards } from "./vimguards";
 
 export { imageLink } from "./commands";
 
@@ -45,6 +48,11 @@ export interface EditorOptions {
    * On failure, report it and resolve to []; nothing is inserted then.
    */
   onImageFiles?(files: File[]): Promise<string[]>;
+  /**
+   * Imported images whose links were not inserted, because setDoc() replaced the document (or
+   * the editor was destroyed) while they were imported. The files exist; nothing links to them.
+   */
+  onImagesUnlinked?(paths: string[]): void;
   /** Maps a relative image path to a loadable URL for styled-mode previews. */
   resolveImageUrl?(relPath: string): string;
 }
@@ -59,6 +67,11 @@ export interface EditorHandle {
   setDark(on: boolean): void;
   focus(): void;
   insertAtCursor(text: string): void;
+  /**
+   * Imports images through `onImageFiles` and links them at the cursor, one per line, as a paste
+   * does; selected text is kept. Used by the phone's photo picker.
+   */
+  importImages(files: File[]): void;
   /** Wraps the selection (or inserts the pair around the cursor); unwraps if already wrapped. */
   wrapSelection(before: string, after: string): void;
   /** Toggles "# ", "- " or "- [ ] " on the selected lines. */
@@ -94,6 +107,28 @@ const save = (view: EditorView) => {
 };
 Vim.defineEx("write", "w", (cm) => save(cm.cm6 as EditorView));
 
+/**
+ * codemirror-vim keeps one jump list (G, gg, n, '', Ctrl-o, ...) for all editors, as offsets into
+ * the document it was recorded in, and it outlives the vim instance. Each instance, so each
+ * document, starts a fresh one: offsets past the end of a shorter document would make every
+ * later jump throw, and the key would be typed as text instead. The rest of vim's global state
+ * (registers, search and command history, macros, `:set` options) carries over.
+ */
+const freshJumpList = ViewPlugin.define(() => {
+  const kept = { ...Vim.getVimGlobalState_() };
+  // `:set` values are reset too, so they are put back.
+  const options = ["pcre", "insertModeEscKeysTimeout"].map(
+    (name) => [name, Vim.getOption(name)] as const,
+  );
+  Vim.resetVimGlobalState_();
+  const fresh = Vim.getVimGlobalState_();
+  Object.assign(fresh, kept, { jumpList: fresh.jumpList });
+  for (const [name, value] of options) Vim.setOption(name, value);
+  return {};
+});
+
+const vimKeys: Extension = [vim(), freshJumpList, wholeCharacters, vimGuards];
+
 const editingKeymap = keymap.of([
   { key: "Mod-s", run: save },
   { key: "Mod-b", run: (view) => (view.dispatch(wrapSelection(view.state, "**", "**")), true) },
@@ -125,19 +160,24 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
     pendingImports.add(slot);
     try {
       const paths = await imported;
-      // A setDoc() in the meantime means the images belong to another entry.
-      if (pendingImports.delete(slot) && paths.length > 0) {
-        view.dispatch(insertImageLinks(view.state, slot.pos, paths));
-      }
+      if (paths.length === 0) return;
+      // A setDoc() in the meantime means the document they were meant for is gone.
+      if (pendingImports.delete(slot)) view.dispatch(insertImageLinks(view.state, slot.pos, paths));
+      else opts.onImagesUnlinked?.(paths);
     } finally {
       pendingImports.delete(slot);
     }
   }
 
-  function handleImages(view: EditorView, event: Event, files: File[], pos: number): boolean {
+  function importAt(view: EditorView, files: File[], pos: number): boolean {
     if (!opts.onImageFiles || files.length === 0) return false;
-    event.preventDefault();
     void insertImported(view, opts.onImageFiles(files), pos);
+    return true;
+  }
+
+  function handleImages(view: EditorView, event: Event, files: File[], pos: number): boolean {
+    if (!importAt(view, files, pos)) return false;
+    event.preventDefault();
     return true;
   }
 
@@ -160,7 +200,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
       doc,
       extensions: [
         // First, so vim sees keys before every other keymap.
-        vimConf.of(vimOn ? vim() : []),
+        vimConf.of(vimOn ? vimKeys : []),
         lineBreaks(doc),
         EditorView.clipboardInputFilter.of(normalizeBreaks),
         saveHandlers.of(() => opts.onSave?.()),
@@ -199,7 +239,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
     },
     setVim(on) {
       vimOn = on && !opts.mobile;
-      view.dispatch({ effects: vimConf.reconfigure(vimOn ? vim() : []) });
+      view.dispatch({ effects: vimConf.reconfigure(vimOn ? vimKeys : []) });
     },
     setDark(on) {
       dark = on;
@@ -212,6 +252,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
         userEvent: "input",
       });
     },
+    importImages: (files) => void importAt(view, files, view.state.selection.main.head),
     wrapSelection: (before, after) => view.dispatch(wrapSelection(view.state, before, after)),
     toggleLinePrefix: (prefix) => view.dispatch(toggleLinePrefix(view.state, prefix)),
     destroy() {

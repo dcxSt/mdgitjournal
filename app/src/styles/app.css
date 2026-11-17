@@ -95,7 +95,7 @@ button:disabled {
 }
 
 :focus-visible {
-  outline: 2px solid var(--color-accent-soft);
+  outline: 2px solid var(--color-accent);
   outline-offset: 1px;
 }
 
@@ -151,12 +151,10 @@ button:disabled {
   }
 }
 
-/* iOS zooms the page into any field with text smaller than 16px. */
-@media (max-width: 699px) {
-  input,
-  textarea {
-    font-size: 16px;
-  }
+/* iOS zooms the page into any field with text smaller than 16px. `data-layout` is set by
+   App.svelte from the layout in use, which a window's width alone doesn't decide. */
+:where([data-layout="phone"]) :is(input, textarea) {
+  font-size: 16px;
 }
 
 @media (prefers-reduced-motion: reduce) {

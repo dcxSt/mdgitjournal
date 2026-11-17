@@ -142,13 +142,13 @@ Commit author is your GitHub name with `<id>+<login>@users.noreply.github.com`, 
 
 Paste, drag-drop, or (on the phone) the photo picker. The pipeline is all Rust:
 
-1. Decode the image (JPEG, PNG, WebP, GIF first frame). iOS hands HEIC to the WebView already converted to JPEG.
+1. Decode the image (JPEG, PNG, WebP, GIF first frame). iOS hands HEIC to the WebView already converted to JPEG. Images over 64 megapixels are refused, before decoding, with "the image is too large to import".
 2. Apply the EXIF orientation, then **strip all metadata**, including GPS location.
 3. Downscale so the longest side is at most **1024 px** (Lanczos).
 4. Encode as JPEG at **quality 60**, progressive, with 4:2:0 chroma subsampling.
    - A typical phone photo comes out at about **60–150 KB**. Screenshots compress further.
    - It stays clearly readable, not pixelated.
-5. Save as `assets/<entry-stem>-1.jpg` (then `-2`, and so on) and insert `![](assets/…jpg)` at the cursor.
+5. Save as `assets/<entry-stem>-<first 8 hex digits of the JPEG's SHA-256>.jpg`, and insert `![](assets/…jpg)` at the cursor on its own line; a selection is kept. Named by content, photos added to one entry on two devices never take each other's name, and the same image again reuses its file. `-2`, `-3`, … is appended only if the name already holds a different file.
 
 Max size and quality are configurable in Settings, but these are the defaults.
 
@@ -183,6 +183,7 @@ Keyboard shortcuts (`Ctrl` instead of `⌘` on Linux):
 
 - Everything can be done from the keyboard.
 - Vim `:w` saves.
+- On Linux with Vim keys on, Ctrl-E, Ctrl-N and Ctrl-P go to Vim while the text has focus; anywhere else they are the app's shortcuts.
 - **Search:** filename filter as you type, and full-text search across entries with match snippets. It's an in-memory scan in Rust, which is fast for thousands of entries.
 - **Word count** for the current entry is shown in the status bar.
 - **Themes:** light and dark, following the system automatically.

@@ -57,6 +57,8 @@ export interface Api {
   githubConnect(fullName: string): Promise<PullResult>;
   githubDisconnect(signOut: boolean): Promise<SyncView>;
   githubUrls(): Promise<GithubUrls>;
+  /** The licences of everything the app is built from, as markdown. */
+  thirdPartyNotices(): Promise<string>;
 
   onSyncState(cb: (view: SyncView) => void): Promise<Unlisten>;
   onEntriesChanged(cb: () => void): Promise<Unlisten>;
@@ -159,6 +161,7 @@ export function createTauriApi(): Api {
     githubConnect: (fullName) => call("github_connect", { fullName }),
     githubDisconnect: (signOut) => call("github_disconnect", { signOut }),
     githubUrls: () => call("github_urls"),
+    thirdPartyNotices: () => call("third_party_notices"),
 
     onSyncState: (cb) => listen<SyncView>("sync://state", (e) => cb(e.payload)),
     onEntriesChanged: (cb) => listen("entries://changed", () => cb()),

@@ -1,0 +1,46 @@
+diff --git a/vim.js b/vim.js
+index 3cafa6bcf0c99f2ae25a5da8936d3f29445f2d6d..887fd46c6e19995af5d2bd3051226617a51f562b 100644
+--- a/vim.js
++++ b/vim.js
+@@ -64,7 +64,7 @@ export function initVim(CM) {
+     if (curStart.line === curEnd.line && curStart.ch >= curEnd.ch - 1) {
+       var text = cm.getLine(curStart.line);
+       var charCode = text.charCodeAt(curStart.ch);
+-      if (0xD800 <= charCode && charCode <= 0xD8FF) {
++      if (0xD800 <= charCode && charCode <= 0xDBFF) {
+         curEnd.ch += 1;
+       }
+     }
+@@ -2138,10 +2138,14 @@ export function initVim(CM) {
+           mode = vim.visualBlock ? 'block' :
+                   linewise ? 'line' :
+                   'char';
+-          var newPositions = updateSelectionForSurrogateCharacters(cm, curStart, curEnd);
++          // The end is inclusive: on the high half of a pair, it takes in the low half.
++          var endCode = cm.getLine(curEnd.line).charCodeAt(curEnd.ch);
++          if (0xD800 <= endCode && endCode <= 0xDBFF) {
++            curEnd = new Pos(curEnd.line, curEnd.ch + 1);
++          }
+           cmSel = makeCmSelection(cm, {
+-            anchor: newPositions.start,
+-            head: newPositions.end
++            anchor: curStart,
++            head: curEnd
+           }, mode);
+           if (linewise) {
+             var ranges = cmSel.ranges;
+@@ -3139,10 +3143,11 @@ export function initVim(CM) {
+         vim.visualBlock = !!actionArgs.blockwise;
+         head = clipCursorToContent(
+             cm, new Pos(anchor.line, anchor.ch + repeat - 1));
+-        var newPosition = updateSelectionForSurrogateCharacters(cm, anchor, head)
++        // Not moved onto the low half of a pair: clipCursorToContent would read that as a
++        // cursor inside the pair, and the next motion would skip a character.
+         vim.sel = {
+-          anchor: newPosition.start,
+-          head: newPosition.end
++          anchor: anchor,
++          head: head
+         };
+         CM.signal(cm, "vim-mode-change", {mode: "visual", subMode: vim.visualLine ? "linewise" : vim.visualBlock ? "blockwise" : ""});
+         updateCmSelection(cm);

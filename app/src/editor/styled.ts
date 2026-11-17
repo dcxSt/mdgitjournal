@@ -35,11 +35,11 @@ const lineDecorations: Record<string, Decoration> = {
 const dimmed = mark("cm-md-mark");
 const linkText = mark("cm-md-link");
 const taskDone = mark("cm-md-task-done");
+const struck = mark("cm-md-strike");
 
 const markDecorations: Record<string, Decoration> = {
   Emphasis: mark("cm-md-em"),
   StrongEmphasis: mark("cm-md-strong"),
-  Strikethrough: mark("cm-md-strike"),
   InlineCode: mark("cm-md-code"),
   Link: linkText,
   Image: linkText,
@@ -92,6 +92,13 @@ function decorate(view: EditorView): DecorationSet {
         }
         const deco = markFor(node);
         if (deco && start < end) ranges.push(deco.range(start, end));
+        // Only the text between the "~~" is struck: a line-through reaches every inline element
+        // inside, so it cannot be kept off the marks if they are inside.
+        if (node.name === "Strikethrough") {
+          const text = Math.max(node.node.firstChild?.to ?? node.from, from);
+          const textEnd = Math.min(node.node.lastChild?.from ?? node.to, to);
+          if (text < textEnd) ranges.push(struck.range(text, textEnd));
+        }
         if (node.name === "Task") {
           const box = node.node.firstChild;
           if (box?.name !== "TaskMarker" || state.sliceDoc(box.from + 1, box.to - 1) === " ") return;

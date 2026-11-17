@@ -5,10 +5,10 @@
 
   --color-bg: #fbfaf7;
   --color-text: #2b2a27;
-  --color-muted: #8a867d;
+  --color-muted: #6b675f;
   --color-syntax: #b8b3a8;
   --color-accent: #3d6fb4;
-  --color-danger: #b5483b;
+  --color-danger: #a63f33;
 
   --font-styled: ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif;
   --font-source: ui-monospace, "SF Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace;
@@ -17,8 +17,9 @@
   --text-styled: 18px;
   --text-styled-mobile: 17px;
   --leading-styled: 1.6;
-  /* About 66 characters of prose; 66ch would be 66 zeros, some 90 characters in a serif. */
-  --measure-styled: 28em;
+  /* About 66 characters of prose in New York at 18px (31em); 66ch would be 66 zeros, far wider
+     in a serif. */
+  --measure-styled: 31em;
   --text-source: 14px;
   --text-ui: 13px;
 }
@@ -32,6 +33,7 @@
     --color-muted: #8f8a80;
     --color-syntax: #5f5b54;
     --color-accent: #7ea6e0;
+    --color-danger: #e07a6c;
   }
 }
 
@@ -42,4 +44,5 @@
   --color-muted: #8f8a80;
   --color-syntax: #5f5b54;
   --color-accent: #7ea6e0;
+  --color-danger: #e07a6c;
 }

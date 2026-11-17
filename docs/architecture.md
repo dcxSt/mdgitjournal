@@ -19,6 +19,7 @@ crates/mdgj-git/           # libgit2 wrapper: init, status, commit, fetch, pull 
 crates/mdgj-github/        # GitHub App device flow, token refresh, token store (keyring + file fallback), REST calls
 app/                       # pnpm package: Vite + Svelte 5 + TypeScript
 app/src/editor/            # CodeMirror 6 editor (source + styled), vim, image paste hooks
+app/patches/               # pnpm patch of @replit/codemirror-vim-core (visual mode on emoji)
 app/src/lib/api.ts         # typed wrappers around Tauri invoke + a mock backend for browser dev/tests
 app/src/lib/types.ts       # TS mirror of the command types below
 app/src/...                # Svelte UI
@@ -26,7 +27,7 @@ app/src-tauri/             # Tauri 2 shell: state, commands (thin glue over the 
 packaging/aur/  site/  docs/  .github/workflows/
 ```
 
-The three crates **do not depend on each other**. Only `app/src-tauri` depends on all three. Each crate has its own unit and integration tests (`cargo test -p <crate>`).
+The three crates **do not depend on each other**. Only `app/src-tauri` depends on all three. Each crate has its own unit and integration tests (`cargo test -p <crate>`); mdgj-git's tests also use mdgj-core, to import photos on two devices.
 
 ## Crate: `mdgj-core`
 
@@ -49,7 +50,7 @@ impl Journal {
   pub fn rename(&self, file: &str, new_title: &str) -> Result<EntryMeta>;       // keeps date+time prefix, only slug changes; no-op if same; dedupe
   pub fn delete(&self, file: &str) -> Result<()>;
   pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>>;   // case-insensitive substring over filename + content; snippet around match
-  pub fn import_image(&self, entry_file: &str, bytes: &[u8], opts: ImageOpts) -> Result<ImportedImage>; // see images.rs; writes assets/<entry-stem>-N.jpg
+  pub fn import_image(&self, entry_file: &str, bytes: &[u8], opts: ImageOpts) -> Result<ImportedImage>; // see images.rs; writes assets/<entry-stem>-<first 8 hex digits of the JPEG's SHA-256>.jpg (identical bytes reuse the file; -2, -3 … only if the name holds a different file); refuses an `assets` that is a symlink or a file
 }
 pub struct EntryMeta { pub file: String, pub date: Option<String> /*"2026-11-16"*/, pub time: Option<String> /*"14:02"*/, pub title: String /*slug, or file stem for Other*/, pub mtime: i64 /*unix ms*/, pub size: u64, pub words: Option<u32> }
 pub struct EntryContent { pub file: String, pub content: String, pub hash: String }
@@ -58,8 +59,8 @@ pub fn word_count(text: &str) -> u32;  // unicode words, ignores markdown punctu
 
 // images.rs
 pub struct ImageOpts { pub max_edge: u32 /*1024*/, pub quality: u8 /*60*/ }
-pub struct ImportedImage { pub path: String /*"assets/2026-11-16-1402-morning-run-1.jpg"*/, pub bytes: u64, pub width: u32, pub height: u32 }
-pub fn compress_image(bytes: &[u8], opts: ImageOpts) -> Result<(Vec<u8>, u32, u32)>; // decode jpeg/png/webp/gif(first frame); apply EXIF orientation; strip ALL metadata; Lanczos3 downscale to max_edge (never upscale); flatten alpha onto white; encode baseline/progressive JPEG at quality
+pub struct ImportedImage { pub path: String /*"assets/2026-11-16-1402-morning-run-5f3a09c2.jpg"*/, pub bytes: u64, pub width: u32, pub height: u32 }
+pub fn compress_image(bytes: &[u8], opts: ImageOpts) -> Result<(Vec<u8>, u32, u32)>; // decode jpeg/png/webp/gif(first frame), refusing more than 64 megapixels (Error::Image "the image is too large to import") before decoding; apply EXIF orientation; strip ALL metadata; Lanczos3 downscale to max_edge (never upscale); flatten alpha onto white; encode baseline/progressive JPEG at quality
 
 // settings.rs — per-device settings, stored as JSON outside the repo
 pub struct Settings { pub vim: bool, pub mode_desktop: Mode, pub mode_mobile: Mode, pub fetch_interval_min: u32 /*5; 0 = off*/,
@@ -79,7 +80,7 @@ All serde structs use `#[serde(rename_all = "camelCase")]`, so they cross the Ta
 The crate uses libgit2 via `git2 = { default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }`. OpenSSL is built from source on every target because libgit2-sys links it on all Unix targets, though macOS and iOS use Apple's TLS. No SSH.
 
 ```rust
-pub struct Creds { pub username: String /*"x-access-token"*/, pub password: String /*token*/ }  // None for local/file:// remotes
+pub struct Creds { pub username: String /*"x-access-token"*/, pub password: String /*token*/, pub url_prefix: String /*the token is only sent to URLs starting with this, e.g. "https://github.com/"*/ }  // None for local/file:// remotes
 pub struct Author { pub name: String, pub email: String }
 
 pub struct Repo { /* wraps git2::Repository */ }
@@ -103,7 +104,7 @@ pub struct Conflict { pub path: String, pub copy: Option<String> /*where OUR ver
 pub struct PullOutcome { pub state: SyncState, pub updated: Vec<String> /*paths changed in working tree by the pull*/, pub merged: Vec<String> /*clean 3-way merges*/, pub conflicts: Vec<Conflict>, pub rebased: u32 }
 pub enum PushOutcome { Pushed { state: SyncState }, NothingToPush { state: SyncState }, Rejected { state: SyncState } /*non-ff: remote moved; caller should show Pull*/ }
 pub enum CommitPushOutcome { Pushed { state: SyncState }, NeedsPull { state: SyncState } /*committed locally, remote ahead*/, NothingToCommit { state: SyncState } }
-pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(String), Io(String) }  // Display messages are user-readable
+pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(String), Io(String) }  // Display messages are user-readable; "failed to connect to …" is Network
 ```
 
 ### Sync semantics. Never lose text.
@@ -123,6 +124,8 @@ pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(
    - Ours is written at `<stem>.conflict-<hhmm>.md` (local time; add `-2` and so on if taken; non-md files get `<stem>.conflict-<hhmm>.<ext>`).
    - If one side deleted the file and the other modified it, keep the modified version at `path`. No copy is needed.
 6. Write the result into the working directory, set HEAD/branch to N, and reset the index to N. Local edits stay as uncommitted changes; conflict copies appear as new untracked files.
+   - Nothing is written if the new tree has a symlink, or two paths (or leading folders) that differ only in case: the pull fails with `Error::Git`, saying which, and asks for it to be fixed with git. Every parent folder is checked (`lstat`) just before each write, so no write goes through a symlink.
+   - A file that changed locally and that the merge would remove stays on disk with its bytes. If the remote renamed it (and edited it), that is reported as `Conflict { path: <the remote's new name>, copy: Some(<the old path>) }`.
 7. Return `updated`, `merged` and `conflicts`.
 
 **`commit_and_push(msg)`**
@@ -141,7 +144,7 @@ pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(
 3. If the remote has a default branch (read from the remote HEAD symref, falling back to `main`, then `master`), adopt that branch name locally and run the `pull` algorithm. Unrelated histories are allowed: with no merge-base, use the empty tree as the base.
 
 **Credentials callback**
-- `Cred::userpass_plaintext(&creds.username, &creds.password)`.
+- `Cred::userpass_plaintext(&creds.username, &creds.password)`, only if the URL libgit2 asks for starts with `creds.url_prefix`. Otherwise `Error::Auth`, naming the host refused and pointing at `remote.origin.pushurl` and `url.*.insteadOf`.
 - Give up after 3 attempts, returning `Error::Auth`.
 - The token never touches disk or `.git/config`.
 
@@ -155,7 +158,7 @@ pub const DEFAULT_APP_SLUG: &str = "mdgitjournal";                 // overridden
 pub fn client_id() -> &'static str; pub fn app_slug() -> &'static str; pub fn is_placeholder() -> bool;
 
 pub trait Http: Send + Sync { fn post_form(&self, url, form: &[(&str,&str)], headers) -> Result<(u16, String)>; fn get(&self, url, headers) -> Result<(u16,String)>; }
-pub struct ReqwestHttp;  // blocking reqwest + rustls
+pub struct ReqwestHttp;  // blocking reqwest + rustls; gives up after 10 s without a connection, 30 s in all
 
 pub struct DeviceCode { pub device_code: String, pub user_code: String, pub verification_uri: String, pub expires_in: u64, pub interval: u64 }
 pub enum Poll { Pending, SlowDown { interval: u64 }, Complete(Tokens), Expired, Denied }
@@ -186,7 +189,9 @@ Tests use a mock `Http`. No real network in unit tests.
 
 ## Tauri commands (`app/src-tauri`) ⇄ `app/src/lib/api.ts`
 
-All commands are `async` and run their blocking work on `tauri::async_runtime::spawn_blocking`. **All git operations share one `Mutex`**, so they never overlap.
+All commands are `async` and run their blocking work on `tauri::async_runtime::spawn_blocking`. **All git operations share one `Mutex`**, so they never overlap. `sync_state` reads through a second repository handle and never waits for them: during one, it reports the state from before it, and the operation sends `sync://state` when it ends. libgit2 gives up after 15 s without a connection and after 30 s without data, so no stalled fetch or push holds the lock for long.
+
+On opening a journal, the shell adds `.mdgj-tmp-*` (mdgj-core's temp files) and `.DS_Store` to `.git/info/exclude`, which belongs to the clone and is never committed. A file already tracked stays tracked.
 
 Errors cross the boundary as `{ kind: string, message: string }`. Kinds: `auth`, `reauth`, `network`, `not_connected`, `empty_message`, `invalid`, `io`, `git`.
 
@@ -220,6 +225,7 @@ Paths:
 | `github_connect` | `fullName` | `{ view: SyncView, updated, merged, conflicts }` |
 | `github_disconnect` | `signOut: bool` | `SyncView` |
 | `github_urls` | – | `{ newRepo, install }` |
+| `third_party_notices` | – | `packaging/THIRD-PARTY-NOTICES.md` (markdown), built into the binary |
 
 ```ts
 type SyncView = { connected: boolean; repo: string | null; branch: string; ahead: number; behind: number;
@@ -235,8 +241,10 @@ The commit author is taken from settings `authorName`/`authorEmail`. If those ar
 
 **Frontend owns timing:**
 - It runs `fetch` on launch, on window focus, and every `fetchIntervalMin`.
-- It flushes pending autosave **before** `pull`, `commit` and `commit_and_push`.
-- After `pull` it reloads the open entry if it is in `updated` or `merged`.
+- It flushes pending autosave **before** `pull`, `commit` and `commit_and_push`. A fetch in flight holds the git lock, so these wait for it first, and autosave keeps working meanwhile.
+- Working-tree operations (open, create, rename, delete, pull, commit, connect, image imports) run one at a time, in order. An image import doesn't start once another entry is open.
+- A `sync_state` reply that a git operation's report (its result, or `sync://state`) overtook is dropped and read again.
+- After `pull` it reloads the open entry if the pull touched it (`updated`, `merged` or `conflicts`) and the buffer is clean. If the buffer has edits typed during the pull, they are kept as in any conflict: GitHub's version keeps the name, and the buffer moves to a `<stem>.conflict-<hhmm>.md` copy (named like mdgj-git's), which autosave writes. If the pull removed the entry, the buffer is written back under its name.
 - On focus it re-lists entries, and reloads the open entry from disk if the hash changed and the buffer is clean.
 - It flushes pending autosave when the page is hidden and before the window closes. If that save fails, the window stays open and says why, offering "Close anyway". On macOS, Quit (⌘Q) closes the window instead of ending the app at once, so it goes through the same save.
 
@@ -248,7 +256,8 @@ export interface EditorOptions {
   doc: string; mode: EditorMode; vim: boolean; dark: boolean; mobile: boolean;
   onChange(doc: string): void;                 // every change (UI debounces autosave 400ms)
   onSave?(): void;                             // vim :w / Mod-s
-  onImageFiles?(files: File[]): Promise<string[] /*relative paths*/>; // paste/drop; editor inserts ![](path) at cursor for each
+  onImageFiles?(files: File[]): Promise<string[] /*relative paths*/>; // paste/drop/importImages; editor inserts ![](path) at the cursor (selection kept), one per line
+  onImagesUnlinked?(paths: string[]): void;    // imports whose links were dropped because setDoc()/destroy() came first
   resolveImageUrl?(relPath: string): string;   // for styled-mode previews (convertFileSrc)
 }
 export interface EditorHandle {
@@ -256,6 +265,7 @@ export interface EditorHandle {
   getDoc(): string;
   setMode(m: EditorMode): void; setVim(on: boolean): void; setDark(on: boolean): void;
   focus(): void; insertAtCursor(text: string): void; wrapSelection(before: string, after: string): void; // mobile toolbar
+  importImages(files: File[]): void;           // the phone's photo picker: imports like a paste
   toggleLinePrefix(prefix: string): void;      // "# ", "- ", "- [ ] "
   destroy(): void;
 }
@@ -263,7 +273,7 @@ export function createEditor(parent: HTMLElement, opts: EditorOptions): EditorHa
 export function imageLink(relPath: string): string;  // "![](path)", or "![](<path>)" if the path has spaces or parentheses
 ```
 
-**Lossless invariant:** the editor never alters text it was given. `getDoc()` after any sequence of `setMode`, `setVim` or `setDark` returns exactly the string passed to `setDoc`, including `\r\n` and a missing final newline. A file with one kind of line break is edited as plain lines and written back with that break (`linebreaks.ts`), so vim, paste and IME can't mix in another; a file that already mixes them is split on `\n` and keeps its `\r` characters.
+**Lossless invariant:** the editor never alters text it was given. `getDoc()` after any sequence of `setMode`, `setVim` or `setDark` returns exactly the string passed to `setDoc`, including `\r\n` and a missing final newline. A file with one kind of line break is edited as plain lines and written back with that break (`linebreaks.ts`), so vim, paste and IME can't mix in another; a file that already mixes them is split on `\n` and keeps its `\r` characters, and input never separates a line's `\r` from its `\n` (text typed or pasted at the line end goes before the `\r`; a new line or typing over the line end keeps it). Under vim, edits, selections and register reads never split a UTF-16 surrogate pair (`surrogates.ts`), text that arrives outside insert mode is dropped rather than typed, and each document gets a fresh jump list (`vimguards.ts`, `index.ts`). The UI never sends a buffer with half a surrogate pair to be saved; it names the line instead.
 
 ## Design tokens (UI + editor share `app/src/styles/tokens.css`)
 
@@ -271,13 +281,13 @@ export function imageLink(relPath: string): string;  // "![](path)", or "![](<pa
 |---|---|---|
 | page background | `#fbfaf7` | `#1b1a18` |
 | text | `#2b2a27` | `#e6e2d9` |
-| muted | `#8a867d` | `#8f8a80` |
+| muted | `#6b675f` | `#8f8a80` |
 | syntax marks | `#b8b3a8` | `#5f5b54` |
 | accent | `#3d6fb4` | `#7ea6e0` |
-| danger | `#b5483b` | — |
+| danger | `#a63f33` | `#e07a6c` |
 
 Typography:
-- Styled mode: `ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif`, 18px / 1.6, `max-width: 28em` (about 66 characters; `66ch` would be 66 zeros, some 90 characters of serif prose).
+- Styled mode: `ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif`, 18px / 1.6, `max-width: 31em` (about 66 characters; `66ch` would be 66 zeros, some 90 characters of serif prose).
 - Source mode: `ui-monospace, "SF Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace`, 14px.
 - Chrome: `system-ui`, 13px.
 
@@ -296,7 +306,7 @@ pnpm -C app check && pnpm -C app test && pnpm -C app build
 pnpm -C app e2e                                         # Playwright + WebKit on the mock backend (app/e2e/)
 pnpm -C app tauri dev                                   # MDGJ_JOURNAL_DIR=/tmp/j for a scratch journal
 pnpm -C app dev                                         # UI only, in a browser, on the mock backend
-pnpm -C app tauri build                                 # bundles in target/release/bundle/
+pnpm -C app tauri build                                 # bundles in target/release/bundle/; CI=true skips the .dmg's Finder layout (needed over SSH)
 pnpm -C app tauri ios build --target aarch64-sim --debug  # after `tauri ios init`; needs full Xcode
 ```
 
@@ -304,12 +314,16 @@ pnpm -C app tauri ios build --target aarch64-sim --debug  # after `tauri ios ini
 - `MDGJ_GITHUB_CLIENT_ID` and `MDGJ_GITHUB_APP_SLUG` are read at compile time. The registered client ID goes in `.cargo/config.toml` `[env]`, and a real environment variable overrides it. `DEFAULT_CLIENT_ID` stays the placeholder.
 - `MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml` must equal `bundle.macOS.minimumSystemVersion`.
 - The version is repeated across several files; `RELEASING.md` lists them.
+- `packaging/THIRD-PARTY-NOTICES.md` is generated by `packaging/notices/generate.sh` and committed. The app shows it under Settings › About; the AUR packages install it in `/usr/share/licenses/`.
+- The iOS Xcode project is generated by `tauri ios init` from `app/src-tauri/project.ios.yml` (`bundle.iOS.template`, a path from `app/`): tauri-cli's template plus libz and libiconv, which the vendored libgit2 needs.
 
 CI (`.github/workflows/`):
 - **`ci.yml`** runs on pushes to `main` and on pull requests:
-  - Rust fmt, clippy and tests on Ubuntu and macOS.
+  - Rust fmt, clippy and tests on Ubuntu and macOS, with `--locked`.
   - Frontend check, tests and build.
-  - Unsigned `tauri build` bundles on Ubuntu 22.04 and macOS, uploaded as artifacts.
-  - An iOS Simulator build, allowed to fail until `gen/apple` is committed.
-- **`release.yml`** runs on `v*` tags. It creates a draft GitHub Release with a universal macOS `.dmg` and the Linux AppImage, `.deb` and `.rpm`.
+  - A check that `packaging/THIRD-PARTY-NOTICES.md` is up to date.
+  - `tauri build` bundles on Ubuntu 24.04 and macOS (ad-hoc signed, signature checked), uploaded as artifacts. The build must leave the working tree unchanged.
+  - An iOS Simulator build (`tauri ios init`, then `tauri ios build --target aarch64-sim`).
+- **`release.yml`** runs on `v*` tags. It creates a draft GitHub Release with a universal macOS `.dmg` and the Linux AppImage, `.deb` and `.rpm`. Without the Apple secrets the `.dmg` is ad-hoc signed and not notarized.
 - **`pages.yml`** deploys `site/` to GitHub Pages.
+- All actions are pinned to commit SHAs; Dependabot (`.github/dependabot.yml`) proposes updates.

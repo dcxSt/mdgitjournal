@@ -23,6 +23,7 @@
         onChange: (doc) => app.current.edit(doc),
         onSave: () => void app.current.flush().catch((e) => app.showError(e)),
         onImageFiles: (files) => app.importImages(files),
+        onImagesUnlinked: (paths) => app.imagesUnlinked(paths),
         resolveImageUrl: (relPath) => app.imageUrl(relPath),
       });
     });

@@ -68,25 +68,22 @@
   }
 
   /* On the phone a sheet hangs from the top, clear of the keyboard; wide ones take the screen. */
-  @media (max-width: 699px) {
-    dialog,
-    dialog.wide {
-      width: 100vw;
-      max-width: 100vw;
-      margin: 0 0 auto;
-      border-width: 0 0 1px;
-      border-radius: 0 0 12px 12px;
-      max-height: 100%;
-    }
+  :global([data-layout="phone"]) dialog {
+    width: 100vw;
+    max-width: 100vw;
+    margin: 0 0 auto;
+    border-width: 0 0 1px;
+    border-radius: 0 0 12px 12px;
+    max-height: 100%;
+  }
 
-    dialog.wide {
-      height: 100%;
-      border-radius: 0;
-    }
+  :global([data-layout="phone"]) dialog.wide {
+    height: 100%;
+    border-radius: 0;
+  }
 
-    .body {
-      padding: calc(12px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom));
-    }
+  :global([data-layout="phone"]) .body {
+    padding: calc(12px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom));
   }
 
   @keyframes sheet-in {

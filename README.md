@@ -68,7 +68,11 @@ Output, relative to the repository root:
 - macOS: `target/release/bundle/macos/mdgitjournal.app` and `target/release/bundle/dmg/*.dmg`
 - Linux: the binary `target/release/mdgitjournal`, plus `target/release/bundle/{appimage,deb,rpm}/`
 
-To build only the binary, add `--no-bundle`; for a single package format, add e.g. `--bundles deb`. On Arch, use the AUR packages `mdgitjournal` or `mdgitjournal-bin` ([`packaging/aur`](packaging/aur)).
+To build only the binary, add `--no-bundle`; for a single package format, add e.g. `--bundles deb`.
+
+On macOS, building the `.dmg` runs a Finder AppleScript that lays out its window, so the first build asks to let your terminal control Finder. Over SSH that prompt can't be answered, and the build waits at *Running bundle_dmg.sh*. To skip the layout, build with `CI=true pnpm -C app tauri build` (the `.dmg` then has a plain window), or build only the app with `--bundles app`.
+
+For Arch, [`packaging/aur`](packaging/aur) has the PKGBUILDs of `mdgitjournal` (from source) and `mdgitjournal-bin` (the release build), which are published to the AUR with each release.
 
 ## Development
 
@@ -129,6 +133,8 @@ On Linux, use `Ctrl` instead of `⌘`.
 
 In the commit sheet, `Enter` or `⌘Enter` commits, `Shift+Enter` adds a new line, and `Esc` cancels.
 
+On Linux with Vim keys on, `Ctrl+E`, `Ctrl+N` and `Ctrl+P` go to Vim while the text has focus; anywhere else they are the app's shortcuts.
+
 ## iOS
 
 iOS builds need macOS with full Xcode (licence accepted: `sudo xcodebuild -license accept`).
@@ -140,6 +146,8 @@ pnpm -C app tauri ios dev                                # run in the Simulator
 pnpm -C app tauri ios build --target aarch64-sim --debug # Simulator build
 ```
 
+`tauri ios init` generates the Xcode project from `app/src-tauri/project.ios.yml`: Tauri's own template, plus libz and libiconv, which libgit2 needs. Run it through `pnpm -C app` as above, since that path is relative to `app/`. After updating `@tauri-apps/cli`, start `project.ios.yml` again from the CLI's `templates/mobile/ios/project.yml` and add those two lines back.
+
 Builds for a real device need an Apple development team: `export APPLE_DEVELOPMENT_TEAM=<Team ID>`. App Store and TestFlight steps are in [RELEASING.md](RELEASING.md).
 
 ## Privacy
@@ -150,4 +158,4 @@ mdgitjournal collects no data. See [docs/privacy.md](docs/privacy.md).
 
 [MIT](LICENSE) © 2026 Stephen Fay.
 
-This software is based in part on the work of the Independent JPEG Group.
+This software is based in part on the work of the Independent JPEG Group. The licences of everything compiled into the app are in [packaging/THIRD-PARTY-NOTICES.md](packaging/THIRD-PARTY-NOTICES.md), which the app also shows under Settings › About.

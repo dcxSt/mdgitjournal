@@ -24,7 +24,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -34,23 +34,24 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal -c clippy -c rustfmt --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # --locked, like the AUR package: a stale Cargo.lock fails here, not after a release.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # End-to-end tests against github.com are #[ignore]d, so this stays offline.
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
   frontend:
     name: Frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: app/package.json
           cache: true
           cache_dependency_path: app/pnpm-lock.yaml
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: lts/*
       - run: pnpm -C app install --frozen-lockfile
@@ -60,6 +61,30 @@ jobs:
       - run: pnpm -C app exec playwright install --with-deps webkit
       - run: pnpm -C app e2e
 
+  notices:
+    name: Third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo install cargo-about --version 0.9.3 --locked --features cli
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: app/package.json
+          cache: true
+          cache_dependency_path: app/pnpm-lock.yaml
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - run: pnpm -C app install --frozen-lockfile
+      - run: cargo fetch --locked
+      # Fails when a dependency changed but packaging/THIRD-PARTY-NOTICES.md wasn't regenerated.
+      - run: packaging/notices/generate.sh && git diff --exit-code packaging/THIRD-PARTY-NOTICES.md
+
   bundle:
     name: Bundle (${{ matrix.os }})
     needs: [rust, frontend]
@@ -67,8 +92,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Older glibc than ubuntu-latest, so the packages run on more distributions.
-          - os: ubuntu-22.04
+          # Pinned, not ubuntu-latest: the packages need at least the glibc they were built
+          # with, so it only changes on purpose. Keep equal to the Linux runner in release.yml.
+          - os: ubuntu-24.04
             artifacts: |
               target/release/bundle/appimage/*.AppImage
               target/release/bundle/deb/*.deb
@@ -78,7 +104,7 @@ jobs:
             artifacts: target/release/bundle/dmg/*.dmg
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -88,19 +114,31 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: app/package.json
           cache: true
           cache_dependency_path: app/pnpm-lock.yaml
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: lts/*
       - run: pnpm -C app install --frozen-lockfile
-      - name: Build unsigned bundles
-        run: pnpm -C app tauri build
-      - uses: actions/upload-artifact@v7
+      # Ad-hoc signed ("-"): left unsigned, the .app has only the linker's signature, which
+      # doesn't seal Info.plist or the resources, and Gatekeeper calls a download "damaged".
+      - name: Build bundles
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
+        run: pnpm -C app tauri build -- --locked
+      - name: Check the app's signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/mdgitjournal.app
+      # E.g. a per-platform schema that tauri-build writes into the committed gen/schemas.
+      - name: Check the build left no new or changed files
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mdgitjournal-${{ runner.os }}
           path: ${{ matrix.artifacts }}
@@ -110,26 +148,25 @@ jobs:
     name: iOS Simulator
     needs: [rust, frontend]
     runs-on: macos-latest
-    # Allowed to fail for now: until app/src-tauri/gen/apple is committed, this job builds a
-    # throwaway Xcode project from `tauri ios init`.
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustup target add aarch64-apple-ios-sim
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: app/package.json
           cache: true
           cache_dependency_path: app/pnpm-lock.yaml
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: lts/*
       - run: pnpm -C app install --frozen-lockfile
+      # From app/src-tauri/project.ios.yml (bundle.iOS.template), which links libz and libiconv
+      # for the vendored libgit2.
       - name: Generate the Xcode project
         if: hashFiles('app/src-tauri/gen/apple/project.yml') == ''
         run: pnpm -C app tauri ios init --ci

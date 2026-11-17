@@ -5,6 +5,7 @@ use std::path::Path;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use mdgj_core::{Error, ImageOpts, Journal, SearchHit};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 fn journal() -> (TempDir, Journal) {
@@ -611,9 +612,10 @@ fn search_skips_unreadable_content_but_matches_its_name() {
     assert_eq!(hits.iter().map(|h| h.line).collect::<Vec<_>>(), [0]);
 }
 
-/// A 3000×2000 PNG with some texture.
-fn png() -> Vec<u8> {
+/// A 3000×2000 PNG with some texture; `seed` changes it.
+fn png(seed: u32) -> Vec<u8> {
     let image = image::RgbImage::from_fn(3000, 2000, |x, y| {
+        let x = x + seed;
         image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8])
     });
     let mut bytes = Cursor::new(Vec::new());
@@ -621,49 +623,118 @@ fn png() -> Vec<u8> {
     bytes.into_inner()
 }
 
+/// `assets/<stem>-<the first 8 hex digits of the SHA-256 of jpeg>`, without `.jpg`.
+fn content_name(stem: &str, jpeg: &[u8]) -> String {
+    format!("assets/{stem}-{}", &hex::encode(Sha256::digest(jpeg))[..8])
+}
+
 #[test]
-fn import_image_numbers_assets_per_entry() {
+fn import_image_names_assets_by_content() {
     let (dir, journal) = journal();
     let entry = journal
         .create("Morning Run", at(2026, 11, 16, 14, 2, 0))
         .unwrap()
         .file;
-    let png = png();
 
-    let first = journal.import_image(&entry, &png, OPTS).unwrap();
-    assert_eq!(first.path, "assets/2026-11-16-1402-morning-run-1.jpg");
-    assert_eq!((first.width, first.height), (1024, 683));
+    let first = journal.import_image(&entry, &png(0), OPTS).unwrap();
     let saved = fs::read(dir.path().join(&first.path)).unwrap();
+    let base = content_name("2026-11-16-1402-morning-run", &saved);
+    assert_eq!(first.path, format!("{base}.jpg"));
+    assert_eq!((first.width, first.height), (1024, 683));
     assert_eq!(saved.len() as u64, first.bytes);
     assert_eq!(&saved[..2], [0xFF, 0xD8]);
     assert_eq!(mode(&dir.path().join(&first.path)), created_mode());
 
-    let second = journal.import_image(&entry, &png, OPTS).unwrap();
-    assert_eq!(second.path, "assets/2026-11-16-1402-morning-run-2.jpg");
+    // The same image again is the same file.
+    assert_eq!(journal.import_image(&entry, &png(0), OPTS).unwrap(), first);
+    assert_eq!(names(&dir.path().join("assets")).len(), 1);
 
-    // The first free number is used, and an existing asset is never replaced.
-    fs::remove_file(dir.path().join(&first.path)).unwrap();
-    fs::write(
-        dir.path().join("assets/2026-11-16-1402-morning-run-3.jpg"),
-        "keep",
-    )
-    .unwrap();
+    // A different image gets a different name.
+    let other = journal.import_image(&entry, &png(1), OPTS).unwrap();
+    assert_ne!(other.path, first.path);
+    assert!(other
+        .path
+        .starts_with("assets/2026-11-16-1402-morning-run-"));
+
+    // A different file under the name is never replaced: the next free number is used, and a
+    // numbered file that holds the image is used as it is.
+    fs::write(dir.path().join(&first.path), "keep").unwrap();
+    let numbered = journal.import_image(&entry, &png(0), OPTS).unwrap();
+    assert_eq!(numbered.path, format!("{base}-2.jpg"));
+    assert_eq!(fs::read(dir.path().join(&numbered.path)).unwrap(), saved);
     assert_eq!(
-        journal.import_image(&entry, &png, OPTS).unwrap().path,
-        first.path
+        journal.import_image(&entry, &png(0), OPTS).unwrap(),
+        numbered
     );
-    assert_eq!(
-        journal.import_image(&entry, &png, OPTS).unwrap().path,
-        "assets/2026-11-16-1402-morning-run-4.jpg"
-    );
-    assert_eq!(
-        fs::read(dir.path().join("assets/2026-11-16-1402-morning-run-3.jpg")).unwrap(),
-        b"keep"
-    );
+    assert_eq!(fs::read(dir.path().join(&first.path)).unwrap(), b"keep");
 
     // Assets are not entries, and no temp files are left behind.
     assert_eq!(files(&journal), [entry]);
-    assert_eq!(names(&dir.path().join("assets")).len(), 4);
+    assert_eq!(names(&dir.path().join("assets")).len(), 3);
+}
+
+/// Two devices adding images to the same entry between syncs must not pick the same name, or
+/// the pull sets one aside and the entry links to the other device's image.
+#[test]
+fn import_image_names_differ_across_devices() {
+    let (dir_a, a) = journal();
+    let (dir_b, b) = journal();
+    let entry = "2026-11-16-1402-run.md";
+    let from_a = a.import_image(entry, &png(0), OPTS).unwrap();
+    let from_b = b.import_image(entry, &png(1), OPTS).unwrap();
+    assert_ne!(from_a.path, from_b.path);
+    assert!(!dir_b.path().join(&from_a.path).exists());
+    assert!(!dir_a.path().join(&from_b.path).exists());
+
+    // The same image added on both is the same file, which merges cleanly.
+    let same = b.import_image(entry, &png(0), OPTS).unwrap();
+    assert_eq!(same, from_a);
+    assert_eq!(
+        fs::read(dir_b.path().join(&same.path)).unwrap(),
+        fs::read(dir_a.path().join(&from_a.path)).unwrap()
+    );
+}
+
+#[test]
+fn import_image_refuses_huge_images_without_writing() {
+    let (dir, journal) = journal();
+    // 72 MP of grey, a small PNG.
+    let mut huge = Cursor::new(Vec::new());
+    image::GrayImage::new(9000, 8000)
+        .write_to(&mut huge, image::ImageFormat::Png)
+        .unwrap();
+    let err = journal
+        .import_image("2026-11-16-1402-x.md", huge.get_ref(), OPTS)
+        .unwrap_err();
+    assert_eq!(err.to_string(), "the image is too large to import");
+    assert!(!dir.path().join("assets").exists());
+}
+
+#[test]
+fn import_image_never_writes_through_an_assets_link() {
+    let (dir, journal) = journal();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("assets")).unwrap();
+    let err = journal
+        .import_image("2026-11-16-1402-x.md", &png(0), OPTS)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "could not save the image: assets is not a folder"
+    );
+    assert_eq!(names(outside.path()), Vec::<String>::new());
+
+    // A file of that name is refused too, and left as it is.
+    fs::remove_file(dir.path().join("assets")).unwrap();
+    fs::write(dir.path().join("assets"), "notes").unwrap();
+    let err = journal
+        .import_image("2026-11-16-1402-x.md", &png(0), OPTS)
+        .unwrap_err();
+    assert!(err.to_string().ends_with("assets is not a folder"), "{err}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("assets")).unwrap(),
+        "notes"
+    );
 }
 
 #[test]

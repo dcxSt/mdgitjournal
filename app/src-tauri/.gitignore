@@ -1,0 +1,5 @@
+# tauri-build writes a schema for each target it builds (macOS-, linux-, iOS-schema.json…) and
+# copies it to desktop- or mobile-schema.json. Only desktop-schema.json, which
+# capabilities/default.json names, is kept, so a build on any platform leaves the tree clean.
+/gen/schemas/*-schema.json
+!/gen/schemas/desktop-schema.json

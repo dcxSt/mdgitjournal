@@ -1,6 +1,8 @@
 [package]
 name = "mdgitjournal"
 description = "A minimal markdown journal synced with git"
+# Also the Maintainer of the .deb, which would otherwise be a bare word from the identifier.
+authors = ["Stephen Fay <dcxstephen@gmail.com>"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +18,8 @@ tauri-build.workspace = true
 
 [dependencies]
 chrono.workspace = true
+# mdgj-git's, for the network timeouts only (see `state::limit_git_waits`).
+git2 = { version = "0.21.0", default-features = false }
 mdgj-core.workspace = true
 mdgj-git.workspace = true
 mdgj-github.workspace = true
@@ -27,3 +31,17 @@ tauri-plugin-opener.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Only to keep the real keychain out of the GitHub e2e test (tests/github_e2e.rs).
+keyring = "3.6.3"
+# The mock runtime, to check the window's permissions against the real capabilities.
+tauri = { workspace = true, features = ["test"] }
+
+# Not inheriting [workspace.lints]: tauri::mobile_entry_point emits #[no_mangle], which
+# unsafe_code = "forbid" rejects.
+[lints]
+
+# The e2e test builds a Tauri app handle, whose event loop macOS allows only on the main thread,
+# which libtest doesn't give tests.
+[[test]]
+name = "github_e2e"
+harness = false

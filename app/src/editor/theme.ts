@@ -49,14 +49,15 @@ export const sourceTheme = EditorView.theme({
   ".cm-lineNumbers .cm-gutterElement": { padding: "0 0.75em 0 1em" },
   ".cm-activeLine": { backgroundColor: tint("--color-text", 4) },
   ".cm-activeLineGutter": { backgroundColor: "transparent", color: "var(--color-muted)" },
-  // Later rules win where inherited classes meet, e.g. the URL inside a link.
+  // Later rules win where inherited classes meet on one span, e.g. the URL inside a link, or the
+  // "~~" of a strikethrough, which stay unstruck.
   ".cm-src-heading": { color: "var(--color-accent)", fontWeight: "bold" },
   ".cm-src-em": { fontStyle: "italic" },
   ".cm-src-strong": { fontWeight: "bold" },
   ".cm-src-strike": { textDecoration: "line-through" },
   ".cm-src-quote": { color: "var(--color-muted)" },
   ".cm-src-link": { color: "var(--color-accent)" },
-  ".cm-src-mark": { color: "var(--color-muted)" },
+  ".cm-src-mark": { color: "var(--color-muted)", textDecoration: "none" },
 });
 
 export const styledTheme = EditorView.theme({
@@ -85,8 +86,6 @@ export const styledTheme = EditorView.theme({
   ".cm-md-em": { fontStyle: "italic" },
   ".cm-md-strong": { fontWeight: "bold" },
   ".cm-md-strike": { textDecoration: "line-through" },
-  // Text decorations reach inline descendants only, so this keeps the "~~" themselves unstruck.
-  ".cm-md-strike .cm-md-mark": { display: "inline-block" },
   ".cm-md-code": {
     fontFamily: "var(--font-source)",
     fontSize: "0.85em",

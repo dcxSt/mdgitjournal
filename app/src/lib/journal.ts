@@ -117,20 +117,75 @@ export function slugPreview(title: string): string | null {
   return slug || "untitled";
 }
 
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** A name the entry list shows (mdgj-core's rule): a top-level `.md` file, not a dotfile. */
+export function isEntryFile(path: string): boolean {
+  return path.length > 3 && path.endsWith(".md") && !path.startsWith(".") && !/\.\.|[/\\\0]/.test(path);
+}
+
+/**
+ * Name for the keep-both copy of `file` (PLAN §5), as mdgj-git names them: `name.conflict-hhmm.md`,
+ * else `name.conflict-hhmm-2.md`, `-3`, … whichever is free first.
+ */
+export function conflictCopyName(file: string, taken: (name: string) => boolean, now: Date): string {
+  const stem = file.replace(/\.md$/, "");
+  const stamp = `${pad2(now.getHours())}${pad2(now.getMinutes())}`;
+  for (let n = 1; ; n++) {
+    const name = `${stem}.conflict-${stamp}${n > 1 ? `-${n}` : ""}.md`;
+    if (!taken(name)) return name;
+  }
+}
+
 const segmenter = new Intl.Segmenter(undefined, { granularity: "word" });
 
-/** Unicode word count; markdown punctuation ("#", "-", "*") is not word-like, so it is ignored. */
-export function wordCount(text: string): number {
+/** Words outside link destinations; a lone x in brackets is a task mark, not a word. */
+function proseWords(text: string): number {
   let count = 0;
-  for (const segment of segmenter.segment(text)) if (segment.isWordLike) count++;
+  for (const { segment, index, isWordLike } of segmenter.segment(text)) {
+    const mark = /^x$/i.test(segment) && text[index - 1] === "[" && text[index + 1] === "]";
+    if (isWordLike && !mark) count++;
+  }
   return count;
 }
 
-/** Splits a search snippet around its match, converting code-point offsets to string slices. */
+/**
+ * Unicode word count by mdgj-core's rules: markdown punctuation ("#", "-", "*"), the `x` of a
+ * checked task and the `(…)` of a link or image are not words; link and alt text are.
+ * Unlike mdgj-core, CJK runs count as dictionary words rather than one per ideograph.
+ */
+export function wordCount(text: string): number {
+  let count = 0;
+  let rest = text;
+  while (rest) {
+    const at = rest.indexOf("](");
+    count += proseWords(at < 0 ? rest : rest.slice(0, at));
+    const link = at < 0 ? "" : rest.slice(at + 2);
+    // A destination ends at `)`; if the line ends first, it wasn't one.
+    const end = link.search(/[)\n]/);
+    rest = end >= 0 && link[end] === ")" ? link.slice(end + 1) : link;
+  }
+  return count;
+}
+
+/** Context kept before a search match, so the match shows even in the narrowest sidebar. */
+const SNIPPET_LEAD = 12;
+
+/**
+ * Splits a search snippet around its match, converting code-point offsets to string slices.
+ * Long context before the match is cut to its last few words.
+ */
 export function snippetParts(hit: SearchHit): { before: string; match: string; after: string } {
   const chars = Array.from(hit.snippet);
+  const cut = hit.matchStart - SNIPPET_LEAD;
+  let before = chars.slice(Math.max(cut, 0), hit.matchStart).join("");
+  if (cut > 0) {
+    // Drop a word the cut went through.
+    if (/\S/.test(chars[cut - 1])) before = before.replace(/^\S*\s+/, "");
+    before = `…${before}`;
+  }
   return {
-    before: chars.slice(0, hit.matchStart).join(""),
+    before,
     match: chars.slice(hit.matchStart, hit.matchEnd).join(""),
     after: chars.slice(hit.matchEnd).join(""),
   };

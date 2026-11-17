@@ -46,9 +46,33 @@ describe("styled mode", () => {
     const prose = line(view, 3);
     expect(prose.querySelector(".cm-md-strong")?.textContent).toBe("**bold**");
     expect(prose.querySelector(".cm-md-em")?.textContent).toBe("_italic_");
-    expect(prose.querySelector(".cm-md-strike")?.textContent).toBe("~~gone~~");
+    expect(prose.querySelector(".cm-md-strike")?.textContent).toBe("gone");
     expect(prose.querySelector(".cm-md-code")?.textContent).toBe("`code`");
     expect(marks(view, 3)).toEqual(["**", "**", "_", "_", "~~", "~~", "`", "`"]);
+  });
+
+  it("strikes the text but not the tildes around it", () => {
+    const { view } = mount({ doc: "a ~~buy *new* gloves~~ b\n", mode: "styled" });
+    const struck = Array.from(view.contentDOM.querySelectorAll(".cm-md-strike"), (el) => el.textContent);
+    expect(struck.join("")).toBe("buy *new* gloves");
+    const tildes = marks(view, 1).filter((text) => text === "~~");
+    expect(tildes).toHaveLength(2);
+    for (const mark of view.contentDOM.querySelectorAll(".cm-md-mark")) {
+      if (mark.textContent === "~~") expect(mark.closest(".cm-md-strike")).toBeNull();
+    }
+  });
+
+  it("does not strike the tildes in source mode either", () => {
+    const { view } = mount({ doc: "a ~~buy gloves~~ b\n" });
+    const spans = Array.from(view.contentDOM.querySelectorAll(".cm-line span"), (el) => [
+      el.textContent,
+      getComputedStyle(el).textDecorationLine,
+    ]);
+    expect(spans).toEqual([
+      ["~~", "none"],
+      ["buy gloves", "line-through"],
+      ["~~", "none"],
+    ]);
   });
 
   it("colours links and dims their target", () => {

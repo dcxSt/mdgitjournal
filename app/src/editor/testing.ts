@@ -17,7 +17,10 @@ export function cleanup() {
   document.body.replaceChildren();
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 export function mount(options: Partial<EditorOptions> = {}) {
   const parent = document.body.appendChild(document.createElement("div"));

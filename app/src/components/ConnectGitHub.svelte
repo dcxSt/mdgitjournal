@@ -322,15 +322,13 @@
     color: var(--color-danger);
   }
 
-  @media (max-width: 699px) {
-    .button,
-    .repos button {
-      min-height: var(--touch);
-    }
+  :global([data-layout="phone"]) .button,
+  :global([data-layout="phone"]) .repos button {
+    min-height: var(--touch);
+  }
 
-    label {
-      grid-template-columns: 1fr;
-      gap: 4px;
-    }
+  :global([data-layout="phone"]) label {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 </style>

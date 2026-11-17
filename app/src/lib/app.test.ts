@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppState, NEEDS_PULL_TEXT, mobileLayout } from "./app.svelte";
+import { AUTOSAVE_MS } from "./entry.svelte";
 import { createMockApi, type MockApi } from "./mock";
 
 const RUN = "2026-11-16-1402-morning-run.md";
@@ -23,6 +24,15 @@ async function start({ connected = false, api = createMockApi({ platform: "macos
 
 /** Positions of `names` in the recorded calls, in the order given. */
 const order = (api: MockApi, ...names: string[]) => names.map((n) => api.mock.calls.indexOf(n));
+
+/** Makes the next pull run `during` while it is in progress, i.e. while autosave is paused. */
+function duringNextPull(api: MockApi, during: () => void) {
+  const pull = api.pull.bind(api);
+  vi.spyOn(api, "pull").mockImplementationOnce(async () => {
+    during();
+    return pull();
+  });
+}
 
 afterEach(() => {
   for (const app of apps.splice(0)) app.dispose();
@@ -181,6 +191,67 @@ describe("pull", () => {
     expect(app.current.content).toContain("Edited on the phone.");
   });
 
+  it("keeps both when the open entry is typed in while the pull changes it", async () => {
+    const { api, app } = await start({ connected: true });
+    await app.open(IDEAS);
+    const typed = `${app.current.content}typed during the pull\n`;
+    duringNextPull(api, () => app.current.edit(typed));
+    await app.pull();
+    await app.current.settle();
+
+    // GitHub's version keeps the name; the buffer, still open, is saved next to it.
+    expect(api.mock.files.get(IDEAS)).toContain("Edited on the phone.");
+    expect(api.mock.files.get(IDEAS)).not.toContain("typed during the pull");
+    const copy = app.current.file!;
+    expect(copy).toMatch(/^2026-11-14-2130-ideas\.conflict-\d{4}\.md$/);
+    expect(api.mock.files.get(copy)).toBe(typed);
+    expect(app.current.dirty).toBe(false);
+    await vi.waitFor(() => expect(app.currentMeta?.file).toBe(copy));
+    const notice = app.notices.list.find((n) => n.key === "kept-buffer");
+    expect(notice?.text).toContain(copy);
+    expect(notice?.files?.map((f) => f.file)).toEqual([IDEAS]);
+  });
+
+  it("keeps a saved edit and the typing after it when the pull conflicts", async () => {
+    const { api, app } = await start({ connected: true });
+    await app.open(IDEAS);
+    app.current.edit("my saved edit\n");
+    await app.current.flush();
+    duringNextPull(api, () => app.current.edit("my saved edit\nand a line typed while pulling\n"));
+    await app.pull();
+    await app.current.settle();
+
+    const conflictCopy = app.notices.list.find((n) => n.key === "conflicts")?.files?.[0].file ?? "";
+    expect(api.mock.files.get(conflictCopy)).toBe("my saved edit\n");
+    expect(app.current.file).not.toBe(conflictCopy);
+    expect(api.mock.files.get(app.current.file!)).toBe("my saved edit\nand a line typed while pulling\n");
+    expect(api.mock.files.get(IDEAS)).toContain("Edited on the phone.");
+  });
+
+  it("autosaves typing as usual when the pull leaves the open entry alone", async () => {
+    const { api, app } = await start({ connected: true });
+    duringNextPull(api, () => app.current.edit("typed during the pull"));
+    await app.pull();
+    await app.current.settle();
+    expect(app.current.file).toBe(RUN);
+    expect(api.mock.files.get(RUN)).toBe("typed during the pull");
+    expect(app.notices.list.map((n) => n.key)).not.toContain("kept-buffer");
+  });
+
+  it("writes the typing back, and lists the entry again, when the pull removed it", async () => {
+    const { api, app } = await start({ connected: true });
+    vi.spyOn(api, "pull").mockImplementationOnce(async () => {
+      app.current.edit("typed during the pull");
+      api.mock.files.delete(RUN);
+      return { view: await api.syncState(), updated: [RUN], merged: [], conflicts: [] };
+    });
+    await app.pull();
+    await app.current.settle();
+    expect(app.current.file).toBe(RUN);
+    expect(api.mock.files.get(RUN)).toBe("typed during the pull");
+    await vi.waitFor(() => expect(app.currentMeta?.file).toBe(RUN));
+  });
+
   it("marks the error for the red dot and clears it on success", async () => {
     const { api, app } = await start({ connected: true });
     api.mock.failNext("pull", "network", "Offline.");
@@ -188,6 +259,127 @@ describe("pull", () => {
     expect(app.lastError?.message).toBe("Offline.");
     await app.pull();
     expect(app.lastError).toBeNull();
+  });
+});
+
+/** A promise the test resolves. */
+function gate<T = void>() {
+  let open!: (value: T) => void;
+  const closed = new Promise<T>((resolve) => (open = resolve));
+  return { closed, open };
+}
+
+const png = () => new File([new Uint8Array([137, 80, 78, 71])], "shot.png", { type: "image/png" });
+
+describe("sync state", () => {
+  it("pull waits for a fetch in flight, and autosave keeps working meanwhile", async () => {
+    const { api, app } = await start({ connected: true });
+    const fetchDone = gate();
+    const fetch = api.fetch.bind(api);
+    vi.spyOn(api, "fetch").mockImplementationOnce(async () => {
+      await fetchDone.closed;
+      return fetch();
+    });
+    const fetching = app.fetch();
+    const pulling = app.pull();
+    app.current.edit("typed while GitHub is checked");
+    await vi.waitFor(() => expect(api.mock.files.get(RUN)).toBe("typed while GitHub is checked"));
+    expect(api.mock.calls).not.toContain("pull");
+
+    fetchDone.open();
+    await Promise.all([fetching, pulling]);
+    expect(order(api, "fetch", "pull")).toEqual([...order(api, "fetch", "pull")].sort((a, b) => a - b));
+    expect(app.sync.behind).toBe(0);
+  });
+
+  it("a sync_state reply overtaken by a fetch doesn't undo what the fetch found", async () => {
+    const { api, app } = await start({ connected: true });
+    const stale = await api.syncState();
+    expect(stale.behind).toBe(0);
+    const reply = gate<typeof stale>();
+    vi.spyOn(api, "syncState").mockImplementationOnce(() => reply.closed);
+    app.refreshSync();
+    await app.fetch();
+    expect(app.sync.behind).toBe(2);
+
+    reply.open(stale);
+    await vi.waitFor(() => expect(api.syncState).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => setTimeout(resolve));
+    expect(app.sync.behind).toBe(2);
+  });
+});
+
+describe("images", () => {
+  it("an import waits for a pull in progress", async () => {
+    const { api, app } = await start({ connected: true });
+    const pullDone = gate();
+    const pull = api.pull.bind(api);
+    vi.spyOn(api, "pull").mockImplementationOnce(async () => {
+      await pullDone.closed;
+      return pull();
+    });
+    const pulling = app.pull();
+    const importing = app.importImages([png()]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(api.mock.calls).not.toContain("importImage");
+
+    pullDone.open();
+    await pulling;
+    const [path] = await importing;
+    expect(path).toMatch(/^assets\/2026-11-16-1402-morning-run-[0-9a-f]{8}\.jpg$/);
+    expect(order(api, "pull", "importImage")).toEqual([...order(api, "pull", "importImage")].sort((a, b) => a - b));
+  });
+
+  it("names images by content, and the same image twice is one file", async () => {
+    const { app } = await start();
+    const [first, again] = await app.importImages([png(), png()]);
+    expect(again).toBe(first);
+  });
+
+  it("stops importing once another entry is open, and says so", async () => {
+    const { api, app } = await start();
+    const importImage = api.importImage.bind(api);
+    vi.spyOn(api, "importImage").mockImplementationOnce(async (entry, bytes) => {
+      void app.open(IDEAS);
+      return importImage(entry, bytes);
+    });
+    const paths = await app.importImages([png(), png()]);
+    expect(paths).toHaveLength(1);
+    expect(app.current.file).toBe(IDEAS);
+    expect(api.mock.calls.filter((c) => c === "importImage")).toHaveLength(1);
+    expect(app.notices.list.at(-1)?.text).toBe(
+      "1 image not added: the open entry changed while importing. Add it again.",
+    );
+  });
+
+  it("names the links it couldn't insert, as text to copy", async () => {
+    const { app } = await start();
+    app.imagesUnlinked(["assets/run-1a2b3c4d.jpg", "assets/my run-5e6f7a8b.jpg"]);
+    const notice = app.notices.list.at(-1);
+    expect(notice?.text).toMatch(/^Saved 2 images but didn't link them/);
+    expect(notice?.files).toEqual([
+      { label: "![](assets/run-1a2b3c4d.jpg)" },
+      { label: "![](<assets/my run-5e6f7a8b.jpg>)" },
+    ]);
+  });
+
+  it("a conflict banner links entries only; an image copy is just named", async () => {
+    const { api, app } = await start({ connected: true });
+    const copy = "assets/run-1.conflict-1402.jpg";
+    vi.spyOn(api, "pull").mockImplementationOnce(async () => ({
+      view: await api.syncState(),
+      updated: [],
+      merged: [],
+      conflicts: [
+        { path: "assets/run-1.jpg", copy },
+        { path: IDEAS, copy: "2026-11-14-2130-ideas.conflict-1402.md" },
+      ],
+    }));
+    await app.pull();
+    expect(app.notices.list.find((n) => n.key === "conflicts")?.files).toEqual([
+      { label: copy, file: undefined },
+      { label: "2026-11-14-2130-ideas.conflict-1402.md", file: "2026-11-14-2130-ideas.conflict-1402.md" },
+    ]);
   });
 });
 
@@ -243,6 +435,29 @@ describe("entries", () => {
     expect(app.currentMeta?.title).toBe("long-run");
   });
 
+  it("deletes only the entry the user confirmed", async () => {
+    const { api, app } = await start();
+    await app.remove(IDEAS);
+    expect(api.mock.files.has(IDEAS)).toBe(true);
+    expect(api.mock.calls).not.toContain("deleteEntry");
+    await app.remove(RUN);
+    expect(api.mock.files.has(RUN)).toBe(false);
+  });
+
+  it("on the phone, Back during a pull waits for it, then saves what was typed", async () => {
+    const { api, app } = await start({ connected: true, api: createMockApi({ platform: "ios" }) });
+    await app.openEntry(RUN);
+    let back: Promise<void> | undefined;
+    duringNextPull(api, () => {
+      app.current.edit("typed during the pull");
+      back = app.back();
+    });
+    await app.pull();
+    await back;
+    expect(api.mock.files.get(RUN)).toBe("typed during the pull");
+    expect(app.current.file).toBeNull();
+  });
+
   it("goes back to the list on the phone only once the entry is saved", async () => {
     const { api, app } = await start({ api: createMockApi({ platform: "ios" }) });
     await app.openEntry(RUN);
@@ -282,8 +497,32 @@ describe("closing the window", () => {
     app.current.edit("typed during a pull");
     app.current.pause();
     expect(await app.beforeClose()).toBe(false);
+    expect(app.notices.list.find((n) => n.key === "close")?.text).toMatch(/sync in progress/);
     app.current.resume();
     expect(await app.beforeClose()).toBe(true);
+  });
+});
+
+describe("a failed autosave", () => {
+  it("is explained in a notice, which goes once a retry succeeds", async () => {
+    vi.useFakeTimers();
+    const { api, app } = await start();
+    const notices = () => app.notices.list.filter((n) => n.key === "save-error");
+    api.mock.failNext("writeEntry", "io", "Disk full.");
+    app.current.edit("precious");
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS);
+    expect(notices()).toHaveLength(1);
+    expect(notices()[0]).toMatchObject({ tone: "error", text: expect.stringContaining("Disk full.") });
+
+    // Leaving the entry reports the failure again; it replaces the notice rather than adding one.
+    api.mock.failNext("writeEntry", "io", "Disk full.");
+    await app.back();
+    expect(app.current.file).toBe(RUN);
+    expect(notices()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(api.mock.files.get(RUN)).toBe("precious");
+    expect(notices()).toHaveLength(0);
   });
 });
 
@@ -309,10 +548,13 @@ describe("perform", () => {
 
   it("does nothing else while a sheet is open", async () => {
     const { app } = await start();
-    app.overlay = "commit";
-    app.perform("toggleMode");
-    app.perform("new");
-    app.perform("settings");
-    expect(app).toMatchObject({ mode: "source", newPrompt: false, overlay: "commit" });
+    for (const overlay of ["commit", "delete"] as const) {
+      app.overlay = overlay;
+      app.perform("toggleMode");
+      app.perform("new");
+      app.perform("settings");
+      app.perform("quickOpen");
+      expect(app).toMatchObject({ mode: "source", newPrompt: false, overlay });
+    }
   });
 });

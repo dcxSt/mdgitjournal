@@ -21,7 +21,7 @@
     class:accent={pull.accent}
     disabled={pulling}
     title={error ? `Last sync failed: ${error.message}` : `${pull.title} (${shortcutLabel("pull", app.mac)})`}
-    onclick={() => (error ? app.showSyncError() : void app.pull())}
+    onclick={() => void app.pull()}
   >
     {#if pull.busy}<span class="spinner" aria-hidden="true"></span>{:else}<Icon name="pull" size={13} />{/if}
     <span>Pull</span>

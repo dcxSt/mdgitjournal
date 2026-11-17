@@ -78,7 +78,7 @@ describe("autosave", () => {
     expect(entry.saveError).toBeNull();
   });
 
-  it("writes nothing while paused and catches up after resume", async () => {
+  it("writes nothing while paused and catches up as soon as it resumes", async () => {
     const { api, entry } = await setup();
     entry.pause();
     entry.edit("typed during a pull");
@@ -87,8 +87,71 @@ describe("autosave", () => {
     expect(api.mock.calls).toEqual([]);
 
     entry.resume();
-    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS);
+    await vi.advanceTimersByTimeAsync(0);
     expect(api.mock.files.get(FILE)).toBe("typed during a pull");
+  });
+
+  it("settle fails while paused instead of reporting unsaved edits as written", async () => {
+    const { api, entry } = await setup();
+    entry.pause();
+    entry.edit("typed during a pull");
+    await expect(entry.settle()).rejects.toBeInstanceOf(SaveError);
+    expect(entry.dirty).toBe(true);
+    expect(api.mock.calls).toEqual([]);
+
+    entry.resume();
+    await entry.settle();
+    expect(api.mock.files.get(FILE)).toBe("typed during a pull");
+  });
+
+  it("reports the first failure of a run of failed writes, not each retry", async () => {
+    const api = createMockApi();
+    const failed = vi.fn();
+    const entry = new CurrentEntry(api, undefined, failed);
+    entry.load(await api.readEntry(FILE));
+    api.mock.failNext("writeEntry", "io", "Disk full.");
+    entry.edit("a");
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS);
+    api.mock.failNext("writeEntry", "io", "Still full.");
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(failed.mock.calls).toEqual([[FILE, "Disk full.", true]]);
+
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(entry.saveError).toBeNull();
+    api.mock.failNext("writeEntry", "io", "Full again.");
+    entry.edit("ab");
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS);
+    expect(failed.mock.calls).toEqual([
+      [FILE, "Disk full.", true],
+      [FILE, "Full again.", true],
+    ]);
+  });
+
+  it("never sends half of a character, says which line has it, and saves once it is gone", async () => {
+    const api = createMockApi();
+    const failed = vi.fn();
+    const entry = new CurrentEntry(api, undefined, failed);
+    entry.load(await api.readEntry(FILE));
+    const before = api.mock.files.get(FILE);
+    api.mock.calls.length = 0;
+    entry.edit("one\ntwo \ud83d\nthree 👍");
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS + 10_000);
+    expect(api.mock.calls).toEqual([]);
+    expect(api.mock.files.get(FILE)).toBe(before);
+    const message = "line 2 has half of a character (such as an emoji); delete it or undo to save";
+    expect(failed.mock.calls).toEqual([[FILE, message, false]]);
+    await expect(entry.flush()).rejects.toThrow(message);
+    expect(entry.dirty).toBe(true);
+
+    entry.edit("one\ntwo \udc4d"); // a lone low half
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS);
+    expect(api.mock.calls).toEqual([]);
+    expect(entry.saveError).toMatch(/^line 2 /);
+
+    entry.edit("one\ntwo \nthree 👍");
+    await vi.advanceTimersByTimeAsync(AUTOSAVE_MS);
+    expect(api.mock.files.get(FILE)).toBe("one\ntwo \nthree 👍");
+    expect(entry.saveError).toBeNull();
   });
 });
 

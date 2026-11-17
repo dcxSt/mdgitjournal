@@ -38,6 +38,10 @@ impl From<git2::Error> for Error {
             ),
             (_, _, Some(code)) => Error::Network(format!("the server answered HTTP {code}")),
             (_, ErrorClass::Net | ErrorClass::Http | ErrorClass::Ssl, _) => Error::Network(message),
+            // libgit2's socket stream reports an unreachable host as an OS error.
+            (_, ErrorClass::Os, _) if message.starts_with("failed to connect to") => {
+                Error::Network(message)
+            }
             (_, ErrorClass::Os, _) => Error::Io(message),
             _ => Error::Git(message),
         }
@@ -75,6 +79,19 @@ mod tests {
         assert_eq!(
             map(ErrorCode::GenericError, ErrorClass::Net, offline),
             Error::Network(offline.into())
+        );
+        let unreachable = "failed to connect to github.com: Connection refused";
+        assert_eq!(
+            map(ErrorCode::GenericError, ErrorClass::Os, unreachable),
+            Error::Network(unreachable.into())
+        );
+        assert_eq!(
+            map(
+                ErrorCode::GenericError,
+                ErrorClass::Os,
+                "could not open file"
+            ),
+            Error::Io("could not open file".into())
         );
         assert!(matches!(
             map(

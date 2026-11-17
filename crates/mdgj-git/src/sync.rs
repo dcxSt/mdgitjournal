@@ -1,16 +1,18 @@
 //! Remote operations: fetch, pull, push, commit and push, connect.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
 
 use git2::{
-    AutotagOption, BranchType, Commit, Cred, CredentialType, ErrorCode, FetchOptions, FetchPrune,
-    ProxyOptions, PushOptions, Remote, RemoteCallbacks, Sort,
+    AutotagOption, BranchType, Commit, Cred, CredentialType, Delta, DiffFindOptions, ErrorCode,
+    FetchOptions, FetchPrune, ProxyOptions, PushOptions, Remote, RemoteCallbacks, Repository, Sort,
+    Tree,
 };
 use serde::Serialize;
 
 use crate::merge::{merge_keep_both, tree_files};
-use crate::repo::{empty_tree, head_commit, lossy, signature, workdir, REMOTE};
+use crate::repo::{empty_tree, head_commit, lossy, signature, without_userinfo, workdir, REMOTE};
 use crate::worktree::{apply, exists, files, Snapshot};
 use crate::{Author, Error, Repo, Result, SyncState};
 
@@ -24,6 +26,9 @@ const DEFAULT_BRANCHES: [&str; 2] = ["main", "master"];
 pub struct Creds {
     pub username: String,
     pub password: String,
+    /// The credentials are only sent to URLs starting with this, e.g. "https://github.com/". git
+    /// may contact another URL than origin's (`pushurl`, `insteadOf`, redirects).
+    pub url_prefix: String,
 }
 
 impl fmt::Debug for Creds {
@@ -31,6 +36,7 @@ impl fmt::Debug for Creds {
         f.debug_struct("Creds")
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field("url_prefix", &self.url_prefix)
             .finish()
     }
 }
@@ -128,7 +134,7 @@ impl Repo {
         let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
         match remote.push(&[refspec.as_str()], Some(&mut options)) {
             Ok(()) => {}
-            Err(e) if auth.failure.get().is_none() && e.code() == ErrorCode::NotFastForward => {
+            Err(e) if auth.failure.borrow().is_none() && e.code() == ErrorCode::NotFastForward => {
                 rejection.replace(Some(e.message().to_owned()));
             }
             Err(e) => return Err(auth.error(e)),
@@ -303,14 +309,23 @@ impl Repo {
         let mut target = files(&merge.index);
 
         // A safety net under the merge: a file may leave the working tree only if git still has
-        // its exact content, at the base or somewhere in the result.
+        // its exact content, at the base or somewhere in the result. A file kept this way is
+        // reported, so it never sits there unnoticed (e.g. renamed remotely, edited here).
         let base_files = tree_files(&base)?;
+        let renamed = renames(repo, &base, &theirs)?;
         for (path, entry) in &snapshot.files {
             let kept = target.contains_key(path)
                 || base_files.get(path) == Some(entry)
                 || target.values().any(|(id, _)| *id == entry.0);
             if !kept {
                 target.insert(path.clone(), *entry);
+                let shown = lossy(renamed.get(path).unwrap_or(path));
+                // Replaces the merge's "deleted here" note for the renamed file: it wasn't.
+                conflicts.retain(|c| c.path != shown || c.copy.is_some());
+                conflicts.push(Conflict {
+                    path: shown,
+                    copy: Some(lossy(path)),
+                });
             }
         }
 
@@ -455,11 +470,27 @@ impl Repo {
     }
 }
 
-/// Hands credentials to libgit2 (in memory only) and gives up after a few rejected attempts.
+/// Old path -> new path for every file renamed between two trees.
+fn renames(repo: &Repository, old: &Tree<'_>, new: &Tree<'_>) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+    let mut diff = repo.diff_tree_to_tree(Some(old), Some(new), None)?;
+    diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
+    Ok(diff
+        .deltas()
+        .filter(|delta| delta.status() == Delta::Renamed)
+        .filter_map(|delta| {
+            let from = delta.old_file().path_bytes()?.to_vec();
+            let to = delta.new_file().path_bytes()?.to_vec();
+            Some((from, to))
+        })
+        .collect())
+}
+
+/// Hands credentials to libgit2 (in memory only), only for URLs under `Creds::url_prefix`, and
+/// gives up after a few rejected attempts.
 struct Auth<'a> {
     creds: Option<&'a Creds>,
     attempts: Cell<u32>,
-    failure: Cell<Option<&'static str>>,
+    failure: RefCell<Option<String>>,
 }
 
 impl<'a> Auth<'a> {
@@ -467,37 +498,54 @@ impl<'a> Auth<'a> {
         Auth {
             creds,
             attempts: Cell::new(0),
-            failure: Cell::new(None),
+            failure: RefCell::new(None),
         }
     }
 
     fn callbacks(&'a self) -> RemoteCallbacks<'a> {
         let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(move |_, _, allowed| {
+        callbacks.credentials(move |url, _, allowed| {
             let failure = match self.creds {
-                None => "the remote repository requires signing in",
+                None => "the remote repository requires signing in".to_owned(),
+                Some(creds) if !url.starts_with(&creds.url_prefix) => format!(
+                    "the token is only sent to {}, not to {} (check remote.origin.pushurl and \
+                     url.*.insteadOf in the git config)",
+                    creds.url_prefix,
+                    origin(url)
+                ),
                 Some(_) if !allowed.contains(CredentialType::USER_PASS_PLAINTEXT) => {
-                    "the remote asked for a sign-in method other than a token"
+                    "the remote asked for a sign-in method other than a token".to_owned()
                 }
                 Some(_) if self.attempts.get() >= MAX_AUTH_ATTEMPTS => {
-                    "the remote did not accept the token; sign in again"
+                    "the remote did not accept the token; sign in again".to_owned()
                 }
                 Some(creds) => {
                     self.attempts.set(self.attempts.get() + 1);
                     return Cred::userpass_plaintext(&creds.username, &creds.password);
                 }
             };
-            self.failure.set(Some(failure));
-            Err(git2::Error::from_str(failure))
+            let error = git2::Error::from_str(&failure);
+            self.failure.replace(Some(failure));
+            Err(error)
         });
         callbacks
     }
 
     fn error(&self, e: git2::Error) -> Error {
-        match self.failure.get() {
-            Some(failure) => Error::Auth(failure.to_owned()),
+        match self.failure.take() {
+            Some(failure) => Error::Auth(failure),
             None => e.into(),
         }
+    }
+}
+
+/// "https://user@host:8080/x.git" -> "https://host:8080", for messages.
+fn origin(url: &str) -> String {
+    let url = without_userinfo(url);
+    let path_start = url.find("://").map_or(0, |i| i + 3);
+    match url[path_start..].find('/') {
+        Some(i) => url[..path_start + i].to_owned(),
+        None => url,
     }
 }
 
@@ -510,16 +558,26 @@ fn proxy() -> ProxyOptions<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::Creds;
+    use super::{origin, Creds};
 
     #[test]
     fn debug_output_hides_the_token() {
         let creds = Creds {
             username: "x-access-token".into(),
             password: "ghs_secret".into(),
+            url_prefix: "https://github.com/".into(),
         };
         let shown = format!("{creds:?}");
         assert!(shown.contains("x-access-token"));
         assert!(!shown.contains("ghs_secret"));
+    }
+
+    #[test]
+    fn origins_drop_userinfo_and_path() {
+        assert_eq!(
+            origin("https://u:p@example.com:8080/a/b.git"),
+            "https://example.com:8080"
+        );
+        assert_eq!(origin("http://127.0.0.1:1"), "http://127.0.0.1:1");
     }
 }

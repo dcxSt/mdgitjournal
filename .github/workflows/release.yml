@@ -5,7 +5,7 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,8 +14,10 @@ jobs:
   draft:
     name: Draft release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check that the tag matches the app version
         run: |
           want="${GITHUB_REF_NAME#v}"
@@ -23,6 +25,9 @@ jobs:
           check app/src-tauri/tauri.conf.json "$(jq -r .version app/src-tauri/tauri.conf.json)"
           check app/package.json "$(jq -r .version app/package.json)"
           check Cargo.toml "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "mdgitjournal").version')"
+          # Fails if RELEASING.md's `cargo update --workspace` was forgotten; the AUR package
+          # builds the tag with --locked.
+          cargo update --workspace --locked
           metainfo=packaging/linux/xyz.stephenfay.mdgitjournal.metainfo.xml
           grep -q "<release version=\"$want\"" "$metainfo" ||
             { echo "::error file=$metainfo::no <release> entry for $want"; exit 1; }
@@ -43,20 +48,24 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     needs: draft
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: macOS universal
             os: macos-latest
-            args: --target universal-apple-darwin
-          # Older glibc than ubuntu-latest, so the packages run on more distributions.
+            args: --target universal-apple-darwin -- --locked
+          # Pinned, not ubuntu-latest: the packages need at least the glibc they were built
+          # with (2.39), so it only changes on purpose. Move on to the next LTS when GitHub
+          # deprecates this image, and keep equal to the bundle job in ci.yml.
           - name: Linux x86_64
-            os: ubuntu-22.04
-            args: ''
+            os: ubuntu-24.04
+            args: -- --locked
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -69,17 +78,19 @@ jobs:
       - name: Add the macOS targets
         if: runner.os == 'macOS'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - uses: pnpm/action-setup@v6
+      # No rust-cache here: releases are rare, and every third-party step in this job can read
+      # the Apple secrets.
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         with:
           package_json_file: app/package.json
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: lts/*
       - run: pnpm -C app install --frozen-lockfile
       # Unset secrets and variables arrive as empty strings, which still count as set. Export only
-      # the non-empty ones: without Apple credentials the .dmg stays unsigned instead of failing,
-      # and without a client ID variable the one in .cargo/config.toml (if any) applies.
+      # the non-empty ones: without a client ID variable the one in .cargo/config.toml (if any)
+      # applies. Without a certificate the app is ad-hoc signed ("-") and not notarized; left
+      # unsigned, its bundle signature is broken and Gatekeeper calls a download "damaged".
       - name: Export build settings
         env:
           MDGJ_GITHUB_CLIENT_ID: ${{ vars.MDGJ_GITHUB_CLIENT_ID || secrets.MDGJ_GITHUB_CLIENT_ID }}
@@ -92,14 +103,17 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           names="MDGJ_GITHUB_CLIENT_ID MDGJ_GITHUB_APP_SLUG"
-          if [ "$RUNNER_OS" = macOS ]; then
+          if [ "$RUNNER_OS" = macOS ] && [ -n "$APPLE_CERTIFICATE" ]; then
             names="$names APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID"
+          elif [ "$RUNNER_OS" = macOS ]; then
+            echo "::warning::No Apple certificate is set; the .dmg is ad-hoc signed and not notarized"
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
           fi
           for name in $names; do
             [ -n "${!name}" ] || continue
             { echo "$name<<__END__"; printf '%s\n' "${!name}"; echo "__END__"; } >> "$GITHUB_ENV"
           done
-      - uses: tauri-apps/tauri-action@v1
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -107,3 +121,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseDraft: true
           args: ${{ matrix.args }}
+      # An unsigned bundle (only the linker's signature) fails this, and Gatekeeper rejects it.
+      - name: Check the app's signature
+        if: runner.os == 'macOS'
+        run: codesign --verify --deep --strict --verbose=2 target/universal-apple-darwin/release/bundle/macos/mdgitjournal.app

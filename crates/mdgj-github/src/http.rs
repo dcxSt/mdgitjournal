@@ -1,6 +1,7 @@
 //! HTTP transport trait and the blocking reqwest + rustls implementation.
 
 use std::error::Error as _;
+use std::time::Duration;
 
 use reqwest::blocking::{Client, RequestBuilder};
 
@@ -22,6 +23,7 @@ pub trait Http: Send + Sync {
 }
 
 /// Blocking reqwest over rustls (ring), verifying certificates against the OS trust store.
+/// A request gives up after 10 s without a connection, or 30 s in all.
 ///
 /// Don't use it from inside an async task; run it on a blocking thread.
 pub struct ReqwestHttp {
@@ -32,7 +34,11 @@ impl ReqwestHttp {
     pub fn new() -> Result<Self> {
         // reqwest is built without a default crypto provider. Fails only if one is already set.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let client = Client::builder().build().map_err(network)?;
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(network)?;
         Ok(Self { client })
     }
 }

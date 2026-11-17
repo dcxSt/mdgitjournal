@@ -1,0 +1,11 @@
+# The workflows pin every action to a commit SHA, with the version in a comment. This bumps both
+# through pull requests; nothing else is updated automatically.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
