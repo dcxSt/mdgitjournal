@@ -369,6 +369,19 @@ fn line_endings_follow_git_and_come_back_exactly() {
     assert_eq!(b.read("b.md"), b"b remote\r\n");
 }
 
+/// The branch back at `local` with no trace of the pull in its reflog: the pull never moved it.
+fn crash(d: &Device, local: git2::Oid) {
+    let git = d.git();
+    let name = "refs/heads/main";
+    let pulled = git.refname_to_id(name).unwrap();
+    git.reference(name, local, true, "crash").unwrap();
+    let mut reflog = git.reflog(name).unwrap();
+    while let Some(i) = reflog.iter().position(|e| e.id_new() == pulled) {
+        reflog.remove(i, false).unwrap();
+    }
+    reflog.write().unwrap();
+}
+
 #[test]
 fn a_pull_the_app_quit_during_is_put_back() {
     let (_remote, a, b) = two_devices(&[("a.md", "a\n"), ("b.md", "b\n")]);
@@ -384,9 +397,7 @@ fn a_pull_the_app_quit_during_is_put_back() {
         &[common::resolved("a.md", mdgj_git::Resolution::Theirs)],
     );
     // As if the app had died after writing the files and the index, before moving the branch.
-    b.git()
-        .reference("refs/heads/main", local, true, "crash")
-        .unwrap();
+    crash(&b, local);
     assert_eq!(b.repo.last_sync(), Ok(None));
 
     // The next operation (here, a preview) puts the files and the index back first.
@@ -406,9 +417,7 @@ fn a_pull_the_app_quit_during_is_put_back() {
         &preview,
         &[common::resolved("a.md", mdgj_git::Resolution::Theirs)],
     );
-    b.git()
-        .reference("refs/heads/main", local, true, "crash")
-        .unwrap();
+    crash(&b, local);
     b.write("b.md", "typed after the crash\n");
     let stuck = b.state();
     let result = b.repo.preview_pull();
@@ -440,4 +449,23 @@ fn undo_is_all_or_nothing() {
     b.repo.undo_last_sync().unwrap();
     assert_eq!(b.text("a.md"), "a\n");
     assert_eq!(b.text("z/x.md"), "x\n");
+}
+
+#[test]
+fn a_pull_undone_with_git_reset_is_not_taken_for_an_interrupted_one() {
+    let (_remote, a, b) = two_devices(&[("a.md", "a\n")]);
+    a.write("a.md", "a, GitHub\n");
+    a.push("A");
+    let local = b.head();
+    b.pull_applied();
+    if b.cli_ok(&["reset", "-q", "--hard", &local.to_string()])
+        .is_none()
+    {
+        return; // no git on PATH
+    }
+    b.write("a.md", "typed after the reset\n");
+    // The next operation carries on; the stale record goes, and nothing is overwritten.
+    assert!(b.repo.preview_pull().unwrap().is_some());
+    assert_eq!(b.text("a.md"), "typed after the reset\n");
+    assert!(!b.root().join(".git/mdgitjournal/undo.json").exists());
 }

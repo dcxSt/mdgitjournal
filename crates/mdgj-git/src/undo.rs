@@ -160,6 +160,13 @@ impl Repo {
         if !interrupted {
             return Ok(());
         }
+        // A pull that finished moved the branch to `after` (the reflog says so); one moved back
+        // since, with `git reset` say, is the user's doing, and its record is just stale.
+        let after = Oid::from_str(&record.after)?;
+        let reflog = self.git.reflog(&format!("refs/heads/{}", record.branch))?;
+        if reflog.iter().any(|entry| entry.id_new() == after) {
+            return self.clear_undo();
+        }
         let edited = self.edited_since(&record)?;
         if !edited.is_empty() {
             return Err(Error::Git(format!(
