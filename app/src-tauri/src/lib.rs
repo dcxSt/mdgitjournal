@@ -4,6 +4,8 @@ mod commands;
 mod error;
 #[cfg(target_os = "macos")]
 mod menu;
+#[cfg(all(unix, desktop))]
+mod signals;
 mod state;
 mod view;
 
@@ -42,6 +44,8 @@ pub fn run() {
             // If the journal can't be opened, the window still is, and the UI says why.
             let backend: state::Backend = state::AppState::open(app.handle());
             app.manage(backend);
+            #[cfg(all(unix, desktop))]
+            signals::close_windows_on_signal(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -183,7 +183,7 @@ test("Keep both keeps yours at the name and saves GitHub's next to it", async ({
     .trim()
     .replace(/^Yours stays; GitHub's is saved next to it as /, "")
     .replace(/\.$/, "");
-  expect(copy).toMatch(/^2026-10-28-0815-reading-list\.from-github-\d{4}\.md$/);
+  expect(copy).toMatch(/^2026-10-28-0815-reading-list\.from-github-\d{2}h\d{2}\.md$/);
 
   await review(page).getByRole("button", { name: "Apply" }).click();
   await expect(review(page)).toBeHidden();
@@ -219,20 +219,45 @@ test("Cancel (or Esc) leaves every file as it was and asks nothing of the backen
   await expect(pullButton(page).locator(".badge")).toHaveText("4");
 });
 
-test("a review gone stale writes nothing and opens again, fresh", async ({ page }) => {
+test("a review gone stale writes nothing and opens again, keeping the choices that still hold", async ({ page }) => {
   await connected(page);
-  await seedOverlaps(page);
+  const { clash } = await seedOverlaps(page);
   await pullButton(page).click();
   await choices(page, "reading-list").getByRole("button", { name: "Keep mine" }).click();
+  // An edit to another file: reading-list is the same, so its choice holds.
   await editOnDisk(page, "notes.md", "Edited in vim while the review was open.\n");
   const before = await allFiles(page);
 
   await review(page).getByRole("button", { name: "Apply" }).click();
-  await expect(review(page).getByText("Something changed since you opened the review.")).toBeVisible();
+  await expect(review(page).getByText("Something changed since you opened the review. Your choices are kept.")).toBeVisible();
   expect(await allFiles(page)).toEqual(before);
-  await expect(choices(page, "reading-list").getByRole("button", { name: "Keep mine" })).toHaveAttribute("aria-pressed", "false");
-  await expect(review(page).getByRole("button", { name: "Apply" })).toBeDisabled();
+  await expect(choices(page, "reading-list").getByRole("button", { name: "Keep mine" })).toHaveAttribute("aria-pressed", "true");
   await expect(pullButton(page).locator(".dot")).toHaveCount(0);
+
+  // An edit to reading-list itself: only its choice starts afresh, and the review says so.
+  await editOnDisk(page, clash, "# Reading list\n\n- typed in vim\n");
+  await review(page).getByRole("button", { name: "Apply" }).click();
+  await expect(review(page).getByText(/“reading-list” is new or changed: check it\./)).toBeVisible();
+  await expect(choices(page, "reading-list").getByRole("button", { name: "Keep mine" })).toHaveAttribute("aria-pressed", "false");
+  await expect(review(page).getByText("new or changed", { exact: true })).toBeVisible();
+  await expect(review(page).getByRole("button", { name: "Apply" })).toBeDisabled();
+});
+
+test("Esc on a review with a hand-made merge asks before discarding it", async ({ page }) => {
+  await connected(page);
+  await seedOverlaps(page);
+  await pullButton(page).click();
+  await choices(page, "reading-list").getByRole("button", { name: "Keep GitHub's" }).click();
+  await page.keyboard.press("Escape");
+  const ask = review(page).getByRole("alertdialog", { name: "Discard your choices?" });
+  await expect(ask).toBeVisible();
+  await ask.getByRole("button", { name: "Keep reviewing" }).click();
+  await expect(ask).toBeHidden();
+  await expect(choices(page, "reading-list").getByRole("button", { name: "Keep GitHub's" })).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("Escape");
+  await review(page).getByRole("alertdialog").getByRole("button", { name: "Discard" }).click();
+  await expect(review(page)).toBeHidden();
+  expect(await callCount(page, "applyPull")).toBe(0);
 });
 
 test("Resolve with git leaves a merge for git; the app says so, blocks syncing, and Abort undoes it", async ({ page }) => {
@@ -260,7 +285,8 @@ test("Resolve with git leaves a merge for git; the app says so, blocks syncing, 
 
   await banner.getByRole("button", { name: "Abort merge" }).click();
   const confirm = page.getByRole("dialog", { name: "Abort merge" });
-  await expect(confirm.getByText(/Files git merged go back to how they were before the merge/)).toBeVisible();
+  await expect(confirm.getByText(/go back to how they were before the merge/)).toBeVisible();
+  await expect(confirm.getByText(LIST, { exact: true })).toBeVisible();
   await confirm.getByRole("button", { name: "Abort merge" }).click();
   await expect(confirm).toBeHidden();
   await expect(banner).toBeHidden();
@@ -268,6 +294,7 @@ test("Resolve with git leaves a merge for git; the app says so, blocks syncing, 
   await expect(pullButton(page)).toBeEnabled();
   await expect(commitButton(page).locator(".badge")).toHaveText("2");
   await expect(page.getByText("Merge finished.")).toHaveCount(0);
+  await expect(page.getByText("Merge aborted.")).toBeVisible();
 });
 
 test("a merge finished in a terminal is noticed when the window comes back", async ({ page }) => {

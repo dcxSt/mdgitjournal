@@ -99,7 +99,7 @@
           {#each summary.resolved as resolved (resolved.path)}
             <li>
               {@render fileName(resolved.path)}
-              <span class="muted">{resolutionText({ kind: "both_modified", copy: resolved.copy }, resolved.choice)}</span>
+              <span class="muted">{resolutionText(resolved, resolved.choice)}</span>
             </li>
           {/each}
         </ul>

@@ -243,16 +243,16 @@ mod tests {
 
     #[test]
     fn parse_accepts_any_nonempty_slug() {
-        // Hand-made or conflict-copy names still sort as entries of that date.
+        // Hand-made or Keep-both copy names still sort as entries of that date.
         assert_eq!(
             parse_filename("2026-11-16-1402-My Notes.md").unwrap().slug,
             "My Notes"
         );
         assert_eq!(
-            parse_filename("2026-11-16-1402-run.conflict-1530.md")
+            parse_filename("2026-11-16-1402-run.from-github-15h30.md")
                 .unwrap()
                 .slug,
-            "run.conflict-1530"
+            "run.from-github-15h30"
         );
         assert_eq!(parse_filename("2026-11-16-1402-é.md").unwrap().slug, "é");
     }

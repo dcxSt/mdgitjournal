@@ -519,6 +519,22 @@ fn join_clean(suggestion: &Value) -> String {
         .collect()
 }
 
+/// One side's text ("mine" or "theirs") of a suggestion, put back together from its chunks.
+fn side(suggestion: &Value, which: &str) -> String {
+    suggestion["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| match (c["kind"].as_str().unwrap(), which) {
+            ("same", _) => c["text"].as_str().unwrap(),
+            ("clash", side) => c[side].as_str().unwrap(),
+            ("both", _) => c["text"].as_str().unwrap(),
+            (kind, side) if kind == side => c["text"].as_str().unwrap(),
+            _ => c["base"].as_str().unwrap(),
+        })
+        .collect()
+}
+
 mod scenario {
     use super::*;
 
@@ -813,8 +829,11 @@ mod scenario {
         let o = overlap(&preview, &first);
         assert_eq!(o["kind"], "both_modified", "{o}");
         assert_eq!(o["choices"], json!(["mine", "theirs", "both", "merged"]));
-        assert_eq!(o["mine"], mine);
-        assert_eq!(o["theirs"], "para one, edited on a\n\npara two\n");
+        assert_eq!(side(&o["suggestion"], "mine"), mine);
+        assert_eq!(
+            side(&o["suggestion"], "theirs"),
+            "para one, edited on a\n\npara two\n"
+        );
         let merged = join_clean(&o["suggestion"]);
         assert_eq!(merged, "para one, edited on a\n\npara two, edited on b\n");
         let again = b.ok("pull_preview", json!({}));
@@ -831,7 +850,7 @@ mod scenario {
         assert_eq!(out["summary"]["plan"], "fast_forward", "{out}");
         assert_eq!(
             out["summary"]["resolved"],
-            json!([{ "path": first, "choice": "merged", "copy": null }])
+            json!([{ "path": first, "kind": "both_modified", "choice": "merged", "copy": null }])
         );
         assert_eq!(b.text(&first), merged);
         // The resolution is left uncommitted, as the edit was.
@@ -879,8 +898,15 @@ mod scenario {
             .strip_prefix(&format!("{stem}.from-github-"))
             .and_then(|rest| rest.strip_suffix(".md"))
             .unwrap_or_else(|| panic!("copy name {copy}"));
+        // "20h28": hours, "h", minutes (not "2028", which reads as a year).
+        let digits = stamp.split_once('h');
         assert!(
-            stamp.len() == 4 && stamp.bytes().all(|c| c.is_ascii_digit()),
+            stamp.len() == 5
+                && digits.is_some_and(|(h, m)| {
+                    h.len() == 2
+                        && m.len() == 2
+                        && (h.to_owned() + m).bytes().all(|c| c.is_ascii_digit())
+                }),
             "{copy}"
         );
         let out = b.ok(
@@ -890,7 +916,7 @@ mod scenario {
         );
         assert_eq!(
             out["summary"]["resolved"],
-            json!([{ "path": first, "choice": "both", "copy": copy }])
+            json!([{ "path": first, "kind": "both_modified", "choice": "both", "copy": copy }])
         );
         assert_eq!(b.text(&first), newer);
         assert_eq!(
@@ -918,11 +944,10 @@ mod scenario {
             "start_external_merge",
             json!({ "id": id, "message": "e2e: b's edit, before merging" }),
         );
-        assert_eq!(
-            view["merge"],
-            json!({ "conflicted": [second], "startedByApp": true }),
-            "{view}"
-        );
+        assert_eq!(view["merge"]["conflicted"], json!([second]), "{view}");
+        assert_eq!(view["merge"]["startedByApp"], true, "{view}");
+        assert_eq!(view["merge"]["precommit"], true, "{view}");
+        assert_eq!(view["merge"]["autostash"], false, "{view}");
         let marked = b.text(&second);
         for marker in ["<<<<<<< HEAD\n", "=======\n", ">>>>>>> origin/main\n"] {
             assert!(marked.contains(marker), "{marked}");
@@ -1054,21 +1079,27 @@ mod scenario {
         let edited_on_b = format!("{with_image}a line written on b\n");
         b.write(&first, &edited_on_b);
         let preview = review(&mut b);
-        let o = overlap(&preview, &first);
-        assert_eq!(o["kind"], "modified_deleted", "{o}");
-        assert_eq!(o["choices"], json!(["mine", "theirs"]));
-        assert!(has_change(&preview["auto"], &renamed, "added"), "{preview}");
+        // One file changed on both sides, under GitHub's new name, with B's edit merged in.
+        let o = overlap(&preview, &renamed);
+        assert_eq!(o["kind"], "modified_renamed", "{o}");
+        assert_eq!(o["minePath"], json!(first), "{o}");
+        assert_eq!(o["theirsPath"], json!(renamed), "{o}");
+        assert_eq!(o["choices"], json!(["mine", "theirs", "both", "merged"]));
+        assert_eq!(preview["auto"], json!([]), "{preview}");
+        let merged = join_clean(&o["suggestion"]);
+        assert_eq!(merged, edited_on_b);
         b.ok(
             "apply_pull",
             json!({ "id": preview["id"], "message": null,
-                    "resolutions": [{ "path": first, "choice": "mine" }] }),
+                    "resolutions": [{ "path": renamed, "choice": "merged", "text": merged }] }),
         );
-        assert_eq!(b.text(&first), edited_on_b);
-        assert_eq!(b.text(&renamed), with_image);
-        pushed(&mut b, "e2e: b kept its edit after the rename", &[&first]);
+        assert_eq!(b.text(&renamed), edited_on_b);
+        assert!(!b.journal.join(&first).exists(), "one entry, not two");
+        pushed(&mut b, "e2e: b's edit, under the new name", &[&renamed]);
         applied(&mut a);
-        assert_eq!(a.text(&first), edited_on_b);
-        println!("ok  rename on A + edit on B: B kept its text, the new name arrived");
+        assert_eq!(a.text(&renamed), edited_on_b);
+        assert!(!a.journal.join(&first).exists());
+        println!("ok  rename on A + edit on B: one entry, B's edit under A's new name");
 
         // Disconnect keeps the journal and the sign-in; reconnect pushes a commit made meanwhile.
         let view = a.ok("github_disconnect", json!({ "signOut": false }));
@@ -1198,7 +1229,8 @@ mod scenario {
         println!("ok  settings author used; set_settings kept the remote");
 
         // A third device with its own history, a draft and a different file at a name GitHub has:
-        // connecting opens a review for that file only; its commit goes after GitHub's.
+        // connecting opens a review for that file only; Apply joins the histories with a merge
+        // commit (decision C), the draft and the resolution left uncommitted.
         let mut c = Device::launch("c", root, token);
         let own = entry(&mut c, format!("{tag} c own"), "c's history\n");
         c.ok(
@@ -1215,26 +1247,40 @@ mod scenario {
         assert_eq!(paths(&preview["overlaps"]), [second.as_str()], "{preview}");
         let o = overlap(&preview, &second);
         assert_eq!(o["kind"], "both_added", "{o}");
-        assert_eq!(o["base"], Value::Null);
-        assert_eq!(preview["plan"], "rebase", "{preview}");
+        assert_eq!(o["minePath"], json!(second), "{o}");
+        assert_eq!(o["committed"], false, "only uncommitted text clashes: {o}");
+        assert_eq!(preview["plan"], "merge", "{preview}");
         assert_eq!(c.text(&second), "c's version\n", "connecting wrote to it");
         let out = c.ok(
             "apply_pull",
-            json!({ "id": preview["id"], "message": null,
+            json!({ "id": preview["id"], "message": "e2e: c joins GitHub's history",
                     "resolutions": [{ "path": second, "choice": "both" }] }),
         );
         let c_copy = out["summary"]["resolved"][0]["copy"]
             .as_str()
             .unwrap()
             .to_owned();
-        assert_eq!(out["summary"]["rebased"], 1, "{out}");
+        assert_eq!(out["summary"]["rebased"], 0, "{out}");
+        assert!(out["summary"]["mergeCommit"].is_string(), "{out}");
         assert_eq!(c.text(&second), "c's version\n");
         assert_eq!(c.text(&c_copy), a.text(&second));
         assert_eq!(c.text(&c_draft), "c's draft\n");
         assert_eq!(
-            c.git(&["log", "-1", "--format=%s"]).trim(),
-            "e2e: c local commit"
+            c.git(&["log", "-1", "--format=%P"])
+                .split_whitespace()
+                .count(),
+            2,
+            "a merge commit"
         );
+        assert_eq!(
+            c.git(&["log", "-1", "--format=%s"]).trim(),
+            "e2e: c joins GitHub's history"
+        );
+        assert!(c
+            .git(&["log", "--format=%s"])
+            .lines()
+            .any(|s| s == "e2e: c local commit"));
+        // Only the merge commit goes; the resolution and the draft stay changes to commit.
         pushed(&mut c, "", &[]);
         let summary = applied(&mut a);
         assert!(has_change(&summary["files"], &own, "added"), "{summary}");
@@ -1242,7 +1288,7 @@ mod scenario {
             !a.journal.join(&c_draft).exists(),
             "C's draft wasn't ticked"
         );
-        println!("ok  device with its own history joined: one review, rebased, draft kept");
+        println!("ok  device with its own history joined: one review, a merge commit, draft kept");
 
         // The token is nowhere on disk but in the token stores, and no keyring was touched.
         let allowed = [&a, &b, &c].map(|d| d.config().join("credentials.json"));

@@ -3,8 +3,9 @@
 // the deciding; `Review` holds one review's choices while its sheet and merge view are open.
 
 import { joinChunks, type MergeSnapshot } from "../editor/merge";
+import { pathLabel } from "./journal";
 import { commitMessageValid } from "./sync";
-import type { Choice, MergeChunk, Overlap, PullPreview, Resolved } from "./types";
+import type { Choice, MergeChunk, Overlap, OverlapKind, PullPreview, Resolved } from "./types";
 
 /** One file's choice; `text` is the merged result for `merged`. */
 export type Chosen = { choice: "mine" | "theirs" | "both" } | { choice: "merged"; text: string };
@@ -38,11 +39,29 @@ export function resolutions(preview: PullPreview, picks: Choices): Resolved[] {
   });
 }
 
+/** The kinds where one side deleted the file: the choices keep it or don't. */
+const KEEP_OR_DELETE: Record<string, { mine: string; theirs: string }> = {
+  modified_deleted: { mine: "Keep mine", theirs: "Delete" },
+  renamed_deleted: { mine: "Keep mine", theirs: "Delete" },
+  deleted_modified: { mine: "Keep deleted", theirs: "Keep GitHub's" },
+  deleted_renamed: { mine: "Keep deleted", theirs: "Keep GitHub's" },
+};
+
 /** The choice's labels: deletions name what each choice does to the file. */
 export function choiceLabel(overlap: Overlap, choice: Choice): string {
-  if (overlap.kind === "modified_deleted") return choice === "mine" ? "Keep mine" : "Delete";
-  if (overlap.kind === "deleted_modified") return choice === "mine" ? "Keep deleted" : "Keep GitHub's";
+  const deletion = KEEP_OR_DELETE[overlap.kind];
+  if (deletion && (choice === "mine" || choice === "theirs")) return deletion[choice];
   return { mine: "Keep mine", theirs: "Keep GitHub's", both: "Keep both", merged: "Merge…" }[choice];
+}
+
+/** Where the row's file is known to the user: its name here, or GitHub's if it is gone here. */
+export function overlapName(overlap: Overlap): string {
+  return overlap.minePath ?? overlap.theirsPath ?? overlap.path;
+}
+
+/** “Long run” (an entry's title) or the path. */
+function named(path: string | null): string {
+  return `“${path === null ? "" : pathLabel(path).title}”`;
 }
 
 /** A line saying how this file was changed on both sides. */
@@ -53,6 +72,16 @@ export function overlapNote(overlap: Overlap): string {
       return "Changed here, deleted on GitHub";
     case "deleted_modified":
       return "Deleted here, changed on GitHub";
+    case "modified_renamed":
+      return `Changed here, renamed on GitHub to ${named(overlap.theirsPath)}`;
+    case "renamed_modified":
+      return `Renamed here, changed on GitHub (where it is still ${named(overlap.theirsPath)})`;
+    case "both_renamed":
+      return `Renamed here, and on GitHub to ${named(overlap.theirsPath)}`;
+    case "renamed_deleted":
+      return "Renamed here, deleted on GitHub";
+    case "deleted_renamed":
+      return "Deleted here, renamed on GitHub";
     case "both_added":
       return overlap.binary ? `New ${what} here and on GitHub` : "New here and on GitHub, with different text";
     default:
@@ -76,13 +105,16 @@ export function mergeCounts(chunks: readonly MergeChunk[]): MergeCounts {
   return counts;
 }
 
+const DELETED_HERE: OverlapKind[] = ["deleted_modified", "deleted_renamed"];
+const DELETED_THERE: OverlapKind[] = ["modified_deleted", "renamed_deleted"];
+
 /** How a resolution reads in the merge commit's message and the summary. */
-export function resolutionText(overlap: { kind: Overlap["kind"]; copy: Overlap["copy"] }, choice: Choice): string {
+export function resolutionText(overlap: { kind: OverlapKind; copy: string | null }, choice: Choice): string {
   switch (choice) {
     case "mine":
-      return overlap.kind === "deleted_modified" ? "kept mine (deleted)" : "kept mine";
+      return DELETED_HERE.includes(overlap.kind) ? "kept mine (deleted)" : "kept mine";
     case "theirs":
-      return overlap.kind === "modified_deleted" ? "kept GitHub's (deleted)" : "kept GitHub's";
+      return DELETED_THERE.includes(overlap.kind) ? "kept GitHub's (deleted)" : "kept GitHub's";
     case "both":
       return overlap.copy ? `kept both (GitHub's saved as ${overlap.copy})` : "kept both";
     case "merged":
@@ -90,13 +122,27 @@ export function resolutionText(overlap: { kind: Overlap["kind"]; copy: Overlap["
   }
 }
 
-/** The merge commit's prefilled message: "Merge from GitHub" and what was chosen for each file. */
+/**
+ * The merge commit's prefilled message: "Merge from GitHub" and what was chosen for each file the
+ * commit records (the others' resolutions stay as changes for the next commit).
+ */
 export function mergeMessage(preview: PullPreview, picks: Choices): string {
   const lines = preview.overlaps.flatMap((o) => {
     const pick = picks[o.path];
-    return pick ? [`- ${o.path}: ${resolutionText(o, pick.choice)}`] : [];
+    return pick && o.committed ? [`- ${o.path}: ${resolutionText(o, pick.choice)}`] : [];
   });
   return lines.length ? `Merge from GitHub\n\n${lines.join("\n")}` : "Merge from GitHub";
+}
+
+/** The same file, changed the same way, in a fresh review: a choice made for it still holds. */
+function unchanged(before: Overlap | undefined, after: Overlap): boolean {
+  return (
+    before !== undefined &&
+    before.kind === after.kind &&
+    before.versions === after.versions &&
+    before.copy === after.copy &&
+    before.choices.join() === after.choices.join()
+  );
 }
 
 /** One open review: its choices, the merge commit's message and the merge view's work. */
@@ -113,19 +159,50 @@ export class Review {
   gitMessage = $state("");
   /** The file open in the merge view. */
   merging = $state<string | null>(null);
+  /** Files of a stale review whose choices couldn't carry over (they changed, or are new). */
+  readonly reset: string[] = [];
 
   /** Apply may run. */
   get ready(): boolean {
     return reviewReady(this.preview, this.picks, this.message);
   }
 
+  /** The user has done something a stray Esc shouldn't throw away. */
+  get dirty(): boolean {
+    const initial = initialPicks(this.preview);
+    const picked = this.preview.overlaps.some((o) => JSON.stringify(this.picks[o.path]) !== JSON.stringify(initial[o.path]));
+    return picked || this.#snapshots.size > 0 || this.#messageEdited || this.gitMessage.trim() !== "";
+  }
+
   #messageEdited = false;
   readonly #snapshots = new Map<string, MergeSnapshot>();
 
-  constructor(preview: PullPreview) {
+  /**
+   * A review of `preview`. With `previous` (a review that went stale), every choice and merge for
+   * a file that is the same in both is kept; the rest start afresh and are listed in `reset`.
+   */
+  constructor(preview: PullPreview, previous?: Review) {
     this.preview = preview;
-    this.picks = initialPicks(preview);
-    this.message = mergeMessage(preview, this.picks);
+    const picks: Record<string, Chosen | null> = { ...initialPicks(preview) };
+    if (previous) {
+      for (const o of preview.overlaps) {
+        if (unchanged(previous.overlap(o.path), o)) {
+          picks[o.path] = previous.picks[o.path] ?? null;
+          const snapshot = previous.snapshot(o.path);
+          if (snapshot) this.#snapshots.set(o.path, snapshot);
+        } else {
+          this.reset.push(o.path);
+        }
+      }
+      this.gitMessage = previous.gitMessage;
+    }
+    this.picks = picks;
+    if (previous && previous.#messageEdited) {
+      this.message = previous.message;
+      this.#messageEdited = true;
+    } else {
+      this.message = mergeMessage(preview, this.picks);
+    }
   }
 
   overlap(path: string): Overlap | undefined {

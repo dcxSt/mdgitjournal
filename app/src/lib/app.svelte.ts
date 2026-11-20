@@ -7,9 +7,9 @@ import type { MergeSnapshot } from "../editor/merge";
 import { ApiError, onHidden, toApiError, type Api, type Unlisten } from "./api";
 import { DEFAULT_SETTINGS, EMPTY_VIEW, SIGNED_OUT } from "./defaults";
 import { CurrentEntry, SaveError } from "./entry.svelte";
-import { isEntryFile } from "./journal";
+import { isEntryFile, pathLabel } from "./journal";
 import { Notices } from "./notices.svelte";
-import { Review } from "./review.svelte";
+import { overlapName, Review } from "./review.svelte";
 import { Search } from "./search.svelte";
 import type { Action } from "./shortcuts";
 import {
@@ -55,6 +55,21 @@ export const MERGE_POLL_MS = 5000;
 export const NEEDS_PULL_TEXT = "GitHub has new changes — Pull first. Your commit is saved locally.";
 export const STALE_TEXT = "Something changed since you opened the review.";
 export const MERGE_TEXT = "Merge in progress — finish it with git, or abort it.";
+/** The banner of a review that replaced a stale one: what was kept, and what to check again. */
+export function staleNotice(fresh: Review, stale: Review | null): string {
+  const kept = stale !== null && fresh.preview.overlaps.some((o) => !fresh.reset.includes(o.path) && fresh.picks[o.path]);
+  if (!fresh.reset.length) return kept ? `${STALE_TEXT} Your choices are kept.` : STALE_TEXT;
+  const names = fresh.reset.map((path) => {
+    const overlap = fresh.overlap(path);
+    return `“${pathLabel(overlap ? overlapName(overlap) : path).title}”`;
+  });
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  const one = names.length === 1;
+  return `${STALE_TEXT} ${list} ${one ? "is new or changed" : "are new or changed"}: check ${one ? "it" : "them"}.${kept ? " Your other choices are kept." : ""}`;
+}
+
+/** On the phone there is no git to finish a merge with: one started elsewhere can only be aborted. */
+export const MERGE_TEXT_PHONE = "A git merge is in progress in this journal — finish it with git on a computer, or abort it.";
 
 /** iOS always gets the phone layout; desktop windows never do (their minimum width fits both panes). */
 export function mobileLayout(platform: Platform, width: number, native: boolean): boolean {
@@ -394,9 +409,12 @@ export class AppState {
     else this.openReview(result.preview);
   }
 
-  /** Opens the Sync review of `preview`; `notice` says why it opened (connect, a stale review). */
-  openReview(preview: PullPreview, notice: string | null = null): void {
-    const review = new Review(preview);
+  /**
+   * Opens the Sync review of `preview`; `notice` says why it opened (connect, a stale review).
+   * `previous` is the review it replaces, whose choices carry over where the files are the same.
+   */
+  openReview(preview: PullPreview, notice: string | null = null, previous?: Review): void {
+    const review = new Review(preview, previous);
     review.notice = notice;
     this.review = review;
     this.overlay = "review";
@@ -454,7 +472,7 @@ export class AppState {
   async resolveWithGit(): Promise<void> {
     const review = this.review;
     if (!review || review.busy) return;
-    const needsMessage = this.sync.changes.length > 0;
+    const needsMessage = review.preview.gitMerge.uncommitted.length > 0;
     if (needsMessage && !commitMessageValid(review.gitMessage)) {
       review.error = "Write a commit message for your changes first.";
       return;
@@ -503,20 +521,36 @@ export class AppState {
     if (this.summary && this.overlay === null) this.overlay = "summary";
   }
 
-  /** Abort merge (after its confirmation): back to how things were before the merge. */
+  /**
+   * Abort merge (after its confirmation): back to how things were before the merge. Returns why
+   * it couldn't (a file git merged was edited since), for the confirmation to show.
+   */
   async abortMerge(): Promise<ApiError | null> {
     this.#aborting = true;
+    let stashed: boolean | undefined;
     try {
-      return await this.#track("apply", () =>
+      const error = await this.#track("apply", () =>
         this.#writeWork(async () => {
           const result = await this.api.abortMerge();
           this.#setSync(result.view);
+          stashed = result.stashed;
           await this.#afterWrite(result.restored);
         }),
       );
+      if (error) return error;
     } finally {
       this.#aborting = false;
     }
+    if (stashed) {
+      this.notices.show({
+        key: "merge-stash",
+        tone: "error",
+        text: "Merge aborted. The uncommitted changes git set aside (--autostash) didn't apply cleanly, so they are a git stash now: run git stash pop to get them back.",
+      });
+    } else {
+      this.#toast("Merge aborted.");
+    }
+    return null;
   }
 
   /** Opens the commit sheet with an up-to-date list of changes. */
@@ -619,8 +653,9 @@ export class AppState {
   }
 
   /**
-   * Connects the journal to `owner/repo`; errors are thrown for the connect flow to show. If files
-   * differ on both sides, the Sync review opens in front of Settings.
+   * Connects the journal to `owner/repo`; errors are thrown for the connect flow to show. If the
+   * pull needs the user (files that differ on both sides, or a merge commit), the Sync review
+   * replaces Settings.
    */
   async connect(fullName: string): Promise<PullResult> {
     const result = await this.#writeWork(async () => {
@@ -634,7 +669,10 @@ export class AppState {
     [this.settings, this.auth] = await Promise.all([this.api.getSettings(), this.api.authStatus()]);
     if (result.status === "applied") this.#showSummary(result.summary);
     else if (result.status === "review") {
-      this.openReview(result.preview, `Connected to ${fullName}. Some files differ here and on GitHub: choose what to keep.`);
+      const why = result.preview.overlaps.length
+        ? "Some files differ here and on GitHub: choose what to keep."
+        : "Your history and GitHub's need a merge commit.";
+      this.openReview(result.preview, `Connected to ${fullName}. ${why}`);
     }
     return result;
   }
@@ -806,19 +844,26 @@ export class AppState {
     this.notices.dismiss("merge");
     if (this.overlay === "abortMerge") this.overlay = null;
     if (this.#aborting) return;
-    this.#toast("Merge finished.");
+    // Ended with git: committed (HEAD has GitHub's commits) or aborted (it doesn't).
+    if (this.sync.behind === 0) this.#toast("Merge finished.");
+    else if (before.startedByApp && before.precommit) {
+      this.#toast("Merge aborted with git. Your edits stay committed, as an unpushed commit.");
+    } else this.#toast("Merge aborted with git.");
     // git changed files: the list and the open entry follow.
     void this.refresh();
   }
 
   #mergeNotice(merge: MergeState) {
+    const lead = this.info?.platform === "ios" ? MERGE_TEXT_PHONE : MERGE_TEXT;
+    const merged = merge.merged.length ? ` git also merged ${plural(merge.merged.length, "other file")}.` : "";
+    const stash = merge.autostash ? " Your uncommitted changes are set aside by git (--autostash) until it ends." : "";
     return {
       key: "merge",
       tone: "info" as const,
       persistent: true,
       text: merge.conflicted.length
-        ? `${MERGE_TEXT} ${merge.conflicted.length === 1 ? "This file has" : "These files have"} conflict markers:`
-        : `${MERGE_TEXT} No conflicts are left: commit with git to finish.`,
+        ? `${lead}${merged}${stash} ${merge.conflicted.length === 1 ? "This file has" : "These files have"} conflict markers:`
+        : `${lead}${merged}${stash} No conflicts are left: commit with git to finish.`,
       files: merge.conflicted.map((path) => ({ label: path, file: isEntryFile(path) ? path : undefined })),
       actions: [{ label: "Abort merge", keep: true, run: () => this.#openOverlay("abortMerge") }],
     };
@@ -830,7 +875,7 @@ export class AppState {
     this.notices.show({
       key: "sync-summary",
       tone: "info",
-      text: `${summaryText(summary)}.`,
+      text: `${summaryText(summary, this.sync.changes)}.`,
       actions: [
         { label: "Details", keep: true, run: () => this.openSummary() },
         ...(undoable ? [{ label: "Undo", keep: true, run: () => void this.#undoFromNotice() }] : []),
@@ -860,8 +905,12 @@ export class AppState {
     if (this.reviewing) this.overlay = null;
   }
 
-  /** After `stale_review`: a fresh review, from a preview that never applies anything. */
+  /**
+   * After `stale_review`: a fresh review, from a preview that never applies anything. Choices for
+   * files that are the same in both carry over; the notice names the ones that don't.
+   */
   async #freshReview(): Promise<void> {
+    const stale = this.review;
     try {
       const result = await this.#serial(async () => {
         await this.current.flush();
@@ -869,7 +918,8 @@ export class AppState {
       });
       this.#setSync(result.view);
       if (result.status === "review") {
-        this.openReview(result.preview, STALE_TEXT);
+        this.openReview(result.preview, null, stale ?? undefined);
+        if (this.review) this.review.notice = staleNotice(this.review, stale);
         return;
       }
       this.review = null;

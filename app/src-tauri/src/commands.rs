@@ -5,8 +5,7 @@ use std::borrow::Cow;
 use chrono::Local;
 use mdgj_core::{EntryContent, EntryMeta, ImportedImage, RemoteConfig, SearchHit, Settings};
 use mdgj_git::{
-    CommitPushOutcome, FileDiff, PullOutcome, PullPreview, PushOutcome, Resolved, SyncState,
-    SyncSummary,
+    CommitPushOutcome, FileDiff, PullOutcome, PullPreview, PushOutcome, Resolved, SyncSummary,
 };
 use mdgj_github::{AuthKind, DeviceCode, GitHub, Poll, RepoInfo, StoredAuth, Tokens};
 use percent_encoding::percent_decode;
@@ -184,32 +183,18 @@ pub enum PullResult {
     },
 }
 
-/// A [`PullOutcome`] without its state, which becomes the view.
-enum Incoming {
-    UpToDate,
-    Applied(SyncSummary),
-    Review(PullPreview),
-}
-
-fn split(outcome: PullOutcome) -> (SyncState, Incoming) {
+/// The result of a pull or connect, its state already the view; tells the UI to re-list entries
+/// if files changed.
+fn pull_result(app: &AppHandle, view: SyncView, outcome: PullOutcome) -> PullResult {
     match outcome {
-        PullOutcome::UpToDate { state } => (state, Incoming::UpToDate),
-        PullOutcome::Applied { state, summary } => (state, Incoming::Applied(summary)),
-        PullOutcome::Review { state, preview } => (state, Incoming::Review(preview)),
-    }
-}
-
-/// The result of a pull or connect; tells the UI to re-list entries if files changed.
-fn incoming(app: &AppHandle, view: SyncView, incoming: Incoming) -> PullResult {
-    match incoming {
-        Incoming::UpToDate => PullResult::UpToDate { view },
-        Incoming::Applied(summary) => {
+        PullOutcome::UpToDate { .. } => PullResult::UpToDate { view },
+        PullOutcome::Applied { summary, .. } => {
             if !summary.files.is_empty() {
                 emit(app, ENTRIES_CHANGED, ());
             }
             PullResult::Applied { view, summary }
         }
-        Incoming::Review(preview) => PullResult::Review { view, preview },
+        PullOutcome::Review { preview, .. } => PullResult::Review { view, preview },
     }
 }
 
@@ -238,10 +223,11 @@ pub async fn fetch(app: AppHandle) -> Result<SyncView> {
 #[tauri::command]
 pub async fn pull(app: AppHandle) -> Result<PullResult> {
     run(app, |app, s| {
-        let (view, result) = s.sync(app, |repo| {
-            Ok(split(repo.pull(s.creds(repo)?.as_ref(), &s.author(true))?))
+        let (view, outcome) = s.sync(app, |repo| {
+            let outcome = repo.pull(s.creds(repo)?.as_ref(), &s.author(true))?;
+            Ok((outcome.state().clone(), outcome))
         })?;
-        Ok(incoming(app, view, result))
+        Ok(pull_result(app, view, outcome))
     })
     .await
 }
@@ -338,15 +324,30 @@ pub async fn start_external_merge(
     .await
 }
 
-/// `git merge --abort`, and the commit Resolve with git made first is undone.
+/// What Abort merge did: the paths put back, and whether what `git merge --autostash` set aside
+/// had to stay a git stash.
+#[derive(Debug, Serialize)]
+pub struct Aborted {
+    view: SyncView,
+    restored: Vec<String>,
+    stashed: bool,
+}
+
+/// `git merge --abort`, and the commit Resolve with git made first is undone. `invalid` (nothing
+/// changed) if a file git merged was edited since.
 #[tauri::command]
-pub async fn abort_merge(app: AppHandle) -> Result<Restored> {
+pub async fn abort_merge(app: AppHandle) -> Result<Aborted> {
     run(app, |app, s| {
-        let (view, paths) = s.sync(app, |repo| {
-            let paths = repo.abort_merge()?;
-            Ok((repo.sync_state()?, paths))
+        let (view, aborted) = s.sync(app, |repo| {
+            let aborted = repo.abort_merge()?;
+            Ok((repo.sync_state()?, aborted))
         })?;
-        Ok(restored(app, view, paths))
+        let Restored { view, restored } = restored(app, view, aborted.restored);
+        Ok(Aborted {
+            view,
+            restored,
+            stashed: aborted.stashed,
+        })
     })
     .await
 }
@@ -579,7 +580,7 @@ pub async fn github_list_repos(app: AppHandle) -> Result<Vec<RepoInfo>> {
 #[tauri::command]
 pub async fn github_connect(app: AppHandle, full_name: String) -> Result<PullResult> {
     run(app, move |app, s| {
-        let (view, result) = s.sync(app, |repo| {
+        let (view, outcome) = s.sync(app, |repo| {
             let kind = s.signed_in()?.kind;
             let token = s.token()?;
             let full_name = full_name.trim();
@@ -597,8 +598,9 @@ pub async fn github_connect(app: AppHandle, full_name: String) -> Result<PullRes
                     })?,
                 AuthKind::Pat => s.github().repo(&token, full_name)?,
             };
-            let (state, result) =
-                split(repo.connect(&info.clone_url, Some(&token_creds(token)), &s.author(true))?);
+            let outcome =
+                repo.connect(&info.clone_url, Some(&token_creds(token)), &s.author(true))?;
+            let state = outcome.state().clone();
             // A review is no failure: the journal is connected, and Pull is lit.
             s.set_remote(Some(RemoteConfig {
                 full_name: info.full_name,
@@ -609,9 +611,9 @@ pub async fn github_connect(app: AppHandle, full_name: String) -> Result<PullRes
                     AuthKind::Pat => mdgj_core::AuthKind::Pat,
                 },
             }))?;
-            Ok((state, result))
+            Ok((state, outcome))
         })?;
-        Ok(incoming(app, view, result))
+        Ok(pull_result(app, view, outcome))
     })
     .await
 }
@@ -661,8 +663,8 @@ pub async fn third_party_notices() -> &'static str {
 #[cfg(test)]
 mod tests {
     use mdgj_git::{
-        ChangeKind, Choice, CommitInfo, DiffHunk, DiffLine, FileChange, LineKind, MergeChunk,
-        MergeSuggestion, Overlap, OverlapKind, PullPlan, Resolution,
+        ChangeKind, Choice, CommitInfo, DiffHunk, DiffLine, FileChange, GitMerge, LineKind,
+        MergeChunk, MergeSuggestion, Overlap, OverlapKind, PullPlan, Resolution, SyncState,
     };
     use serde_json::{json, Value};
     use tauri::http::HeaderValue;
@@ -814,11 +816,12 @@ mod tests {
                 path: file.into(),
                 kind: OverlapKind::BothModified,
                 binary: false,
-                base: Some("a\nb\n".into()),
-                mine: Some("A\nb\n".into()),
-                theirs: Some("a\nB\n".into()),
+                mine_path: Some(file.into()),
+                theirs_path: Some(file.into()),
+                committed: true,
+                versions: "a:b:c".into(),
                 choices: vec![Choice::Mine, Choice::Theirs, Choice::Both, Choice::Merged],
-                copy: Some("2026-11-16-1402-run.from-github-1530.md".into()),
+                copy: Some("2026-11-16-1402-run.from-github-15h30.md".into()),
                 suggestion: Some(MergeSuggestion {
                     clean: false,
                     chunks: vec![
@@ -837,6 +840,10 @@ mod tests {
                     ],
                 }),
             }],
+            git_merge: GitMerge {
+                conflicted: vec![file.into()],
+                uncommitted: vec![],
+            },
         };
         let review = json_of(PullResult::Review {
             view: view(),
@@ -850,6 +857,7 @@ mod tests {
             "automatic",
             "auto",
             "overlaps",
+            "gitMerge",
         ] {
             assert!(preview.get(key).is_some(), "{key} missing: {preview}");
         }
@@ -860,7 +868,15 @@ mod tests {
             overlap["choices"],
             json!(["mine", "theirs", "both", "merged"])
         );
-        assert_eq!(overlap["copy"], "2026-11-16-1402-run.from-github-1530.md");
+        assert_eq!(overlap["copy"], "2026-11-16-1402-run.from-github-15h30.md");
+        assert_eq!(overlap["minePath"], file);
+        assert_eq!(overlap["theirsPath"], file);
+        assert_eq!(overlap["committed"], true);
+        assert!(overlap.get("mine").is_none(), "no full texts: {overlap}");
+        assert_eq!(
+            preview["gitMerge"],
+            json!({ "conflicted": [file], "uncommitted": [] })
+        );
         assert_eq!(
             overlap["suggestion"],
             json!({ "clean": false, "chunks": [
@@ -888,6 +904,14 @@ mod tests {
         assert_eq!(restored["restored"], json!(["2026-11-16-1402-run.md"]));
         assert_eq!(restored["view"]["merge"], Value::Null);
         assert_eq!(restored["view"]["lastSync"], Value::Null);
+
+        let aborted = json_of(Aborted {
+            view: view(),
+            restored: vec![],
+            stashed: true,
+        });
+        assert_eq!(aborted["stashed"], true);
+        assert_eq!(aborted.as_object().unwrap().len(), 3);
     }
 
     #[test]

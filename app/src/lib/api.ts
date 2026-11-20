@@ -6,6 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
+  AbortResult,
   AppInfo,
   ApplyResult,
   AuthStatus,
@@ -60,7 +61,7 @@ export interface Api {
   /** Resolve with git: leaves a standard merge in progress. `message` commits uncommitted edits first. */
   startExternalMerge(id: string, message: string | null): Promise<SyncView>;
   /** `git merge --abort`, and uncommits what Resolve with git committed first. */
-  abortMerge(): Promise<RestoreResult>;
+  abortMerge(): Promise<AbortResult>;
   /** A commit on this device only, of the given changed paths. */
   commit(message: string, paths: string[]): Promise<SyncView>;
   /** Commits the given paths and pushes; a blank message with no paths only pushes waiting commits. */

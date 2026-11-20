@@ -105,8 +105,12 @@
     </button>
   </header>
   <p class="help">
-    Changes from both versions are already in, tinted by where they came from. Where both changed the same lines,
-    choose a version. You can edit anything.
+    {#if app.mobile}
+      Both versions' changes are in, tinted by source. Pick a version where they clash; edit anything.
+    {:else}
+      Changes from both versions are already in, tinted by where they came from. Where both changed the same lines,
+      choose a version. You can edit anything.
+    {/if}
   </p>
   <div class="editor"></div>
 </dialog>
@@ -274,7 +278,7 @@
   }
 
   .phone .help {
-    display: none;
+    padding: 4px max(8px, env(safe-area-inset-left));
   }
 
   .phone .button {

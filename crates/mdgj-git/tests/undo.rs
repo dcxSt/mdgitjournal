@@ -3,6 +3,8 @@
 mod common;
 
 use common::{author, merged, resolved, two_devices, Device, Remote};
+use std::fs;
+
 use mdgj_git::{ChangeKind, Error, PullOutcome, Resolution};
 
 const UNDO_REF: &str = "refs/mdgitjournal/undo";
@@ -271,4 +273,171 @@ fn a_new_pull_replaces_the_undo_record_and_disconnecting_clears_it() {
     b.repo.remove_remote().unwrap();
     assert_eq!(b.repo.last_sync(), Ok(None));
     assert!(!record_exists(&b));
+}
+
+#[test]
+fn something_staged_with_git_stays_staged_through_a_pull() {
+    let (_remote, a, b) = two_devices(&[("a.md", "a\n"), ("b.md", "b\n")]);
+    a.write("a.md", "a, GitHub\n");
+    a.push("A");
+    b.write("b.md", "b staged\n");
+    b.write("new.md", "new\n");
+    if b.cli_ok(&["add", "b.md", "new.md"]).is_none() {
+        return; // no git on PATH
+    }
+    b.write("b.md", "b staged, then edited more\n");
+    let before = b.cli_ok(&["status", "--short"]).unwrap();
+    assert_eq!(before, "MM b.md\nA  new.md\n");
+    b.pull_applied();
+    assert_eq!(b.cli_ok(&["status", "--short"]).unwrap(), before);
+    assert_eq!(b.cli_ok(&["show", ":b.md"]).unwrap(), "b staged\n");
+    assert_eq!(b.cli_ok(&["show", ":a.md"]).unwrap(), "a, GitHub\n");
+
+    // Staging after the pull: Undo refuses rather than unstage it.
+    b.cli_ok(&["add", "new.md", "b.md"]).unwrap();
+    let refused = b.repo.undo_last_sync();
+    assert!(
+        matches!(&refused, Err(mdgj_git::Error::UndoRefused(m)) if m.contains("staged")),
+        "{refused:?}"
+    );
+    // Staged back as it was before the pull, Undo goes ahead.
+    b.write("b.md", "b staged\n");
+    b.cli_ok(&["add", "b.md"]).unwrap();
+    b.write("b.md", "b staged, then edited more\n");
+    b.repo.undo_last_sync().unwrap();
+    assert_eq!(b.cli_ok(&["status", "--short"]).unwrap(), before);
+}
+
+#[test]
+fn a_pull_that_changes_a_staged_file_is_refused() {
+    let (_remote, a, b) = two_devices(&[("a.md", "a\n")]);
+    a.write("a.md", "a, GitHub\n");
+    a.push("A");
+    b.write("a.md", "a, staged here\n");
+    if b.cli_ok(&["add", "a.md"]).is_none() {
+        return;
+    }
+    b.write("a.md", "a\n");
+    let before = b.state();
+    let result = b.repo.pull(None, &common::author());
+    assert!(
+        matches!(&result, Err(mdgj_git::Error::Git(m)) if m.contains("staged") && m.contains("a.md")),
+        "{result:?}"
+    );
+    assert_eq!(b.state(), before);
+}
+
+#[test]
+fn line_endings_follow_git_and_come_back_exactly() {
+    let (_remote, a, b) = two_devices(&[
+        (".gitattributes", "*.md text eol=crlf\n"),
+        ("a.md", "one\ntwo\nthree\n"),
+        ("b.md", "b\n"),
+    ]);
+    // As git checks them out here.
+    b.write("a.md", "one\r\ntwo\r\nthree\r\n");
+    b.write("b.md", "b\r\n");
+    assert_eq!(b.changes(), [], "the same to git");
+    a.write("b.md", "b remote\n");
+    a.push("A");
+
+    let before = b.state();
+    b.pull_applied();
+    assert_eq!(b.read("b.md"), b"b remote\r\n", "as git checkout writes it");
+    if let Some(cli) = b.cli_ok(&["cat-file", "--filters", "HEAD:b.md"]) {
+        assert_eq!(cli.as_bytes(), b.read("b.md"));
+    }
+    b.repo.undo_last_sync().unwrap();
+    assert_eq!(b.state().files, before.files, "Undo: byte for byte");
+
+    // A merged file keeps the file's line endings too.
+    b.write("a.md", "one\r\ntwo MINE\r\nthree\r\n");
+    a.write("a.md", "one\ntwo\nthree GITHUB\n");
+    a.push("A2");
+    let preview = b.pull_review();
+    let text = common::overlap(&preview, "a.md")
+        .suggestion
+        .as_ref()
+        .unwrap()
+        .text();
+    assert_eq!(text.as_deref(), None, "touching lines clash");
+    b.apply(
+        &preview,
+        &[common::merged("a.md", "one\ntwo MINE\nthree GITHUB\n")],
+    );
+    assert_eq!(b.read("a.md"), b"one\r\ntwo MINE\r\nthree GITHUB\r\n");
+    assert_eq!(b.read("b.md"), b"b remote\r\n");
+}
+
+#[test]
+fn a_pull_the_app_quit_during_is_put_back() {
+    let (_remote, a, b) = two_devices(&[("a.md", "a\n"), ("b.md", "b\n")]);
+    a.write("a.md", "a, GitHub\n");
+    a.write("b.md", "b, GitHub\n");
+    a.push("A");
+    b.write("a.md", "a, mine\n");
+    let before = b.state();
+    let preview = b.pull_review();
+    let local = b.head();
+    b.apply(
+        &preview,
+        &[common::resolved("a.md", mdgj_git::Resolution::Theirs)],
+    );
+    // As if the app had died after writing the files and the index, before moving the branch.
+    b.git()
+        .reference("refs/heads/main", local, true, "crash")
+        .unwrap();
+    assert_eq!(b.repo.last_sync(), Ok(None));
+
+    // The next operation (here, a preview) puts the files and the index back first.
+    b.repo.preview_pull().unwrap();
+    let after = b.state();
+    assert_eq!(after.files, before.files);
+    assert_eq!(after.index, before.index);
+    assert_eq!(
+        b.changes(),
+        [("a.md".into(), mdgj_git::ChangeKind::Modified)]
+    );
+    assert!(!b.root().join(".git/mdgitjournal/undo.json").exists());
+
+    // If a file it wrote has been edited since, it says so and changes nothing.
+    let preview = b.repo.preview_pull().unwrap().unwrap();
+    b.apply(
+        &preview,
+        &[common::resolved("a.md", mdgj_git::Resolution::Theirs)],
+    );
+    b.git()
+        .reference("refs/heads/main", local, true, "crash")
+        .unwrap();
+    b.write("b.md", "typed after the crash\n");
+    let stuck = b.state();
+    let result = b.repo.preview_pull();
+    assert!(
+        matches!(&result, Err(mdgj_git::Error::Git(m)) if m.contains("stopped part way") && m.contains("b.md")),
+        "{result:?}"
+    );
+    assert_eq!(b.state(), stuck);
+}
+
+#[test]
+fn undo_is_all_or_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_remote, a, b) = two_devices(&[("a.md", "a\n"), ("z/x.md", "x\n")]);
+    a.write("a.md", "a, GitHub\n");
+    a.write("z/x.md", "x, GitHub\n");
+    a.push("A");
+    b.pull_applied();
+    let pulled = b.state();
+    let z = b.root().join("z");
+    fs::set_permissions(&z, fs::Permissions::from_mode(0o555)).unwrap();
+    let result = b.repo.undo_last_sync();
+    fs::set_permissions(&z, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(&result, Err(mdgj_git::Error::Io(m)) if m.contains("nothing was changed")),
+        "{result:?}"
+    );
+    assert_eq!(b.state(), pulled, "every file as the pull left it");
+    b.repo.undo_last_sync().unwrap();
+    assert_eq!(b.text("a.md"), "a\n");
+    assert_eq!(b.text("z/x.md"), "x\n");
 }

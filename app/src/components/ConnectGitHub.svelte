@@ -174,10 +174,9 @@
   {:else}
     {#if step.result}
       <p>Connected to <strong>{step.fullName}</strong>.</p>
+      <!-- A review replaces Settings at once, so only these two are ever seen here. -->
       {#if step.result.status === "applied" && step.result.summary.files.length}
         <p class="muted">{plural(step.result.summary.files.length, "file")} came from GitHub.</p>
-      {:else if step.result.status === "review"}
-        <p class="muted">Some files differ here and on GitHub. Pull to choose what to keep of each.</p>
       {/if}
     {:else}
       <p>Signed in again as <strong>@{app.auth.login}</strong>.</p>

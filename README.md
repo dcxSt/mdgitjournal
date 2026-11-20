@@ -106,7 +106,9 @@ To try syncing without a second computer, build the app (`pnpm -C app tauri buil
 scripts/two-devices.sh            # --reset starts from empty journals; --dev uses the debug build and `pnpm -C app dev`
 ```
 
-It opens two windows, *mdgitjournal — Device A* and *— Device B*, each with its own journal, settings and sign-in under `~/mdgitjournal-test-devices/`, kept between runs. Sign in and connect both to the same (test) repository, then edit, commit and pull on either side. Your real journal and keychain are not touched.
+It opens two windows, *mdgitjournal — Device A* and *— Device B*, each with its own journal, settings and sign-in under `~/mdgitjournal-test-devices/`, kept between runs. Sign in and connect both to the same (test) repository, then edit, commit and pull on either side. Your real journal and keychain are not touched. Close both windows to quit; Ctrl-C in the terminal asks both to save and close.
+
+[docs/testing.md](docs/testing.md) is a step-by-step manual test script, two-device conflicts included.
 
 ## Connecting GitHub
 
@@ -114,7 +116,7 @@ Optional. In **Settings › Connect GitHub**:
 
 1. **Sign in with GitHub.** The app shows a short code; approve it in the browser.
 2. **Install the mdgitjournal GitHub App on one repository**, e.g. a new private `journal` repository. The app can only see repositories you install it on.
-3. **Connect.** An empty repository receives your local history. An existing one is pulled by the same rules as **Pull**: files only one side has arrive at once, and a file both sides have with different content waits for you in the Sync review.
+3. **Connect.** An empty repository receives your local history. An existing one is pulled by the same rules as **Pull**: files only one side has arrive at once, and a file both sides have with different content waits for you in the Sync review (as does joining two histories, which needs a merge commit).
 
 Alternatively, paste a fine-grained personal access token limited to that repository (*Contents: read and write*) and type `owner/repo`. Source builds without a registered GitHub App use this path. [docs/github-app.md](docs/github-app.md) covers both, including registering your own GitHub App.
 

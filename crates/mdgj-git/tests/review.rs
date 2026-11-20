@@ -12,7 +12,7 @@ use mdgj_git::{
 const ENTRY: &str = "2026-11-16-1402-run.md";
 const BASE: &str = "# Run\n\nFirst paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n";
 
-/// The "hhmm" of a Keep both copy: GitHub's newest commit time on this device.
+/// The "hhhmm" of a Keep both copy: GitHub's newest commit time on this device.
 fn stamp(d: &Device) -> String {
     let git = d.git();
     let remote = git
@@ -23,7 +23,7 @@ fn stamp(d: &Device) -> String {
     chrono::Local
         .timestamp_opt(remote.time().seconds(), 0)
         .unwrap()
-        .format("%H%M")
+        .format("%Hh%M")
         .to_string()
 }
 
@@ -76,9 +76,14 @@ fn an_overlap_opens_a_review_and_changes_nothing() {
         assert!(!preview.automatic, "{case}");
         let found = overlap(&preview, ENTRY);
         assert_eq!(found.kind, OverlapKind::BothModified, "{case}");
-        assert_eq!(found.mine.as_deref(), Some(mine.as_str()), "{case}");
-        assert_eq!(found.theirs.as_deref(), Some(theirs.as_str()), "{case}");
-        assert_eq!(found.base.as_deref(), Some(BASE), "{case}");
+        assert_eq!(
+            common::sides(found),
+            (BASE.to_owned(), mine.clone(), theirs.clone()),
+            "{case}"
+        );
+        assert_eq!(found.mine_path.as_deref(), Some(ENTRY));
+        assert_eq!(found.theirs_path.as_deref(), Some(ENTRY));
+        assert!(!found.committed, "nothing to commit in a fast-forward");
         assert_eq!(
             found.choices,
             [Choice::Mine, Choice::Theirs, Choice::Both, Choice::Merged]
@@ -307,40 +312,66 @@ fn each_resolution_of_a_committed_clash_makes_a_merge_commit() {
 }
 
 #[test]
-fn a_committed_clash_with_more_edits_on_top_goes_into_the_merge_as_resolved() {
-    let (_remote, a, b) = two_devices(&[(ENTRY, BASE)]);
-    a.write(ENTRY, BASE.replace("First paragraph.", "First, GitHub."));
-    a.push("A");
-    b.write(ENTRY, BASE.replace("First paragraph.", "First, committed."));
-    b.commit("B");
-    b.write(
-        ENTRY,
-        BASE.replace("First paragraph.", "First, committed, then typed."),
-    );
-    let (preview, _) = review(&b);
+fn a_committed_clash_with_more_edits_on_top_commits_only_what_was_committed() {
+    let typed = BASE
+        .replace("First paragraph.", "First, committed.")
+        .replace("Third paragraph.", "Third, typed.");
+    let setup = || {
+        let (remote, a, b) = two_devices(&[(ENTRY, BASE)]);
+        a.write(ENTRY, BASE.replace("First paragraph.", "First, GitHub."));
+        a.push("A");
+        b.write(ENTRY, BASE.replace("First paragraph.", "First, committed."));
+        b.commit("B");
+        b.write(ENTRY, &typed);
+        let (preview, _) = review(&b);
+        (remote, a, b, preview)
+    };
+
+    // Keep mine: the merge commit records the committed version; the typed line stays a change.
+    let (_r, _a, b, preview) = setup();
     assert_eq!(preview.plan, PullPlan::Merge);
     let found = overlap(&preview, ENTRY);
-    assert_eq!(
-        found.mine.as_deref(),
-        Some(
-            BASE.replace("First paragraph.", "First, committed, then typed.")
-                .as_str()
-        ),
-        "mine is the working tree"
-    );
+    assert!(found.committed);
+    assert_eq!(common::sides(found).1, typed, "mine is the working tree");
     b.apply(&preview, &[resolved(ENTRY, Resolution::Mine)]);
     assert_eq!(
         b.committed(ENTRY).unwrap(),
-        BASE.replace("First paragraph.", "First, committed, then typed.")
+        BASE.replace("First paragraph.", "First, committed.")
             .into_bytes()
     );
+    assert_eq!(b.text(ENTRY), typed);
+    assert_eq!(b.changes(), [(ENTRY.into(), ChangeKind::Modified)]);
+
+    // Merged: the merge without the typed line, which stays uncommitted on top of it.
+    let (_r, _a, b, preview) = setup();
+    let merged_text = BASE
+        .replace("First paragraph.", "First, merged.")
+        .replace("Third paragraph.", "Third, typed.");
+    b.apply(&preview, &[merged(ENTRY, &merged_text)]);
+    assert_eq!(
+        b.committed(ENTRY).unwrap(),
+        BASE.replace("First paragraph.", "First, merged.")
+            .into_bytes()
+    );
+    assert_eq!(b.text(ENTRY), merged_text);
+    assert_eq!(b.changes(), [(ENTRY.into(), ChangeKind::Modified)]);
+
+    // A merge that rewrote the typed line itself records it, as the user resolved it.
+    let (_r, _a, b, preview) = setup();
+    let merged_text = BASE
+        .replace("First paragraph.", "First, merged.")
+        .replace("Third paragraph.", "Third, typed and merged.");
+    b.apply(&preview, &[merged(ENTRY, &merged_text)]);
+    assert_eq!(b.text(ENTRY), merged_text);
+    assert_eq!(b.committed(ENTRY).unwrap(), merged_text.into_bytes());
     assert_eq!(b.changes(), []);
 }
 
-// 8. Diverged, overlap only in uncommitted edits: rebase, resolution uncommitted
+// 8. Diverged, overlap only in uncommitted edits: a merge commit of the commits, resolution
+// uncommitted
 
 #[test]
-fn an_overlap_in_uncommitted_edits_with_unpushed_commits_elsewhere_rebases() {
+fn an_overlap_in_uncommitted_edits_with_unpushed_commits_elsewhere_makes_a_merge_commit() {
     let (_remote, a, b) = two_devices(&[(ENTRY, BASE)]);
     a.write(ENTRY, BASE.replace("First paragraph.", "First, GitHub."));
     a.push("A");
@@ -354,31 +385,30 @@ fn an_overlap_in_uncommitted_edits_with_unpushed_commits_elsewhere_rebases() {
     );
 
     let (preview, _) = review(&b);
-    assert_eq!(preview.plan, PullPlan::Rebase);
+    assert_eq!(preview.plan, PullPlan::Merge, "decision C: no rebase");
     assert!(!preview.automatic);
     assert_eq!(preview.local_count, 2);
     let messages: Vec<_> = preview.local.iter().map(|c| c.message.as_str()).collect();
     assert_eq!(messages, ["b2", "b1"]);
-    let suggestion = overlap(&preview, ENTRY).suggestion.clone().unwrap();
+    let found = overlap(&preview, ENTRY);
+    assert!(!found.committed, "only uncommitted edits clash");
+    let suggestion = found.suggestion.clone().unwrap();
     assert!(suggestion.clean);
     let text = suggestion.text().unwrap();
+    let local = b.head();
     let summary = b.apply(&preview, &[merged(ENTRY, &text)]);
-    assert_eq!(summary.plan, PullPlan::Rebase);
-    assert_eq!(summary.rebased, 2);
-    assert_eq!(summary.merge_commit, None);
-    assert_eq!(
-        b.history(),
-        [
-            ("b2".into(), 1),
-            ("b1".into(), 1),
-            ("A".into(), 1),
-            ("Base".into(), 0)
-        ]
-    );
+    assert_eq!(summary.plan, PullPlan::Merge);
+    assert_eq!(summary.rebased, 0);
+    let git = b.git();
+    let commit = git.find_commit(b.head()).unwrap();
+    assert_eq!(summary.merge_commit, Some(commit.id().to_string()));
+    let parents: Vec<_> = commit.parent_ids().collect();
+    assert_eq!(parents, [local, a.head()], "B's commits keep their ids");
     assert_eq!(
         b.committed(ENTRY).unwrap(),
         BASE.replace("First paragraph.", "First, GitHub.")
-            .into_bytes()
+            .into_bytes(),
+        "the merge commit records commits only"
     );
     assert_eq!(
         b.text(ENTRY),
@@ -473,11 +503,11 @@ fn two_different_images_at_one_path_are_binary() {
     let found = overlap(&preview, path);
     assert_eq!(found.kind, OverlapKind::BothAdded);
     assert!(found.binary);
-    assert_eq!(
-        (found.base.clone(), found.mine.clone(), found.theirs.clone()),
-        (None, None, None)
-    );
     assert_eq!(found.suggestion, None);
+    assert_eq!(
+        (found.mine_path.as_deref(), found.theirs_path.as_deref()),
+        (Some(path), Some(path))
+    );
     assert_eq!(found.choices, [Choice::Mine, Choice::Theirs, Choice::Both]);
     let copy = found.copy.clone().unwrap();
     assert!(
@@ -508,11 +538,11 @@ fn delete_and_modify_offer_keep_or_take_and_do_each() {
     assert_eq!(ours.kind, OverlapKind::ModifiedDeleted);
     assert_eq!(ours.choices, [Choice::Mine, Choice::Theirs]);
     assert_eq!((ours.copy.clone(), ours.suggestion.clone()), (None, None));
-    assert_eq!(ours.theirs, None);
+    assert_eq!(ours.theirs_path, None);
     let theirs = overlap(&preview, "theirs.md");
     assert_eq!(theirs.kind, OverlapKind::DeletedModified);
     assert_eq!(theirs.choices, [Choice::Mine, Choice::Theirs]);
-    assert_eq!(theirs.mine, None);
+    assert_eq!(theirs.mine_path, None);
 
     // Keep mine: my edit stays, my deletion stays.
     b.apply(

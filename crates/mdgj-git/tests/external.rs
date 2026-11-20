@@ -87,7 +87,10 @@ fn resolve_with_git_leaves_a_standard_merge_in_progress() {
         state,
         Some(MergeState {
             conflicted: vec![ENTRY.into()],
-            started_by_app: true
+            merged: vec!["a.md".into()],
+            started_by_app: true,
+            precommit: false,
+            autostash: false,
         })
     );
     assert_eq!(b.repo.sync_state().unwrap().merge, state);
@@ -144,9 +147,9 @@ fn abort_after_a_clean_start_restores_everything_byte_for_byte() {
         .unwrap();
     // The user starts resolving, then gives up.
     b.write(ENTRY, "half resolved\n");
-    let mut restored = b.repo.abort_merge().unwrap();
-    restored.sort();
-    assert_eq!(restored, [ENTRY, "a.md"]);
+    let aborted = b.repo.abort_merge().unwrap();
+    assert_eq!(aborted.restored, ["2026-11-16-1402-run.md", "a.md"]);
+    assert!(!aborted.stashed);
     assert_eq!(b.state(), before, "refs, index bytes and files as before");
     assert_eq!(b.repo.merge_state(), Ok(None));
     assert!(git_file(&b, "MERGE_HEAD").is_none());
@@ -175,6 +178,12 @@ fn resolve_with_git_commits_uncommitted_edits_first_and_abort_takes_that_back() 
     b.write("untracked.md", "untracked\n");
     b.write("x.md", "x, edited\n");
     let preview = b.pull_review();
+    assert_eq!(
+        preview.git_merge.uncommitted,
+        [ENTRY],
+        "only what git merges over"
+    );
+    assert_eq!(preview.git_merge.conflicted, [ENTRY]);
     let local = b.head();
     let before = b.state();
     let status = b.repo.status().unwrap();
@@ -193,10 +202,15 @@ fn resolve_with_git_commits_uncommitted_edits_first_and_abort_takes_that_back() 
     let precommit = git.head().unwrap().peel_to_commit().unwrap();
     assert_eq!(precommit.message(), Ok("Work in progress\n"));
     assert_eq!(precommit.parent_id(0).unwrap(), local);
-    assert_eq!(b.committed("untracked.md"), Some(b"untracked\n".to_vec()));
+    // Files GitHub didn't change aren't committed: they stay as they are, uncommitted.
+    assert_eq!(b.committed("untracked.md"), None);
+    assert_eq!(b.committed("x.md"), Some(b"x\n".to_vec()));
     assert!(b.text(ENTRY).contains("<<<<<<< HEAD\nFirst, typed here.\n"));
     assert_eq!(b.text("x.md"), "x, edited\n");
-    assert_eq!(b.repo.merge_state().unwrap().unwrap().conflicted, [ENTRY]);
+    assert_eq!(b.text("untracked.md"), "untracked\n");
+    let state = b.repo.merge_state().unwrap().unwrap();
+    assert_eq!(state.conflicted, [ENTRY]);
+    assert!(state.precommit);
 
     b.repo.abort_merge().unwrap();
     assert_eq!(b.head(), local, "the commit of my edits is taken back");
@@ -333,7 +347,10 @@ fn a_merge_started_on_the_command_line_is_shown_and_can_be_aborted() {
         b.repo.merge_state(),
         Ok(Some(MergeState {
             conflicted: vec![ENTRY.into()],
-            started_by_app: false
+            merged: vec!["a.md".into()],
+            started_by_app: false,
+            precommit: false,
+            autostash: false,
         }))
     );
     assert_eq!(b.repo.pull(None, &author()), Err(Error::MergeInProgress));
@@ -375,4 +392,93 @@ fn a_cli_abort_leaves_the_commit_of_edits_and_the_app_carries_on() {
     let preview = b.pull_review();
     assert_eq!(preview.plan, mdgj_git::PullPlan::Merge);
     assert!(!b.root().join(".git/mdgitjournal/merge.json").exists());
+}
+
+#[test]
+fn abort_refuses_rather_than_discard_text_typed_into_a_merged_file() {
+    let clean = "# Clean\n\nOne.\n\nTwo.\n\nThree.\n";
+    let (_remote, a, b) = two_devices(&[(ENTRY, BASE), ("clean.md", clean)]);
+    a.write(
+        ENTRY,
+        BASE.replace("First paragraph.", "First, from GitHub."),
+    );
+    a.write("clean.md", clean.replace("Three.", "Three, GitHub."));
+    a.write("dawn.md", "dawn\n");
+    a.push("A");
+    b.write(
+        ENTRY,
+        BASE.replace("First paragraph.", "First, typed here."),
+    );
+    b.write("clean.md", clean.replace("One.", "One, here."));
+    let preview = b.pull_review();
+    assert_eq!(preview.git_merge.conflicted, [ENTRY]);
+    b.repo
+        .start_external_merge(&preview.id, Some("Mine"), &author())
+        .unwrap();
+    let state = b.repo.merge_state().unwrap().unwrap();
+    assert_eq!(state.conflicted, [ENTRY]);
+    assert_eq!(state.merged, ["clean.md", "dawn.md"]);
+
+    // Typing into files git merged (not the conflicted one) during the merge.
+    let typed = format!("{}\nTYPED DURING THE MERGE.\n", b.text("clean.md"));
+    b.write("clean.md", &typed);
+    b.write("dawn.md", "dawn\nand a line\n");
+    let during = b.state();
+    let refused = b.repo.abort_merge();
+    assert!(
+        matches!(&refused, Err(Error::Invalid(m)) if m.contains("clean.md") && m.contains("dawn.md")),
+        "{refused:?}"
+    );
+    assert_eq!(b.state(), during, "nothing changed");
+    assert!(git_file(&b, "MERGE_HEAD").is_some());
+
+    // Once that text is saved elsewhere (here: put back as git merged it), Abort goes ahead.
+    b.write(
+        "clean.md",
+        clean
+            .replace("One.", "One, here.")
+            .replace("Three.", "Three, GitHub."),
+    );
+    b.write("dawn.md", "dawn\n");
+    b.repo.abort_merge().unwrap();
+    assert_eq!(b.text("clean.md"), clean.replace("One.", "One, here."));
+    assert!(!b.exists("dawn.md"));
+}
+
+#[test]
+fn abort_puts_back_what_git_merge_autostash_set_aside() {
+    let (_remote, a, b) = two_devices(&[(ENTRY, BASE), ("n.md", "notes\n")]);
+    a.write(
+        ENTRY,
+        BASE.replace("First paragraph.", "First, from GitHub."),
+    );
+    a.push("A");
+    b.write(
+        ENTRY,
+        BASE.replace("First paragraph.", "First, committed here."),
+    );
+    b.commit("B");
+    b.write("n.md", "notes UNCOMMITTED IMPORTANT\n");
+    let Some(output) = b.cli(&["merge", "--autostash", "origin/main"]) else {
+        return; // no git on PATH
+    };
+    if !b.root().join(".git/MERGE_AUTOSTASH").exists() {
+        return; // a git without --autostash
+    }
+    assert!(!output.status.success(), "the merge conflicts");
+    assert_eq!(b.text("n.md"), "notes\n", "git set the note aside");
+    let state = b.repo.merge_state().unwrap().unwrap();
+    assert!(state.autostash);
+    assert!(!state.started_by_app);
+
+    let aborted = b.repo.abort_merge().unwrap();
+    assert!(!aborted.stashed);
+    assert!(aborted.restored.contains(&"n.md".to_owned()));
+    assert_eq!(b.text("n.md"), "notes UNCOMMITTED IMPORTANT\n");
+    assert!(!b.root().join(".git/MERGE_AUTOSTASH").exists());
+    assert!(!b.root().join(".git/AUTO_MERGE").exists());
+    assert_eq!(b.changes(), [("n.md".into(), ChangeKind::Modified)]);
+    if let Some(list) = b.cli_ok(&["stash", "list"]) {
+        assert_eq!(list, "", "applied, not left as a stash");
+    }
 }

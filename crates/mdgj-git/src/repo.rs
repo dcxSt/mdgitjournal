@@ -102,7 +102,13 @@ impl Repo {
                 path.display()
             )));
         }
-        Ok(Repo { git })
+        let repo = Repo { git };
+        // A pull the app quit during is put back before anything reads the journal. If that
+        // can't be done safely, every operation that would change it says why.
+        if repo.git.state() == RepositoryState::Clean {
+            let _ = repo.recover_interrupted_pull();
+        }
+        Ok(repo)
     }
 
     /// Working tree vs HEAD, including untracked files that aren't ignored, with renames detected.
@@ -299,10 +305,14 @@ impl Repo {
     }
 
     /// Fails while git is in the middle of something (a merge: `MergeInProgress`). A record of a
-    /// merge the user has since finished or aborted with git is deleted.
+    /// merge the user has since finished or aborted with git is deleted, and a pull that stopped
+    /// part way is put back.
     pub(crate) fn locked(&self) -> Result<()> {
         let operation = match self.git.state() {
-            RepositoryState::Clean => return self.forget_merge(),
+            RepositoryState::Clean => {
+                self.forget_merge()?;
+                return self.recover_interrupted_pull();
+            }
             RepositoryState::Merge => return Err(Error::MergeInProgress),
             RepositoryState::Revert | RepositoryState::RevertSequence => "revert",
             RepositoryState::CherryPick | RepositoryState::CherryPickSequence => "cherry-pick",

@@ -88,7 +88,7 @@ describe("commit message", () => {
 });
 
 describe("a merge in progress", () => {
-  const merging = view({ behind: 2, changes: [change], merge: { conflicted: [change.path], startedByApp: true } });
+  const merging = view({ behind: 2, changes: [change], merge: { conflicted: [change.path], merged: [], startedByApp: true, precommit: false, autostash: false } });
 
   it("disables Pull and Commit & Push, saying why", () => {
     expect(pullButton(merging, [])).toMatchObject({ disabled: true, accent: false, title: MERGE_TITLE });
@@ -124,6 +124,15 @@ describe("summary words", () => {
     expect(summaryText(summary({ incomingCount: 1, files: [], rebased: 2, plan: "rebase" }))).toBe(
       "Pulled 1 commit from GitHub · your 2 unpushed commits were placed after them",
     );
+    // What is left to do: a merge commit to push, resolutions still to commit.
+    const resolved = { path: change.path, kind: "both_modified" as const, choice: "merged" as const, copy: null };
+    expect(summaryText(summary({ mergeCommit: "c".repeat(40), plan: "merge", files: [] }))).toBe(
+      "Pulled 3 commits from GitHub · merge commit ready to push",
+    );
+    expect(summaryText(summary({ files: [change], resolved: [resolved] }), [change])).toBe(
+      "Pulled 3 commits from GitHub · 1 file changed · 1 resolved file ready to commit",
+    );
+    expect(summaryText(summary({ files: [change], resolved: [resolved] }), [])).toBe("Pulled 3 commits from GitHub · 1 file changed");
     expect(rebasedText({ rebased: 2, incomingCount: 3 })).toBe("Your 2 unpushed commits were placed after the 3 from GitHub.");
     expect(rebasedText({ rebased: 1, incomingCount: 1 })).toBe("Your 1 unpushed commit was placed after the 1 from GitHub.");
   });

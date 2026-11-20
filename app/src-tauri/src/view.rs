@@ -56,7 +56,7 @@ impl SyncView {
 #[cfg(test)]
 mod tests {
     use mdgj_core::AuthKind;
-    use mdgj_git::{ChangeKind, Choice, CommitInfo, PullPlan, ResolvedFile};
+    use mdgj_git::{ChangeKind, Choice, CommitInfo, OverlapKind, PullPlan, ResolvedFile};
     use serde_json::json;
 
     use super::*;
@@ -143,15 +143,19 @@ mod tests {
             }],
             resolved: vec![ResolvedFile {
                 path: "2026-11-15-0700-walk.md".into(),
+                kind: OverlapKind::BothModified,
                 choice: Choice::Both,
-                copy: Some("2026-11-15-0700-walk.from-github-1402.md".into()),
+                copy: Some("2026-11-15-0700-walk.from-github-14h02.md".into()),
             }],
         };
         let view = SyncView::new(
             SyncState {
                 merge: Some(MergeState {
                     conflicted: vec!["2026-11-15-0700-walk.md".into()],
+                    merged: vec!["2026-11-16-1402-run.md".into()],
                     started_by_app: true,
+                    precommit: true,
+                    autostash: false,
                 }),
                 last_sync: Some(summary),
                 ..state(true)
@@ -163,7 +167,9 @@ mod tests {
         let json = serde_json::to_value(view).unwrap();
         assert_eq!(
             json["merge"],
-            json!({ "conflicted": ["2026-11-15-0700-walk.md"], "startedByApp": true })
+            json!({ "conflicted": ["2026-11-15-0700-walk.md"],
+                    "merged": ["2026-11-16-1402-run.md"],
+                    "startedByApp": true, "precommit": true, "autostash": false })
         );
         assert_eq!(
             json["lastSync"],
@@ -176,8 +182,9 @@ mod tests {
                 "rebased": 2,
                 "mergeCommit": null,
                 "files": [{ "path": "2026-11-16-1402-run.md", "kind": "added" }],
-                "resolved": [{ "path": "2026-11-15-0700-walk.md", "choice": "both",
-                               "copy": "2026-11-15-0700-walk.from-github-1402.md" }],
+                "resolved": [{ "path": "2026-11-15-0700-walk.md", "kind": "both_modified",
+                               "choice": "both",
+                               "copy": "2026-11-15-0700-walk.from-github-14h02.md" }],
             })
         );
     }

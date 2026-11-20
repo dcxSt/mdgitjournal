@@ -3,7 +3,9 @@
 //!
 //! A merge the app starts is recorded in `.git/mdgitjournal/merge.json`, with a copy of the index
 //! from before it (`merge-index`), so Abort restores the index byte for byte and can take back the
-//! commit of uncommitted edits made to start the merge.
+//! commit of uncommitted edits made to start the merge. Abort refuses, as `git merge --abort`
+//! does, rather than discard what was typed into a merged file since, and puts back the changes
+//! `git merge --autostash` set aside.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -12,25 +14,55 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use git2::build::CheckoutBuilder;
-use git2::{ErrorCode, Index, MergeOptions, Oid, RepositoryState};
+use git2::{ErrorCode, Index, MergeOptions, Oid, Repository, RepositoryState, StashApplyOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::pull::PullPlan;
-use crate::repo::{head_commit, head_tree_id, lossy, now_ms, read_if_exists, REMOTE};
-use crate::worktree::{self, entry, files, tree_files, Files, Snapshot, GITLINK};
+use crate::repo::{changes, head_commit, lossy, now_ms, read_if_exists, remove_if_exists, REMOTE};
+use crate::undo::list;
+use crate::worktree::{self, entry, files, scratch, tree_files, Files, Snapshot, GITLINK};
 use crate::{Author, Error, Repo, Result};
 
 const RECORD: &str = "merge.json";
 const INDEX_COPY: &str = "merge-index";
 const VERSION: u32 = 1;
+/// What `git merge --autostash` (or `merge.autoStash`) set aside: a stash commit's id.
+const AUTOSTASH: &str = "MERGE_AUTOSTASH";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MergeState {
     /// Paths with conflict entries in the index, sorted.
     pub conflicted: Vec<String>,
+    /// Paths git merged without a conflict (and staged), which Abort also puts back, sorted.
+    pub merged: Vec<String>,
     /// The app started it (Resolve with git), rather than the git command line.
     pub started_by_app: bool,
+    /// The app committed uncommitted edits first, so git could merge them; Abort takes that
+    /// commit back, a `git merge --abort` keeps it.
+    pub precommit: bool,
+    /// `git merge --autostash` set uncommitted changes aside; Abort puts them back.
+    pub autostash: bool,
+}
+
+/// What Abort merge did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aborted {
+    /// Paths put back.
+    pub restored: Vec<String>,
+    /// The changes `--autostash` set aside didn't apply cleanly, so they are a git stash now
+    /// (`git stash pop`), as git leaves them.
+    pub stashed: bool,
+}
+
+/// The paths a merge in progress has changed.
+struct MergePaths {
+    conflicted: BTreeSet<Vec<u8>>,
+    /// Conflicted paths, and the paths git merged: staged differently from HEAD where a merged
+    /// commit differs from HEAD too.
+    reset: BTreeSet<Vec<u8>>,
+    head: Files,
+    staged: Files,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -58,7 +90,14 @@ impl Repo {
         self.locked()?;
         let snapshot = Snapshot::take(&self.git)?;
         let analysis = self.fresh(&snapshot, id)?;
-        let dirty = snapshot.tree != head_tree_id(&self.git)?;
+        // Only the uncommitted changes git must merge over are committed; other files stay as
+        // they are, uncommitted.
+        let over: Vec<String> = analysis
+            .merged_over()?
+            .iter()
+            .map(|change| change.public().path)
+            .collect();
+        let dirty = !over.is_empty();
         let message = message.filter(|m| !m.trim().is_empty());
         if dirty && message.is_none() {
             return Err(Error::EmptyMessage);
@@ -76,7 +115,9 @@ impl Repo {
             None => self.remove_state_file(INDEX_COPY)?,
         }
         let precommit = match message {
-            Some(message) if dirty => self.commit_snapshot(&snapshot, message, None, author)?,
+            Some(message) if dirty => {
+                self.commit_snapshot(&snapshot, message, Some(&over), author)?
+            }
             _ => None,
         };
         drop(analysis);
@@ -121,32 +162,23 @@ impl Repo {
         if self.git.state() != RepositoryState::Merge {
             return Ok(None);
         }
-        let index = Index::open(&self.git.path().join("index"))?;
-        let mut conflicted = BTreeSet::new();
-        for conflict in index.conflicts()? {
-            let conflict = conflict?;
-            if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
-                conflicted.insert(lossy(&entry.path));
-            }
-        }
+        let paths = self.merge_paths()?;
+        let record = self.merge_record()?;
         Ok(Some(MergeState {
-            conflicted: conflicted.into_iter().collect(),
-            started_by_app: self.merge_record()?.is_some(),
+            conflicted: paths.conflicted.iter().map(|p| lossy(p)).collect(),
+            merged: paths
+                .reset
+                .difference(&paths.conflicted)
+                .map(|p| lossy(p))
+                .collect(),
+            started_by_app: record.is_some(),
+            precommit: record.is_some_and(|r| r.precommit.is_some()),
+            autostash: self.git.path().join(AUTOSTASH).exists(),
         }))
     }
 
-    /// `git merge --abort`: every file the merge changed (or that conflicts) goes back to HEAD's
-    /// version, discarding what was done to it since; other files are left alone. For a merge
-    /// the app started, the index is restored exactly and the commit of uncommitted edits is
-    /// taken back, so they are uncommitted again. Returns the paths put back.
-    pub fn abort_merge(&self) -> Result<Vec<String>> {
-        if self.git.state() != RepositoryState::Merge {
-            return Err(Error::Invalid("No merge is in progress.".into()));
-        }
-        let record = self.merge_record()?;
-        let head = head_commit(&self.git)?;
-        let head_id = head.as_ref().map(|commit| commit.id());
-        let head_files = match &head {
+    fn merge_paths(&self) -> Result<MergePaths> {
+        let head = match head_commit(&self.git)? {
             Some(commit) => tree_files(&commit.tree()?)?,
             None => Files::new(),
         };
@@ -154,26 +186,75 @@ impl Repo {
         for id in self.merge_heads()? {
             merged.push(tree_files(&self.git.find_commit(id)?.tree()?)?);
         }
-
         let index = Index::open(&self.git.path().join("index"))?;
         let staged = files(&index);
-        let mut reset: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut conflicted = BTreeSet::new();
         for conflict in index.conflicts()? {
             let conflict = conflict?;
             for entry in [conflict.ancestor, conflict.our, conflict.their]
                 .into_iter()
                 .flatten()
             {
-                reset.insert(entry.path);
+                conflicted.insert(entry.path);
             }
         }
+        let mut reset = conflicted.clone();
         // Only paths the merge could have changed: HEAD and the merged commit differ there.
-        for path in staged.keys().chain(head_files.keys()) {
-            let ours = head_files.get(path);
+        for path in staged.keys().chain(head.keys()) {
+            let ours = head.get(path);
             if staged.get(path) != ours && merged.iter().any(|m| m.get(path) != ours) {
                 reset.insert(path.clone());
             }
         }
+        Ok(MergePaths {
+            conflicted,
+            reset,
+            head,
+            staged,
+        })
+    }
+
+    /// `git merge --abort`: every file the merge changed (or that conflicts) goes back to HEAD's
+    /// version; other files are left alone. Refuses, changing nothing, if a file git merged has
+    /// been edited since (conflicted files are reset whatever was done to them, as git does).
+    /// For a merge the app started, the index is restored exactly and the commit of uncommitted
+    /// edits is taken back, so they are uncommitted again; what `--autostash` set aside is put
+    /// back.
+    pub fn abort_merge(&self) -> Result<Aborted> {
+        if self.git.state() != RepositoryState::Merge {
+            return Err(Error::Invalid("No merge is in progress.".into()));
+        }
+        let record = self.merge_record()?;
+        let head_id = head_commit(&self.git)?.map(|commit| commit.id());
+        let MergePaths {
+            conflicted,
+            reset,
+            head: head_files,
+            staged,
+        } = self.merge_paths()?;
+
+        let hasher = scratch(&self.git)?;
+        let mut edited = Vec::new();
+        for path in reset.difference(&conflicted) {
+            let merged = staged.get(path);
+            if merged.is_some_and(|&(_, mode)| mode == GITLINK) {
+                continue;
+            }
+            if worktree::on_disk(&hasher, path)? != merged.map(|&(id, _)| id) {
+                edited.push(lossy(path));
+            }
+        }
+        if !edited.is_empty() {
+            return Err(Error::Invalid(format!(
+                "{} changed after the merge started, and Abort would discard that. Copy the text \
+                 somewhere safe or finish the merge with git, then abort again.",
+                list(&edited)
+            )));
+        }
+        let autostash = match read_if_exists(&self.git.path().join(AUTOSTASH))? {
+            Some(bytes) => Some(Oid::from_str(String::from_utf8_lossy(&bytes).trim())?),
+            None => None,
+        };
 
         for path in &reset {
             let ours = head_files.get(path).copied();
@@ -231,8 +312,54 @@ impl Repo {
             self.move_branch_back(&branch, before, precommit)?;
         }
         self.git.cleanup_state()?;
+        remove_if_exists(&self.git.path().join("AUTO_MERGE"))?;
         self.forget_merge()?;
-        Ok(reset.iter().map(|path| lossy(path)).collect())
+
+        let mut restored: BTreeSet<String> = reset.iter().map(|path| lossy(path)).collect();
+        let mut stashed = false;
+        if let Some(stash) = autostash {
+            restored.extend(self.stash_paths(stash)?);
+            stashed = !self.apply_autostash(stash)?;
+            remove_if_exists(&self.git.path().join(AUTOSTASH))?;
+        }
+        Ok(Aborted {
+            restored: restored.into_iter().collect(),
+            stashed,
+        })
+    }
+
+    /// Applies the stash `git merge --autostash` made, as `git merge --abort` does: through
+    /// `refs/stash`, popped if it applies cleanly, else left there. Whether it applied.
+    fn apply_autostash(&self, stash: Oid) -> Result<bool> {
+        let mut git = Repository::open(self.git.path())?;
+        git.reference_ensure_log("refs/stash")?;
+        git.reference("refs/stash", stash, true, "autostash")?;
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe();
+        let mut options = StashApplyOptions::new();
+        options.checkout_options(checkout);
+        Ok(git.stash_pop(0, Some(&mut options)).is_ok())
+    }
+
+    /// The files a stash changes.
+    fn stash_paths(&self, stash: Oid) -> Result<Vec<String>> {
+        let commit = self.git.find_commit(stash)?;
+        let base = commit.parent(0)?.tree_id();
+        let mut paths: Vec<String> = changes(&self.git, base, commit.tree_id())?
+            .iter()
+            .flat_map(|change| {
+                let change = change.public();
+                [Some(change.path), change.old_path]
+            })
+            .flatten()
+            .collect();
+        // Untracked files, which `--autostash` keeps in a third parent.
+        if let Ok(untracked) = commit.parent(2) {
+            for path in tree_files(&untracked.tree()?)?.keys() {
+                paths.push(lossy(path));
+            }
+        }
+        Ok(paths)
     }
 
     /// Deletes the app's merge record (a merge finished or aborted with git leaves one behind).

@@ -17,10 +17,12 @@
 #   macOS: target/release/bundle/macos/mdgitjournal.app/Contents/MacOS/mdgitjournal
 #          (run directly, so each instance gets its own environment and a second one starts)
 #   Linux: target/release/mdgitjournal
-# --dev uses target/debug/mdgitjournal (`cargo build -p mdgitjournal`, or `pnpm -C app tauri dev`),
-# which loads the UI from the dev server on localhost:1420. target/ is $CARGO_TARGET_DIR if set.
+# --dev uses target/debug/mdgitjournal (build it with `cargo build -p mdgitjournal`), which loads
+# the UI from the dev server on localhost:1420 (`pnpm -C app dev`). Not `pnpm -C app tauri dev`:
+# that starts a third instance, on the real journal. target/ is $CARGO_TARGET_DIR if set.
 #
-# Stays in the foreground: Ctrl-C (or closing the terminal, or both windows) ends both instances.
+# Stays in the foreground. Quit by closing both windows; Ctrl-C (or closing the
+# terminal) asks both instances to close their windows the same way, so what was typed is saved.
 
 set -eu
 
@@ -39,7 +41,8 @@ real journal, settings or keychain.
   -h, --help
             show this help
 
-MDGJ_BIN overrides the binary. Ctrl-C, or closing both windows, ends both instances.
+MDGJ_BIN overrides the binary. Closing both windows ends both instances; Ctrl-C asks
+both to save and close.
 EOF
 }
 
@@ -118,11 +121,25 @@ if [ "$reset" = 1 ]; then
 fi
 
 pids=
-# shellcheck disable=SC2317 # only reached through the traps below
+# shellcheck disable=SC2317,SC2329 # only reached through the traps below
 cleanup() {
 	trap - HUP INT TERM EXIT
+	[ -n "$pids" ] || return 0
+	# An instance closes its window on SIGTERM as if you had closed it, saving what was typed.
 	# shellcheck disable=SC2086 # word splitting is wanted: a list of pids
-	[ -z "$pids" ] || kill $pids 2>/dev/null || true
+	kill $pids 2>/dev/null || true
+	tries=0
+	while [ "$tries" -lt 10 ]; do
+		open=
+		for pid in $pids; do
+			if kill -0 "$pid" 2>/dev/null; then open="$open $pid"; fi
+		done
+		[ -n "$open" ] || return 0
+		sleep 1
+		tries=$((tries + 1))
+	done
+	# Never killed outright: a window that stays open says why (a save that failed).
+	echo "two-devices: still open (pid$open); its window says why. Close it there." >&2
 }
 trap cleanup EXIT
 trap 'cleanup; exit 129' HUP
@@ -143,7 +160,7 @@ start() {
 echo "Binary: $bin"
 start a "Device A"
 start b "Device B"
-echo "Running. Ctrl-C (or closing both windows) ends both."
+echo "Running. Close both windows to quit; Ctrl-C asks both to save and close."
 
 status=0
 for pid in $pids; do

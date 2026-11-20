@@ -1,5 +1,9 @@
 //! The working tree as git sees it (an in-memory snapshot), and the one careful way a pull replaces
 //! or removes files in it.
+//!
+//! Files written from the repository get the bytes `git checkout` would write (the smudge filters
+//! of `.gitattributes` and `core.autocrlf` applied); files put back as they were (Undo, a pull
+//! rolled back) get their exact earlier bytes, which are kept as they were on disk.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -9,7 +13,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use git2::{Index, IndexAddOption, IndexEntry, IndexTime, ObjectType, Oid, Repository, Tree};
+use git2::build::CheckoutBuilder;
+use git2::{
+    AttrCheckFlags, AttrValue, Index, IndexAddOption, IndexEntry, IndexTime, ObjectType, Oid,
+    Repository, Tree,
+};
 
 use crate::repo::{lossy, workdir};
 use crate::{Error, Result};
@@ -20,6 +28,17 @@ pub(crate) type Files = BTreeMap<Vec<u8>, (Oid, u32)>;
 /// Written in the git directory and renamed into place, so an interrupted write never leaves a
 /// stray file in the journal.
 const TEMP_FILE: &str = "mdgitjournal-write.tmp";
+/// Where a blob is checked out to learn the bytes git would write for it, inside the git directory.
+const CHECKOUT_DIR: &str = "mdgitjournal-checkout.tmp";
+/// Attributes that make git change a file's bytes on checkout.
+const FILTER_ATTRIBUTES: [&str; 6] = [
+    "text",
+    "eol",
+    "crlf",
+    "filter",
+    "ident",
+    "working-tree-encoding",
+];
 const MEMPACK_PRIORITY: i32 = 1000;
 pub(crate) const BLOB: u32 = 0o100644;
 pub(crate) const EXECUTABLE: u32 = 0o100755;
@@ -119,6 +138,9 @@ pub(crate) struct Step {
     /// What must be on disk right before the step. Usually `before`; for a new name that the file
     /// system folds onto an existing file (case-only renames on APFS), that file.
     expected: Option<(Oid, u32)>,
+    /// The exact bytes on disk when planned (a blob in the snapshot's handle), which a rollback or
+    /// Undo writes back; `before` is what git's filters make of them.
+    pub raw: Option<(Oid, u32)>,
 }
 
 /// Every change that makes the working tree match a target, checked before anything is written.
@@ -138,8 +160,10 @@ pub(crate) fn plan(snapshot: &Snapshot, target: &Files) -> Result<Plan> {
     let mut removals = Vec::new();
     for (path, &entry) in current {
         if entry.1 != GITLINK && !target.contains_key(path) {
+            let full = checked(workdir, path)?;
             removals.push(Step {
-                full: checked(workdir, path)?,
+                raw: capture(&snapshot.repo, &full)?,
+                full,
                 path: path.clone(),
                 before: Some(entry),
                 after: None,
@@ -184,6 +208,10 @@ pub(crate) fn plan(snapshot: &Snapshot, target: &Files) -> Result<Plan> {
         };
         steps.push(Step {
             path: path.clone(),
+            raw: match expected {
+                Some(_) => capture(&snapshot.repo, &full)?,
+                None => None,
+            },
             full,
             before,
             after: Some(entry),
@@ -241,7 +269,8 @@ fn run(repo: &Repository, step: &Step, written: &mut HashSet<(u64, u64)>) -> Res
             make_parents(workdir, &step.path)?;
             // The new version is on disk (and synced) before the old one is checked, so the check
             // and the replacement happen back to back.
-            let temp = stage_blob(repo, &step.full, id, mode)?;
+            let bytes = checkout_bytes(repo, &step.path, id, mode)?;
+            let temp = stage(repo, &step.full, &bytes, mode)?;
             if !is_expected(&step.full)? {
                 fs::remove_file(&temp)?;
                 return Err(Error::StaleReview);
@@ -260,7 +289,8 @@ fn run(repo: &Repository, step: &Step, written: &mut HashSet<(u64, u64)>) -> Res
     }
 }
 
-/// Undoes the steps that ran, newest first, each only if its file is still as the step left it.
+/// Undoes the steps that ran, newest first, each only if its file is still as the step left it:
+/// the file's exact earlier bytes come back.
 pub(crate) fn rollback(repo: &Repository, plan: &Plan, done: &[Done]) -> Result<()> {
     for (step, outcome) in plan.steps.iter().zip(done).rev() {
         let meta = metadata(&step.full)?;
@@ -270,10 +300,39 @@ pub(crate) fn rollback(repo: &Repository, plan: &Plan, done: &[Done]) -> Result<
             Done::Skipped => false,
         };
         if untouched {
-            put(repo, &step.path, step.expected)?;
+            restore(repo, &step.path, step.raw)?;
         }
     }
     Ok(())
+}
+
+/// The file at `full` exactly as it is on disk (a link's target, for a link), stored as a blob
+/// through `repo` (a scratch handle keeps it in memory) with its mode; `None` if there is none.
+pub(crate) fn capture(repo: &Repository, full: &Path) -> Result<Option<(Oid, u32)>> {
+    match metadata(full)? {
+        None => Ok(None),
+        Some(meta) if meta.is_dir() => Err(Error::Io(format!(
+            "{} is a folder; move it out of the way and try again",
+            full.display()
+        ))),
+        Some(meta) if meta.file_type().is_symlink() => {
+            let target = fs::read_link(full)?;
+            Ok(Some((repo.blob(target.as_os_str().as_bytes())?, LINK)))
+        }
+        Some(meta) => {
+            let mode = if meta.mode() & 0o111 != 0 {
+                EXECUTABLE
+            } else {
+                BLOB
+            };
+            Ok(Some((repo.blob(&fs::read(full)?)?, mode)))
+        }
+    }
+}
+
+/// [`capture`] of a repository path.
+pub(crate) fn capture_path(repo: &Repository, path: &[u8]) -> Result<Option<(Oid, u32)>> {
+    capture(repo, &checked_path(workdir(repo)?, path)?)
 }
 
 /// The blob id of the file at `path` as git would store it (hashed through `repo`, so use a
@@ -301,10 +360,20 @@ fn hash(repo: &Repository, full: &Path, meta: Option<&fs::Metadata>) -> Result<O
     }
 }
 
-/// Makes the file at `path` hold `entry` exactly (blob from `repo`), or removes it for `None`.
-/// Used to restore a user's own versions (Undo, Abort), so links are written back as links;
+/// Makes the file at `path` what `git checkout` makes of `entry` (blob from `repo`), or removes it
+/// for `None`. Used where git would check a file out (Abort), so links are written as links;
 /// submodules are left alone.
 pub(crate) fn put(repo: &Repository, path: &[u8], entry: Option<(Oid, u32)>) -> Result<()> {
+    write(repo, path, entry, true)
+}
+
+/// Makes the file at `path` hold exactly the bytes of `entry` (from [`capture`]), or removes it
+/// for `None`: a user's own earlier version comes back byte for byte (Undo, rollback).
+pub(crate) fn restore(repo: &Repository, path: &[u8], entry: Option<(Oid, u32)>) -> Result<()> {
+    write(repo, path, entry, false)
+}
+
+fn write(repo: &Repository, path: &[u8], entry: Option<(Oid, u32)>, checkout: bool) -> Result<()> {
     let workdir = workdir(repo)?;
     let full = checked_path(workdir, path)?;
     match entry {
@@ -312,13 +381,62 @@ pub(crate) fn put(repo: &Repository, path: &[u8], entry: Option<(Oid, u32)>) -> 
         Some((id, mode)) => {
             not_a_folder(&full)?;
             make_parents(workdir, path)?;
-            write_blob(repo, &full, id, mode)
+            let bytes = match checkout {
+                true => checkout_bytes(repo, path, id, mode)?,
+                false => repo.find_blob(id)?.content().to_vec(),
+            };
+            let temp = stage(repo, &full, &bytes, mode)?;
+            fs::rename(&temp, &full)?;
+            Ok(())
         }
         None => match metadata(&full)? {
             Some(meta) if !meta.is_dir() => remove_file(workdir, &full),
             _ => Ok(()),
         },
     }
+}
+
+/// The bytes `git checkout` writes for the blob at `path`: the blob itself, unless an attribute
+/// or `core.autocrlf` filters it, when libgit2 checks it out (into the git directory) to apply
+/// the same filters. A link's bytes are its target.
+fn checkout_bytes(repo: &Repository, path: &[u8], id: Oid, mode: u32) -> Result<Vec<u8>> {
+    let blob = repo.find_blob(id)?;
+    if !regular(mode) || !filtered(repo, path)? {
+        return Ok(blob.content().to_vec());
+    }
+    let dir = repo.path().join(CHECKOUT_DIR);
+    match fs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    fs::create_dir(&dir)?;
+    let result = (|| -> Result<Vec<u8>> {
+        let mut index = Index::new()?;
+        index.add(&entry(path, id, mode))?;
+        let mut checkout = CheckoutBuilder::new();
+        checkout
+            .force()
+            .update_index(false)
+            .target_dir(&dir)
+            .disable_pathspec_match(true)
+            .path(OsStr::from_bytes(path));
+        repo.checkout_index(Some(&mut index), Some(&mut checkout))?;
+        Ok(fs::read(dir.join(OsStr::from_bytes(path)))?)
+    })();
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+/// Whether git might change the bytes of `path` on checkout.
+fn filtered(repo: &Repository, path: &[u8]) -> Result<bool> {
+    let relative = Path::new(OsStr::from_bytes(path));
+    for name in FILTER_ATTRIBUTES {
+        let value = repo.get_attr_bytes(relative, name, AttrCheckFlags::FILE_THEN_INDEX)?;
+        if !matches!(AttrValue::from_bytes(value), AttrValue::Unspecified) {
+            return Ok(true);
+        }
+    }
+    Ok(repo.config()?.get_bool("core.autocrlf").unwrap_or(false))
 }
 
 fn metadata(full: &Path) -> Result<Option<fs::Metadata>> {
@@ -446,18 +564,9 @@ fn no_case_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>) -> Result<()
     Ok(())
 }
 
-/// Atomically replaces `full` with the blob's bytes, exactly as stored (a link's target, for a
-/// link).
-fn write_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<()> {
-    let temp = stage_blob(repo, full, id, mode)?;
-    fs::rename(&temp, full)?;
-    Ok(())
-}
-
-/// Writes the blob for `full` to the temp file in the git directory, synced, ready to be renamed
-/// into place.
-fn stage_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<PathBuf> {
-    let blob = repo.find_blob(id)?;
+/// Writes `bytes` for `full` to the temp file in the git directory, synced, ready to be renamed
+/// into place (a link to `bytes`, for a link).
+fn stage(repo: &Repository, full: &Path, bytes: &[u8], mode: u32) -> Result<PathBuf> {
     let temp = repo.path().join(TEMP_FILE);
     match fs::remove_file(&temp) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
@@ -467,7 +576,7 @@ fn stage_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<Path
         BLOB => 0o666,
         EXECUTABLE => 0o777,
         LINK => {
-            std::os::unix::fs::symlink(OsStr::from_bytes(blob.content()), &temp)?;
+            std::os::unix::fs::symlink(OsStr::from_bytes(bytes), &temp)?;
             return Ok(temp);
         }
         _ => {
@@ -482,7 +591,7 @@ fn stage_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<Path
         .create_new(true)
         .mode(permissions)
         .open(&temp)?;
-    file.write_all(blob.content())?;
+    file.write_all(bytes)?;
     file.sync_all()?;
     Ok(temp)
 }

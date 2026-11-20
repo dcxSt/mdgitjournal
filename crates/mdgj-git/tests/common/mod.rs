@@ -9,8 +9,8 @@ use std::process::{Command, Output};
 
 use git2::{Oid, PushOptions, Repository, RepositoryInitOptions, Sort};
 use mdgj_git::{
-    Author, ChangeKind, CommitPushOutcome, Overlap, PullOutcome, PullPreview, Repo, Resolution,
-    Resolved, SyncSummary,
+    Author, ChangeKind, CommitPushOutcome, MergeChunk, Overlap, PullOutcome, PullPreview, Repo,
+    Resolution, Resolved, SyncSummary,
 };
 use tempfile::TempDir;
 
@@ -387,12 +387,33 @@ pub fn two_devices(files: &[(&str, &str)]) -> (Remote, Device, Device) {
     (remote, a, b)
 }
 
-/// Whether `copy` is `<stem>.from-github-<hhmm><ext>`.
+/// Whether `copy` is `<stem>.from-github-<hh>h<mm><ext>`.
 pub fn is_github_copy(copy: &str, stem: &str, ext: &str) -> bool {
     copy.strip_prefix(stem)
         .and_then(|rest| rest.strip_prefix(".from-github-"))
         .and_then(|rest| rest.strip_suffix(ext))
-        .is_some_and(|hhmm| hhmm.len() == 4 && hhmm.bytes().all(|b| b.is_ascii_digit()))
+        .is_some_and(|stamp| {
+            let b = stamp.as_bytes();
+            b.len() == 5 && b[2] == b'h' && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit())
+        })
+}
+
+/// The base, mine and theirs texts an overlap's suggestion was made from.
+pub fn sides(overlap: &Overlap) -> (String, String, String) {
+    let (mut b, mut m, mut t) = (String::new(), String::new(), String::new());
+    for chunk in &overlap.suggestion.as_ref().expect("a text overlap").chunks {
+        let (base, mine, theirs) = match chunk {
+            MergeChunk::Same { text } => (text, text, text),
+            MergeChunk::Mine { text, base } => (base, text, base),
+            MergeChunk::Theirs { text, base } => (base, base, text),
+            MergeChunk::Both { text, base } => (base, text, text),
+            MergeChunk::Clash { base, mine, theirs } => (base, mine, theirs),
+        };
+        b.push_str(base);
+        m.push_str(mine);
+        t.push_str(theirs);
+    }
+    (b, m, t)
 }
 
 pub fn no_conflict_markers(d: &Device) {

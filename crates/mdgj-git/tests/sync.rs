@@ -130,9 +130,10 @@ fn connect_with_a_file_both_sides_have_differently_opens_a_review() {
     assert_eq!(preview.plan, PullPlan::Merge, "the clash is committed here");
     let shared = overlap(&preview, "shared.md");
     assert_eq!(shared.kind, OverlapKind::BothAdded);
-    assert_eq!(shared.base, None);
-    assert_eq!(shared.mine.as_deref(), Some("b's version\n"));
-    assert_eq!(shared.theirs.as_deref(), Some("a's version\n"));
+    assert_eq!(
+        common::sides(shared),
+        ("".into(), "b's version\n".into(), "a's version\n".into())
+    );
     assert_eq!(preview.overlaps.len(), 1);
     assert_eq!(preview.auto, [change("a.md", ChangeKind::Added)]);
     assert_eq!(preview.local_count, 2);
@@ -806,29 +807,6 @@ fn a_case_only_rename_loses_nothing() {
     b.repo.undo_last_sync().unwrap();
     assert_eq!(b.text("entry.md"), "text\n");
     assert_eq!(b.changes(), []);
-}
-
-#[test]
-fn a_remote_rename_of_a_file_edited_here_asks() {
-    let body = "A long enough entry for rename detection to recognise it.\n".repeat(4);
-    let (old, new) = ("2026-11-16-1402-old.md", "2026-11-16-1402-new.md");
-    let (_remote, a, b) = two_devices(&[(old, &body)]);
-    fs::rename(a.root().join(old), a.root().join(new)).unwrap();
-    commit_and_push(&a, "Rename");
-    let edited = format!("{body}One more line from b.\n");
-    b.write(old, &edited);
-
-    let preview = b.pull_review();
-    let renamed = overlap(&preview, old);
-    assert_eq!(renamed.kind, OverlapKind::ModifiedDeleted);
-    assert_eq!(preview.auto, [change(new, ChangeKind::Added)]);
-    // Keeping mine keeps the edit at the old name, and GitHub's new name arrives too.
-    b.apply(
-        &preview,
-        &[common::resolved(old, mdgj_git::Resolution::Mine)],
-    );
-    assert_eq!(b.text(old), edited);
-    assert_eq!(b.text(new), body);
 }
 
 /// A small PNG with some texture; `seed` changes it.

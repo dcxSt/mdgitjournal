@@ -132,27 +132,30 @@ The app runs `fetch` on launch, when it regains focus, and every 5 minutes (conf
 3. The app fetches immediately before pushing. If something arrived in the meantime, or the push is rejected (a race with another device), nothing is pushed and the Pull button lights up. The commit is already made locally, so nothing is lost.
 
 **Pull, when only one side changed each file** (the usual case: each entry is its own file):
-1. The incoming changes are applied at once. Your uncommitted edits to other files are untouched.
-2. If you also have unpushed commits, they are placed after GitHub's, keeping history a straight line.
+1. The incoming changes are applied at once. Your uncommitted edits to other files are untouched, and so is anything you staged with git.
+2. If you also have unpushed commits, they are placed after GitHub's, keeping history a straight line. When they can't be (your unpushed history contains a merge commit, or one of your commits no longer applies cleanly on top of GitHub's), nothing changes on disk: the Sync review opens with no files to choose, only to confirm the merge commit and its message, because a merge commit is never made without you seeing it.
 3. A summary says what happened: "**3 commits from GitHub**", each with its message, author and time; the files that were added, updated, deleted or renamed; and, if it applies, "Your 2 unpushed commits were placed after the 3 from GitHub."
 4. The summary has **Undo**, which puts back exactly what was there before the pull: the branch and every file the pull touched. If you've edited one of those files since, Undo refuses and says which, rather than overwrite newer text.
 
 **Pull, when a file changed on both sides** (uncommitted or unpushed, even different paragraphs of one entry): **nothing changes on disk.** The **Sync review** opens instead:
+- Renames are followed, as git follows them: an entry retitled on one device (its file renamed) and edited or retitled on the other is one file changed on both sides, never a deletion plus a new file, and never two entries made behind your back.
 - Each file changed on both sides is listed (entries by title and date, other files by path) with a choice:
-  - **Keep mine** — your version stays.
-  - **Keep GitHub's** — GitHub's replaces yours.
-  - **Keep both** — yours stays; GitHub's is saved next to it as `…-title.from-github-hhmm.md`.
-  - **Merge…** — opens the merge view (text files only).
-  - A file deleted on one side and edited on the other offers just **Keep mine** and **Keep GitHub's** (which keeps or deletes it).
+  - **Keep mine** — your version stays, under its name here.
+  - **Keep GitHub's** — GitHub's replaces yours, under GitHub's name.
+  - **Keep both** — yours stays; GitHub's is saved next to it as `…-title.from-github-20h28.md` (the time of GitHub's newest commit; written so it can't be read as a year), or under its own name if it was renamed.
+  - **Merge…** — opens the merge view (text files only). After a rename on one side, the merged entry gets the new name.
+  - A file deleted on one side and edited or renamed on the other offers just **Keep mine** and **Keep GitHub's** (which keeps or deletes it).
 - Below, collapsed, the files that changed on one side only, marked "will apply automatically", and GitHub's commits, so you see the whole picture.
 - A file whose edits don't clash (different paragraphs) starts out set to **Merge**, already prepared; one look and **Apply**. A file with a real clash has no default; Apply stays disabled until you choose.
-- **Apply** writes your choices. If you had unpushed commits that touched those files, it makes a real git merge commit, with the message prefilled ("Merge from GitHub" and what you chose for each file) and editable. Otherwise your resolved files are simply left as uncommitted changes on top of GitHub's commits, as your edits were before.
-- **Cancel** leaves everything exactly as it was.
-- If anything changed since the review opened (another fetch, an edit made elsewhere), Apply writes nothing, says "Something changed since you opened the review", and opens a fresh one.
+- **Apply** writes your choices. If you have unpushed commits, it makes a real git merge commit of your commits and GitHub's (never a rebase of the work you just resolved), with the message prefilled ("Merge from GitHub" and what you chose for each file it records) and editable. The merge commit records **committed work only**: how you resolved files your commits changed. What was uncommitted stays uncommitted, resolved, for your next Commit & Push, where you choose what goes in; the review says which files that is. With no unpushed commits there is nothing to merge: GitHub's commits come in and your resolved files are left as uncommitted changes on top, as your edits were before.
+- **Cancel** leaves everything exactly as it was. Esc or a click outside asks first once you've made a choice or merged by hand.
+- If anything changed since the review opened (another fetch, an edit made elsewhere), Apply writes nothing, says "Something changed since you opened the review", and opens a fresh one, keeping your choices (and merges) for every file that is still the same, and naming the ones you need to look at again.
 
 **The merge view** is one editable document, prefilled with the merge: changes from both sides that don't clash are already in, and highlighted (yours and GitHub's in different tints) so you can check them. Each real clash is a block showing both versions with **Use mine**, **Use GitHub's** and **Use both**. You can also edit freely. **Done** returns to the review. No conflict markers are ever written to your files this way.
 
-**Resolve with git** (in the review) is the escape hatch for people who'd rather use vim, `git mergetool` or the command line. It leaves a standard git merge in progress: conflict markers in the files, `MERGE_HEAD` set. If you have uncommitted edits, you first write a commit message for them, so git can merge them and Abort can restore them exactly. Until the merge is finished, a banner says "Merge in progress — finish it with git", Pull and Commit & Push are disabled, and **Abort merge** puts everything back as it was before the merge. When you finish the merge with git (`git commit`), the app notices and returns to normal.
+**Resolve with git** (in the review, on the desktop) is the escape hatch for people who'd rather use vim, `git mergetool` or the command line. Before starting it says which files will get conflict markers and which git merges on its own. It leaves a standard git merge in progress: conflict markers in the files, `MERGE_HEAD` set. If you have uncommitted edits to files the merge writes, you first write a commit message for them (only those files; other uncommitted files stay as they are), so git can merge them and Abort can restore them exactly. Until the merge is finished, a banner says "Merge in progress — finish it with git", Pull and Commit & Push are disabled, and **Abort merge** puts everything back as it was before the merge. Abort lists the files it puts back, and refuses, discarding nothing, if you've typed into a file git merged since (as `git merge --abort` does); a merge started with `git merge --autostash` gets its set-aside changes back too. When you finish the merge with git (`git commit`), or abort it with `git merge --abort`, the app notices, says which, and returns to normal. The phone has no git to finish a merge with, so it doesn't offer Resolve with git; the merge view covers it there.
+
+Files the app writes from the repository get the bytes `git checkout` would write (your `.gitattributes` line endings and `core.autocrlf` included), and files it puts back (Undo, an Abort, a pull that failed part way) get exactly the bytes they had. A pull the app quit during is put back the next time it opens.
 
 All git work runs on one Rust worker thread, so it never blocks the UI and operations never overlap.
 
@@ -271,7 +274,7 @@ packaging/aur/        PKGBUILD
 
 - **`mdgj-*` crates unit tests:**
   - slug, filename parse/format, rename keeps the timestamp
-  - collision naming, and `.from-github-hhmm` names for Keep both
+  - collision naming, and `.from-github-20h28` names for Keep both
   - image pipeline: output under 200 KB for a 12 MP test photo, EXIF stripped, orientation applied
 - **`mdgj-*` crates integration tests** against local bare repos:
   - init, commit, connect to an empty remote, connect to a non-empty remote
@@ -279,6 +282,7 @@ packaging/aur/        PKGBUILD
   - Commit & Push blocked when behind
   - pull with dirty unrelated files (applied at once), diverged commits (rebased) and Undo
   - files changed on both sides: the review changes nothing until Apply; every choice; the merge view's prefill; a stale review; Resolve with git, Abort, and finishing it with the git CLI
+  - renames on one or both sides, staged files, `.gitattributes` line endings, and a pull the app quit during
   - push rejected after a race
 - **Editor tests:**
   - load → toggle mode N times → save gives byte-identical output (property test, including CRLF and a missing trailing newline)

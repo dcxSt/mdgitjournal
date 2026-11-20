@@ -4,6 +4,7 @@
   import EntryList from "./EntryList.svelte";
   import Icon from "./Icon.svelte";
   import NewEntryPrompt from "./NewEntryPrompt.svelte";
+  import Notices from "./Notices.svelte";
   import SearchField from "./SearchField.svelte";
   import SearchResults from "./SearchResults.svelte";
   import SyncButtons from "./SyncButtons.svelte";
@@ -53,6 +54,8 @@
   <span class="grow"></span>
   <SyncButtons {app} compact />
 </header>
+
+<Notices {app} inline />
 
 <div class="tools">
   <SearchField {app} />

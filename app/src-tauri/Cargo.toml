@@ -29,6 +29,10 @@ serde_json.workspace = true
 tauri = { workspace = true, features = ["protocol-asset"] }
 tauri-plugin-opener.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# SIGTERM/SIGHUP close the windows, so the UI saves first (src/signals.rs); already in the tree.
+libc = "0.2.191"
+
 [dev-dependencies]
 tempfile.workspace = true
 # Only to keep the real keychain out of the GitHub e2e test (tests/github_e2e.rs).

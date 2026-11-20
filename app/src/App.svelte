@@ -61,7 +61,8 @@
   {:else}
     <Desktop {app} />
   {/if}
-  <Notices {app} />
+  <!-- The phone's entry list shows them in its flow, where they don't cover entries. -->
+  {#if !app.mobile || app.current.file !== null}<Notices {app} />{/if}
   {#if app.overlay === "commit"}
     <CommitSheet {app} />
   {:else if app.overlay === "settings"}

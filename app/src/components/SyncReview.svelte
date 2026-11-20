@@ -7,6 +7,7 @@
     choiceLabel,
     defaultPick,
     mergeCounts,
+    overlapName,
     overlapNote,
     type Review,
   } from "../lib/review.svelte";
@@ -18,9 +19,19 @@
   let { app, review }: { app: AppState; review: Review } = $props();
 
   const preview = $derived(review.preview);
-  const changes = $derived(app.sync.changes);
   const remaining = $derived(preview.overlaps.filter((o) => !review.picks[o.path]).length);
-  const gitReady = $derived(!review.busy && (changes.length === 0 || commitMessageValid(review.gitMessage)));
+  /** Resolve with git commits these files' uncommitted changes first, so git can merge them. */
+  const precommit = $derived(preview.gitMerge.uncommitted);
+  const gitReady = $derived(!review.busy && (precommit.length === 0 || commitMessageValid(review.gitMessage)));
+  /** There is no git on the phone to finish a merge with; the merge view covers it there. */
+  const gitOffered = $derived(preview.overlaps.length > 0 && app.info?.platform !== "ios");
+  const conflicted = $derived(new Set(preview.gitMerge.conflicted));
+  const withMarkers = $derived(preview.overlaps.filter((o) => sides(o).some((p) => conflicted.has(p))));
+  const mergedByGit = $derived(preview.overlaps.filter((o) => !withMarkers.includes(o)));
+  /** In a merge, files whose resolution the merge commit doesn't record: they stay changes to commit. */
+  const uncommittedOnly = $derived(preview.plan === "merge" && preview.overlaps.some((o) => !o.committed));
+  /** Esc or a click outside asked to close a review with work in it. */
+  let discarding = $state(false);
 
   const lead = $derived(
     preview.overlaps.length
@@ -35,10 +46,21 @@
         return preview.overlaps.length ? `Apply brings in GitHub's commits; ${later}.` : "Apply brings in GitHub's commits.";
       case "rebase":
         return `Apply places your ${plural(preview.localCount, "unpushed commit")} after GitHub's${preview.overlaps.length ? `; ${later}` : ""}.`;
-      case "merge":
-        return `Your ${plural(preview.localCount, "unpushed commit")} and GitHub's can't be put in a line, so Apply joins them with a merge commit:`;
+      case "merge": {
+        const commits = plural(preview.localCount, "unpushed commit");
+        if (!preview.overlaps.length) return `Your ${commits} and GitHub's can't be put in a line, so Apply joins them with a merge commit:`;
+        const joins = `Apply joins your ${commits} and GitHub's with a merge commit`;
+        const recorded = preview.overlaps.some((o) => o.committed);
+        if (recorded && uncommittedOnly) return `${joins}, which records how you resolved the files your commits changed; the rest stays as changes for your next commit:`;
+        if (recorded) return `${joins}, which records how you resolved them:`;
+        return `${joins}; ${later}:`;
+      }
     }
   });
+
+  function sides(overlap: Overlap): string[] {
+    return [overlap.path, overlap.minePath, overlap.theirsPath].filter((p): p is string => p !== null);
+  }
 
   function choose(overlap: Overlap, choice: Choice) {
     if (review.busy) return;
@@ -46,7 +68,12 @@
     else review.setPick(overlap.path, { choice });
   }
 
-  /** What the file's current choice will do, in words. */
+  /** “Long run” for an entry, the path for any other file. */
+  function title(path: string | null): string {
+    return path === null ? "" : `“${pathLabel(path).title}”`;
+  }
+
+  /** What the file's current choice will do, in words (Keep both has its own line, with the name). */
   function outcome(overlap: Overlap): string {
     const pick = review.picks[overlap.path];
     const counts = overlap.suggestion && mergeCounts(overlap.suggestion.chunks);
@@ -56,26 +83,35 @@
       }
       return "Choose which version to keep.";
     }
+    const later = preview.plan === "merge" && !overlap.committed && pick.choice !== "theirs" ? " It stays as a change for your next commit." : "";
+    const renamed = overlap.kind === "modified_renamed" || overlap.kind === "renamed_modified" || overlap.kind === "both_renamed";
     switch (pick.choice) {
       case "mine":
-        return overlap.kind === "deleted_modified" ? "It stays deleted." : "Your version stays as it is.";
+        if (overlap.kind === "deleted_modified" || overlap.kind === "deleted_renamed") return "It stays deleted.";
+        if (renamed) return `Your version stays as it is, named ${title(overlap.minePath)}.${later}`;
+        return `Your version stays as it is.${later}`;
       case "theirs":
-        if (overlap.kind === "modified_deleted") return "It is deleted, as on GitHub, with your changes to it.";
-        return overlap.kind === "deleted_modified" ? "GitHub's version comes back." : "GitHub's version replaces yours.";
+        if (overlap.kind === "modified_deleted" || overlap.kind === "renamed_deleted") return "It is deleted, as on GitHub, with your changes to it.";
+        if (overlap.kind === "deleted_modified" || overlap.kind === "deleted_renamed") return `GitHub's version comes back, named ${title(overlap.theirsPath)}.`;
+        if (renamed) return `GitHub's version replaces yours, named ${title(overlap.theirsPath)}.`;
+        return "GitHub's version replaces yours.";
       case "both":
-        return `Yours stays; GitHub's is saved next to it as ${overlap.copy}.`;
+        return "";
       case "merged": {
+        const name = renamed ? ` Saved as ${title(overlap.path)}.` : "";
         const prefilled = defaultPick(overlap);
-        if (!counts || prefilled?.choice !== "merged" || prefilled.text !== pick.text) return "Merged in the merge view.";
+        if (!counts || prefilled?.choice !== "merged" || prefilled.text !== pick.text) return `Merged in the merge view.${name}${later}`;
         const parts = [counts.mine && `${plural(counts.mine, "change")} of yours`, counts.theirs && `${plural(counts.theirs, "change")} from GitHub`];
-        return `Merged: ${parts.filter(Boolean).join(" and ") || "the same changes on both sides"}, no clashes.`;
+        return `Merged: ${parts.filter(Boolean).join(" and ") || "the same changes on both sides"}, no clashes.${name}${later}`;
       }
     }
   }
 
+  /** Esc or a click outside: a review with choices in it asks first, as the merge view keeps edits. */
   function close() {
     if (review.busy) return;
     if (review.resolveWithGit) review.resolveWithGit = false;
+    else if (review.dirty) discarding = !discarding;
     else app.cancelReview();
   }
 
@@ -139,9 +175,12 @@
           <ul class="files">
             {#each preview.overlaps as overlap (overlap.path)}
               {@const pick = review.picks[overlap.path]}
-              {@const label = pathLabel(overlap.path)}
+              {@const label = pathLabel(overlapName(overlap))}
               <li class="file" class:open={!pick}>
-                <div class="name">{@render fileName(overlap.path)}</div>
+                <div class="name">
+                  {@render fileName(overlapName(overlap))}
+                  {#if review.reset.includes(overlap.path)}<span class="changed">new or changed</span>{/if}
+                </div>
                 <p class="note">{overlapNote(overlap)}</p>
                 <div class="choices" role="group" aria-label={`What to keep of ${label.title}`}>
                   {#each overlap.choices as choice (choice)}
@@ -159,7 +198,9 @@
                   {/each}
                 </div>
                 <p class="outcome" class:waiting={!pick}>
-                  {#if pick?.choice === "both"}
+                  {#if pick?.choice === "both" && overlap.copy === overlap.theirsPath}
+                    Yours stays; GitHub's is kept too, under its own name <code>{overlap.copy}</code>.
+                  {:else if pick?.choice === "both"}
                     Yours stays; GitHub's is saved next to it as <code>{overlap.copy}</code>.
                   {:else}
                     {outcome(overlap)}
@@ -203,9 +244,18 @@
       {/if}
 
       {#if review.error}<p class="error" role="alert">{review.error}</p>{/if}
+      {#if discarding}
+        <div class="discard" role="alertdialog" aria-label="Discard your choices?">
+          <p>Discard your choices for this pull? Nothing has been written; Pull opens the review again.</p>
+          <button type="button" class="button" data-autofocus {@attach (node) => node.focus()} onclick={() => (discarding = false)}>
+            Keep reviewing
+          </button>
+          <button type="button" class="button" onclick={() => app.cancelReview()}>Discard</button>
+        </div>
+      {/if}
 
       <div class="actions">
-        {#if preview.overlaps.length}
+        {#if gitOffered}
           <button type="button" class="link git" disabled={review.busy} onclick={() => (review.resolveWithGit = true)}>
             Resolve with git…
           </button>
@@ -227,17 +277,28 @@
     {:else}
       <p>
         This starts a standard git merge, as <code>git merge origin/{preview.branch}</code> does, and leaves it for you to
-        finish with your editor, <code>git mergetool</code> or the command line. In these files, git writes conflict markers
-        (<code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>) where the changes clash:
+        finish with your editor, <code>git mergetool</code> or the command line.
       </p>
-      <ul class="paths">
-        {#each preview.overlaps as overlap (overlap.path)}<li class="mono">{overlap.path}</li>{/each}
-      </ul>
-      {#if changes.length}
+      {#if withMarkers.length}
+        <p>git writes conflict markers (<code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>) where the changes clash, in:</p>
+        <ul class="paths">
+          {#each withMarkers as overlap (overlap.path)}<li class="mono">{overlapName(overlap)}</li>{/each}
+        </ul>
+      {/if}
+      {#if mergedByGit.length}
+        <p>git merges {mergedByGit.length === 1 ? "this file" : "these files"} on its own, without markers:</p>
+        <ul class="paths">
+          {#each mergedByGit as overlap (overlap.path)}<li class="mono">{overlapName(overlap)}</li>{/each}
+        </ul>
+      {/if}
+      {#if precommit.length}
         <p>
-          First, your uncommitted changes to {plural(changes.length, "file")} are committed, so git can merge them. Abort
-          merge makes them uncommitted again.
+          First, your uncommitted changes to {precommit.length === 1 ? "this file are" : "these files are"} committed, so git
+          can merge them (other files stay as they are). Abort merge makes them uncommitted again.
         </p>
+        <ul class="paths">
+          {#each precommit as path (path)}<li class="mono">{path}</li>{/each}
+        </ul>
         <textarea
           data-autofocus
           {@attach (node) => node.focus()}
@@ -256,9 +317,9 @@
         <button
           type="button"
           class="button primary"
-          data-autofocus={changes.length ? undefined : true}
+          data-autofocus={precommit.length ? undefined : true}
           {@attach (node) => {
-            if (!changes.length) node.focus();
+            if (!precommit.length) node.focus();
           }}
           disabled={!gitReady}
           onclick={() => app.resolveWithGit()}
@@ -308,6 +369,25 @@
     height: 28px;
     padding: 0;
     color: var(--color-muted);
+  }
+
+  .changed {
+    margin-left: 6px;
+    font-size: 11px;
+    color: var(--color-accent);
+  }
+
+  .discard {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-left: 2px solid var(--color-danger);
+  }
+
+  .discard p {
+    flex: 1 1 16em;
   }
 
   .notice {

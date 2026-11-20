@@ -1,13 +1,14 @@
-<!-- Banners (needs-pull, a pull's summary, a merge in progress, errors) and short toasts. -->
+<!-- Banners (needs-pull, a pull's summary, a merge in progress, errors) and short toasts. Over
+     the window, or `inline` in the phone's entry list, so they push it down instead of covering it. -->
 <script lang="ts">
   import type { AppState } from "../lib/app.svelte";
   import Icon from "./Icon.svelte";
 
-  let { app }: { app: AppState } = $props();
+  let { app, inline = false }: { app: AppState; inline?: boolean } = $props();
 </script>
 
 {#if app.notices.list.length}
-  <div class="notices" class:mobile={app.mobile}>
+  <div class="notices" class:mobile={app.mobile} class:inline>
     {#each app.notices.list as notice (notice.id)}
       <div class="notice" class:error={notice.tone === "error"} role={notice.tone === "error" ? "alert" : "status"}>
         <div class="text">
@@ -64,6 +65,13 @@
   .notices.mobile {
     bottom: auto;
     top: calc(52px + env(safe-area-inset-top));
+  }
+
+  .notices.inline {
+    position: static;
+    width: auto;
+    margin: 4px max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
+    transform: none;
   }
 
   .notice {

@@ -19,10 +19,10 @@ mod worktree;
 pub use diff::{DiffHunk, DiffLine, FileDiff, LineKind};
 pub use diff3::{MergeChunk, MergeSuggestion};
 pub use error::{Error, Result};
-pub use external::MergeState;
+pub use external::{Aborted, MergeState};
 pub use pull::{
-    Choice, CommitInfo, Overlap, OverlapKind, PullOutcome, PullPlan, PullPreview, Resolution,
-    Resolved, ResolvedFile, SyncSummary,
+    Choice, CommitInfo, GitMerge, Overlap, OverlapKind, PullOutcome, PullPlan, PullPreview,
+    Resolution, Resolved, ResolvedFile, SyncSummary,
 };
 pub use repo::{Author, ChangeKind, FileChange, Repo, SyncState};
 pub use sync::{CommitPushOutcome, Creds, PushOutcome};

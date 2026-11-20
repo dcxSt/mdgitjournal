@@ -9,6 +9,7 @@
 //   mdgjMock.editOnDisk("2026-11-14-2130-ideas.md", "# Ideas\n\nTyped in vim.\n")      // as another program
 //   mdgjMock.seedOverlaps()   // after connecting: one entry that merges cleanly, one that clashes
 //   mdgjMock.finishMergeWithGit()                                                     // `git commit` in a terminal
+//   mdgjMock.abortMergeWithGit()                                                      // `git merge --abort` in one
 
 import { ApiError, onVisible, type Api, type Unlisten } from "./api";
 import { DEFAULT_SETTINGS, SIGNED_OUT } from "./defaults";
@@ -59,6 +60,8 @@ export interface MockControls {
   editOnDisk(file: string, content: string | null): void;
   /** As `git add -A && git commit` in a terminal: finishes the merge in progress and clears `merge`. */
   finishMergeWithGit(): void;
+  /** As `git merge --abort` in a terminal: the files go back, a commit Resolve with git made stays. */
+  abortMergeWithGit(): void;
   /** Makes the next call of `method` fail with this error. */
   failNext(method: keyof Api, kind: ErrorKind, message: string): void;
   /**
@@ -137,6 +140,8 @@ interface MergeRecord {
   mergeHead: string;
   /** Paths the merge changed in the working tree, with HEAD's version (undefined = absent). */
   touched: Map<string, string | undefined>;
+  /** What the merge wrote at each touched path, to tell whether it was edited since. */
+  wrote: Map<string, string | undefined>;
   conflicted: string[];
   startedByApp: boolean;
 }
@@ -150,8 +155,13 @@ interface Analysis {
   local: Tree;
   theirs: Tree;
   remoteChanged: Set<string>;
-  overlapPaths: Set<string>;
+  /** Every path an overlap decides, by overlap path (its base, mine and theirs paths). */
+  paths: Map<string, string[]>;
+  covered: Set<string>;
 }
+
+const RENAMED: OverlapKind[] = ["modified_renamed", "renamed_modified", "both_renamed"];
+const WITH_DELETION: OverlapKind[] = ["modified_deleted", "deleted_modified", "renamed_deleted", "deleted_renamed"];
 
 /** What changed from `before` to `after`, renames detected by identical content. */
 function diffTrees(before: Tree, after: Tree): FileChange[] {
@@ -174,6 +184,39 @@ function diffTrees(before: Tree, after: Tree): FileChange[] {
 function setOrDelete(tree: Tree, path: string, content: string | undefined): void {
   if (content === undefined) tree.delete(path);
   else tree.set(path, content);
+}
+
+/** Base paths renamed from `before` to `after` (identical content, as `diffTrees` pairs them). */
+function renames(before: Tree, after: Tree): Map<string, string> {
+  return new Map(diffTrees(before, after).flatMap((c) => (c.oldPath ? [[c.oldPath, c.path] as const] : [])));
+}
+
+/**
+ * `git merge`'s result over three trees: per path, the merged content (markers where changes
+ * clash) and which paths conflict.
+ */
+function mergeTrees(base: Tree, ours: Tree, theirs: Tree, label: string): { result: Map<string, string | undefined>; conflicted: string[] } {
+  const result = new Map<string, string | undefined>();
+  const conflicted: string[] = [];
+  for (const p of new Set([...base.keys(), ...ours.keys(), ...theirs.keys()])) {
+    const [b, o, t] = [base.get(p), ours.get(p), theirs.get(p)];
+    if (o === t || b === t) continue;
+    let merged: string | undefined = t;
+    if (b !== o) {
+      if (o !== undefined && t !== undefined && !isBinary(p, b, o, t)) {
+        const chunks = diff3(b ?? "", o, t);
+        const clean = cleanMerge(chunks);
+        if (clean === null) conflicted.push(p);
+        merged = clean ?? withConflictMarkers(chunks, label);
+      } else {
+        // Modify/delete, or a binary file: git keeps what is there and marks it conflicted.
+        conflicted.push(p);
+        merged = o ?? t;
+      }
+    }
+    result.set(p, merged);
+  }
+  return { result, conflicted: conflicted.sort() };
 }
 
 function sameTree(a: Tree, b: Tree): boolean {
@@ -291,7 +334,15 @@ export function createMockApi(options: MockOptions = {}): MockApi {
   }
 
   function mergeState(): MergeState | null {
-    return merge && { conflicted: [...merge.conflicted], startedByApp: merge.startedByApp };
+    if (!merge) return null;
+    const conflicted = new Set(merge.conflicted);
+    return {
+      conflicted: [...merge.conflicted],
+      merged: [...merge.touched.keys()].filter((p) => !conflicted.has(p)).sort(),
+      startedByApp: merge.startedByApp,
+      precommit: merge.precommit !== null,
+      autostash: false,
+    };
   }
 
   function view(): SyncView {
@@ -375,7 +426,7 @@ export function createMockApi(options: MockOptions = {}): MockApi {
     lastFetch = now().getTime();
   }
 
-  /** `<dir>/<stem>.from-github-<hhmm><ext>`, then -2, -3 … until free in W, R and the other copies. */
+  /** `<dir>/<stem>.from-github-<hh>h<mm><ext>`, then -2, -3 … until free in W, R and the other copies. */
   function copyName(path: string, at: number, taken: (name: string) => boolean): string {
     const slash = path.lastIndexOf("/");
     const dir = path.slice(0, slash + 1);
@@ -383,7 +434,7 @@ export function createMockApi(options: MockOptions = {}): MockApi {
     const dot = name.lastIndexOf(".");
     const [stem, ext] = dot > 0 ? [name.slice(0, dot), name.slice(dot)] : [name, ""];
     const d = new Date(at);
-    const base = `${dir}${stem}.from-github-${pad(d.getHours())}${pad(d.getMinutes())}`;
+    const base = `${dir}${stem}.from-github-${pad(d.getHours())}h${pad(d.getMinutes())}`;
     let copy = `${base}${ext}`;
     for (let n = 2; taken(copy); n++) copy = `${base}-${n}${ext}`;
     return copy;
@@ -406,59 +457,111 @@ export function createMockApi(options: MockOptions = {}): MockApi {
     const base = treeOf(baseId);
     const local = treeOf(headId);
     const theirs = treeOf(remote);
-    const paths = new Set([...base.keys(), ...local.keys(), ...theirs.keys(), ...files.keys()]);
+    const work = files;
     const diverged = headId !== null && !ancestors(remote).has(headId);
 
     const remoteChanged = new Set<string>();
-    const overlapPaths = new Set<string>();
     const committedOverlap: string[] = [];
-    for (const p of paths) {
-      const [b, l, r, w] = [base.get(p), local.get(p), theirs.get(p), files.get(p)];
+    for (const p of new Set([...base.keys(), ...local.keys(), ...theirs.keys()])) {
+      const [b, l, r] = [base.get(p), local.get(p), theirs.get(p)];
       if (b !== r) remoteChanged.add(p);
-      if (b !== r && b !== w && w !== r) overlapPaths.add(p);
       if (diverged && b !== l && b !== r && l !== r) committedOverlap.push(p);
     }
 
-    const localCommits = only(headId, remote);
-    const plan: PullPlan = !diverged
-      ? "fast_forward"
-      : committedOverlap.length || localCommits.some((c) => c.parents.length > 1)
-        ? "merge"
-        : "rebase";
-
-    const incoming = only(remote, headId);
     const at = commits.get(remote)!.time;
-    const target = new Map(files);
-    for (const p of remoteChanged) if (!overlapPaths.has(p)) setOrDelete(target, p, theirs.get(p));
-    const auto = diffTrees(files, target);
-
     const copies = new Set<string>();
-    const overlaps: Overlap[] = [...overlapPaths].sort().map((path) => {
-      const [b, r, w] = [base.get(path), theirs.get(path), files.get(path)];
-      const kind: OverlapKind =
-        b === undefined ? "both_added" : r === undefined ? "modified_deleted" : w === undefined ? "deleted_modified" : "both_modified";
-      const binary = isBinary(path, b, r, w);
-      const bothSides = kind === "both_modified" || kind === "both_added";
-      const choices: Choice[] = !bothSides ? ["mine", "theirs"] : binary ? ["mine", "theirs", "both"] : ["mine", "theirs", "both", "merged"];
+    const taken = (name: string) => files.has(name) || theirs.has(name) || base.has(name) || local.has(name) || copies.has(name);
+    const found: { overlap: Overlap; paths: string[] }[] = [];
+    const describe = (kind: OverlapKind, path: string, basePath: string | null, minePath: string | null, theirsPath: string | null) => {
+      const get = (tree: Tree, at: string | null) => (at === null ? undefined : tree.get(at));
+      const [b, w, r] = [get(base, basePath), get(work, minePath), get(theirs, theirsPath)];
+      const binary = isBinary(path, b, w, r);
+      const choices: Choice[] = WITH_DELETION.includes(kind)
+        ? ["mine", "theirs"]
+        : binary
+          ? ["mine", "theirs", "both"]
+          : ["mine", "theirs", "both", "merged"];
       let copy: string | null = null;
-      if (bothSides) {
-        copy = copyName(path, at, (name) => files.has(name) || theirs.has(name) || copies.has(name));
-        copies.add(copy);
+      if (choices.includes("both")) {
+        copy = RENAMED.includes(kind) ? theirsPath : copyName(path, at, taken);
+        copies.add(copy!);
       }
-      const text = (content: string | undefined) => (binary ? null : (content ?? null));
-      const chunks = choices.includes("merged") ? diff3(b ?? "", w!, r!) : null;
-      return {
+      const chunks = choices.includes("merged") ? diff3(b ?? "", w ?? "", r ?? "") : null;
+      const overlap: Overlap = {
         path,
         kind,
         binary,
-        base: text(b),
-        mine: text(w),
-        theirs: text(r),
+        minePath,
+        theirsPath,
+        committed: false,
+        versions: [b, w, r].map((c) => (c === undefined ? "0" : hash(c))).join(":"),
         choices,
         copy,
         suggestion: chunks && { clean: chunks.every((c) => c.kind !== "clash"), chunks },
       };
-    });
+      const paths = [...new Set([basePath, minePath, theirsPath].filter((p): p is string => p !== null))].sort();
+      found.push({ overlap, paths });
+    };
+
+    // Renamed on one side and changed on the other, or renamed differently on both.
+    const mineRenames = renames(base, work);
+    const theirRenames = renames(base, theirs);
+    for (const from of [...new Set([...mineRenames.keys(), ...theirRenames.keys()])].sort()) {
+      const [mineTo, theirTo] = [mineRenames.get(from), theirRenames.get(from)];
+      const mine = mineTo ?? (work.has(from) ? from : null);
+      const gh = theirTo ?? (theirs.has(from) ? from : null);
+      if ((mineTo && theirs.has(mineTo) && gh !== mineTo) || (theirTo && work.has(theirTo) && mine !== theirTo)) continue;
+      const [b, w, r] = [base.get(from), mine === null ? undefined : work.get(mine), gh === null ? undefined : theirs.get(gh)];
+      const changedHere = mine !== from || w !== b;
+      const changedThere = gh !== from || r !== b;
+      if (!changedHere || !changedThere || (mine === gh && w === r)) continue;
+      if (mine !== null && gh !== null) {
+        if (mine === gh) describe("both_modified", mine, from, mine, gh);
+        else if (mine === from) describe("modified_renamed", gh, from, mine, gh);
+        else if (gh === from) describe("renamed_modified", mine, from, mine, gh);
+        else describe("both_renamed", mine, from, mine, gh);
+      } else if (mine !== null) describe("renamed_deleted", mine, from, mine, null);
+      else if (gh !== null) describe("deleted_renamed", gh, from, null, gh);
+    }
+    const covered = new Set(found.flatMap((f) => f.paths));
+    // Every other file, path by path.
+    for (const p of [...remoteChanged].sort()) {
+      if (covered.has(p)) continue;
+      const [b, w, r] = [base.get(p), work.get(p), theirs.get(p)];
+      if (b === w || w === r) continue;
+      const kind: OverlapKind =
+        b === undefined ? "both_added" : r === undefined ? "modified_deleted" : w === undefined ? "deleted_modified" : "both_modified";
+      describe(kind, p, b === undefined ? null : p, w === undefined ? null : p, r === undefined ? null : p);
+    }
+    for (const f of found) for (const p of f.paths) covered.add(p);
+    found.sort((a, b) => a.overlap.path.localeCompare(b.overlap.path));
+
+    const localCommits = only(headId, remote);
+    const plan: PullPlan = !diverged
+      ? "fast_forward"
+      : found.length || committedOverlap.length || localCommits.some((c) => c.parents.length > 1)
+        ? "merge"
+        : "rebase";
+    if (plan === "merge") {
+      for (const { overlap, paths } of found) {
+        const side = (tree: Tree) => paths.map((p) => tree.get(p) ?? "\0absent").join("\0\0");
+        overlap.committed = side(local) !== side(base) && side(local) !== side(theirs);
+      }
+    }
+
+    const incoming = only(remote, headId);
+    const target = new Map(files);
+    for (const p of remoteChanged) if (!covered.has(p)) setOrDelete(target, p, theirs.get(p));
+    const auto = diffTrees(files, target);
+    const overlaps = found.map((f) => f.overlap);
+
+    // Resolve with git: the uncommitted changes the merge writes over are committed first.
+    const touches = (p: string | null | undefined) => p != null && (remoteChanged.has(p) || covered.has(p));
+    const over = changes().filter((c) => touches(c.path) || touches(c.oldPath));
+    const ours = withChanges(local, over);
+    const gitMerge = overlaps.length
+      ? { conflicted: mergeTrees(base, ours, theirs, `origin/${BRANCH}`).conflicted, uncommitted: over.map((c) => c.path) }
+      : { conflicted: [], uncommitted: [] };
 
     return {
       preview: {
@@ -472,6 +575,7 @@ export function createMockApi(options: MockOptions = {}): MockApi {
         localCount: localCommits.length,
         auto,
         overlaps,
+        gitMerge,
       },
       head: headId,
       remote,
@@ -479,8 +583,19 @@ export function createMockApi(options: MockOptions = {}): MockApi {
       local,
       theirs,
       remoteChanged,
-      overlapPaths,
+      paths: new Map(found.map((f) => [f.overlap.path, f.paths])),
+      covered,
     };
+  }
+
+  /** `tree` with these working-tree changes applied. */
+  function withChanges(tree: Tree, selected: FileChange[]): Tree {
+    const result = new Map(tree);
+    for (const c of selected) {
+      if (c.oldPath) result.delete(c.oldPath);
+      setOrDelete(result, c.path, files.get(c.path));
+    }
+    return result;
   }
 
   /** The same analysis as the review with this id, or `stale_review`. */
@@ -504,21 +619,22 @@ export function createMockApi(options: MockOptions = {}): MockApi {
       if (!o.choices.includes(r.choice)) throw new ApiError("invalid", `${o.path} can't be resolved with “${r.choice}”.`);
       if (r.choice === "merged" && typeof r.text !== "string") throw new ApiError("invalid", `The merged text of ${o.path} is missing.`);
     }
-    const extra = resolutions.find((r) => !analysis.overlapPaths.has(r.path));
+    const extra = resolutions.find((r) => !analysis.paths.has(r.path));
     if (extra) throw new ApiError("invalid", `${extra.path} didn't change on both sides.`);
     if (preview.plan === "merge") requireMessage(message);
 
     // T: the working tree the pull leaves.
     const target = new Map(files);
-    for (const p of analysis.remoteChanged) if (!analysis.overlapPaths.has(p)) setOrDelete(target, p, theirs.get(p));
-    const copies = new Map<string, string>();
+    for (const p of analysis.remoteChanged) if (!analysis.covered.has(p)) setOrDelete(target, p, theirs.get(p));
     for (const o of preview.overlaps) {
       const r = byPath.get(o.path)!;
-      if (r.choice === "theirs") setOrDelete(target, o.path, theirs.get(o.path));
-      else if (r.choice === "both") {
-        copies.set(o.copy!, o.path);
-        target.set(o.copy!, theirs.get(o.path)!);
-      } else if (r.choice === "merged") target.set(o.path, r.text);
+      const paths = analysis.paths.get(o.path)!;
+      if (r.choice === "theirs") for (const p of paths) setOrDelete(target, p, theirs.get(p));
+      else if (r.choice === "both") target.set(o.copy!, theirs.get(o.theirsPath!)!);
+      else if (r.choice === "merged") {
+        for (const p of paths) target.delete(p);
+        target.set(o.path, r.text);
+      }
     }
 
     // N: the new head.
@@ -543,13 +659,31 @@ export function createMockApi(options: MockOptions = {}): MockApi {
         rebased++;
       }
     } else {
+      // What each side committed; resolutions of uncommitted edits stay uncommitted.
       const tree: Tree = new Map();
-      const paths = new Set([...base.keys(), ...local.keys(), ...theirs.keys()]);
-      for (const p of paths) {
+      for (const p of new Set([...base.keys(), ...local.keys(), ...theirs.keys()])) {
+        if (analysis.covered.has(p)) continue;
         const [b, l, r] = [base.get(p), local.get(p), theirs.get(p)];
         setOrDelete(tree, p, l === b ? r : r === b || l === r ? l : target.get(p));
       }
-      for (const [copy] of copies) tree.set(copy, target.get(copy)!);
+      for (const o of preview.overlaps) {
+        const paths = analysis.paths.get(o.path)!;
+        const r = byPath.get(o.path)!;
+        const take = (from: Tree) => paths.forEach((p) => setOrDelete(tree, p, from.get(p)));
+        if (!o.committed) take(paths.every((p) => local.get(p) === base.get(p)) ? theirs : local);
+        else if (r.choice === "mine") take(local);
+        else if (r.choice === "theirs") take(theirs);
+        else if (r.choice === "both") {
+          take(local);
+          tree.set(o.copy!, theirs.get(o.theirsPath!)!);
+        } else if (r.choice === "merged") {
+          paths.forEach((p) => tree.delete(p));
+          const [w, l] = [files.get(o.minePath ?? ""), local.get(o.minePath ?? "")];
+          // The merge without the uncommitted edits it was made from, where they don't touch it.
+          const committed = w !== undefined && l !== undefined && w !== l ? cleanMerge(diff3(w, l, r.text)) : null;
+          tree.set(o.path, committed ?? r.text);
+        }
+      }
       newHead = makeCommit([head!, remote], tree, message!.trim(), authorName());
       mergeCommit = newHead;
     }
@@ -564,7 +698,7 @@ export function createMockApi(options: MockOptions = {}): MockApi {
       files: diffTrees(files, target),
       resolved: preview.overlaps.map((o) => {
         const choice = byPath.get(o.path)!.choice;
-        return { path: o.path, choice, copy: choice === "both" ? o.copy : null };
+        return { path: o.path, kind: o.kind, choice, copy: choice === "both" ? o.copy : null };
       }),
     };
     const touched = new Map<string, { before: string | undefined; after: string | undefined }>();
@@ -617,31 +751,16 @@ export function createMockApi(options: MockOptions = {}): MockApi {
   function startMerge(remote: string): MergeRecord {
     const base = treeOf(mergeBase(headId, remote));
     const ours = treeOf(headId);
-    const theirs = treeOf(remote);
+    const { result, conflicted } = mergeTrees(base, ours, treeOf(remote), `origin/${BRANCH}`);
     const touched = new Map<string, string | undefined>();
-    const conflicted: string[] = [];
-    for (const p of new Set([...base.keys(), ...ours.keys(), ...theirs.keys()])) {
-      const [b, o, t] = [base.get(p), ours.get(p), theirs.get(p)];
-      if (o === t || b === t) continue;
-      let result: string | undefined = t;
-      if (b !== o) {
-        if (o !== undefined && t !== undefined && !isBinary(p, b, o, t)) {
-          const chunks = diff3(b ?? "", o, t);
-          const clean = cleanMerge(chunks);
-          if (clean === null) conflicted.push(p);
-          result = clean ?? withConflictMarkers(chunks, `origin/${BRANCH}`);
-        } else {
-          // Modify/delete, or a binary file: git keeps what is there and marks it conflicted.
-          conflicted.push(p);
-          result = o ?? t;
-        }
-      }
-      if (files.get(p) !== result) {
-        touched.set(p, o);
-        write(p, result);
-      }
+    const wrote = new Map<string, string | undefined>();
+    for (const [p, merged] of result) {
+      if (files.get(p) === merged) continue;
+      touched.set(p, ours.get(p));
+      wrote.set(p, merged);
+      write(p, merged);
     }
-    return { head: headId, precommit: null, mergeHead: remote, touched, conflicted: conflicted.sort(), startedByApp: true };
+    return { head: headId, precommit: null, mergeHead: remote, touched, wrote, conflicted, startedByApp: true };
   }
 
   const api: MockApi = {
@@ -802,9 +921,14 @@ export function createMockApi(options: MockOptions = {}): MockApi {
       const analysis = fresh(id);
       const head = headId;
       let precommit: string | null = null;
-      if (changes().length) {
+      // Only the uncommitted changes git merges over; other files stay uncommitted.
+      const over = new Set(analysis.preview.gitMerge.uncommitted);
+      const selected = changes().filter((c) => over.has(c.path));
+      if (selected.length) {
         requireMessage(message);
-        precommit = headId = makeCommit(head ? [head] : [], files, message!.trim(), authorName());
+        precommit = headId = makeCommit(head ? [head] : [], withChanges(treeOf(head), selected), message!.trim(), authorName());
+      } else if (analysis.preview.plan === "fast_forward") {
+        throw new ApiError("invalid", "There is nothing to merge: Pull brings in GitHub's commits as they are.");
       }
       merge = { ...startMerge(analysis.remote), head, precommit };
       undo = null;
@@ -815,6 +939,14 @@ export function createMockApi(options: MockOptions = {}): MockApi {
     async abortMerge() {
       await step("abortMerge");
       if (!merge) throw new ApiError("invalid", "No merge is in progress.");
+      const conflicted = new Set(merge.conflicted);
+      const edited = [...merge.wrote].filter(([p, wrote]) => !conflicted.has(p) && files.get(p) !== wrote).map(([p]) => `“${p}”`);
+      if (edited.length) {
+        throw new ApiError(
+          "invalid",
+          `${edited.join(" and ")} changed after the merge started, and Abort would discard that. Copy the text somewhere safe or finish the merge with git, then abort again.`,
+        );
+      }
       const restored = [...merge.touched.keys()].sort();
       for (const [p, content] of merge.touched) write(p, content);
       // Resolve with git committed the uncommitted edits first: they are uncommitted again.
@@ -822,7 +954,7 @@ export function createMockApi(options: MockOptions = {}): MockApi {
       merge = null;
       const v = emitState();
       if (restored.length) entriesChanged();
-      return { view: v, restored };
+      return { view: v, restored, stashed: false };
     },
     async commit(message, paths) {
       await step("commit");
@@ -992,6 +1124,11 @@ export function createMockApi(options: MockOptions = {}): MockApi {
         if (!merge) throw new Error("mock: no merge is in progress");
         const message = `Merge remote-tracking branch 'origin/${BRANCH}'`;
         headId = makeCommit(headId ? [headId, merge.mergeHead] : [merge.mergeHead], files, message, authorName());
+        merge = null;
+      },
+      abortMergeWithGit() {
+        if (!merge) throw new Error("mock: no merge is in progress");
+        for (const [p, content] of merge.touched) write(p, content);
         merge = null;
       },
       failNext(method, kind, message) {

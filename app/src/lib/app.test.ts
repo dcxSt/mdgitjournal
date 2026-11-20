@@ -3,11 +3,20 @@ import { AppState, MERGE_POLL_MS, MERGE_TEXT, NEEDS_PULL_TEXT, STALE_TEXT, mobil
 import { AUTOSAVE_MS } from "./entry.svelte";
 import { createMockApi, type MockApi } from "./mock";
 import { commitButton, pullButton } from "./sync";
+import type { Overlap } from "./types";
+
+/** GitHub's text of an overlap, put back together from its suggestion's chunks. */
+function theirsOf(overlap: Overlap): string {
+  return overlap
+    .suggestion!.chunks.map((c) => (c.kind === "same" ? c.text : c.kind === "clash" ? c.theirs : c.kind === "mine" ? c.base : c.text))
+    .join("");
+}
 
 const RUN = "2026-11-16-1402-morning-run.md";
 const IDEAS = "2026-11-14-2130-ideas.md";
 const LIST = "2026-10-28-0815-reading-list.md";
 const NOTES = "notes.md";
+const DAWN = "2026-11-16-0630-dawn.md";
 
 const apps: AppState[] = [];
 
@@ -356,8 +365,8 @@ describe("sync review", () => {
       review.setPick(clash, { choice });
       await app.applyReview();
       expect(app.overlay).toBeNull();
-      expect(api.mock.files.get(clash)).toBe(choice === "theirs" ? overlap.theirs : mine);
-      if (choice === "both") expect(api.mock.files.get(overlap.copy!)).toBe(overlap.theirs);
+      expect(api.mock.files.get(clash)).toBe(choice === "theirs" ? theirsOf(overlap) : mine);
+      if (choice === "both") expect(api.mock.files.get(overlap.copy!)).toBe(theirsOf(overlap));
       expect(api.mock.files.get(clean)).toBe(merged);
       expect(merged).toContain("Six miles");
       expect(merged).toContain("- [x] new shoes");
@@ -390,12 +399,14 @@ describe("sync review", () => {
     expect(app.review!.picks[clash]).toBeNull();
   });
 
-  it("a stale review writes nothing and is replaced by a fresh one", async () => {
+  it("a stale review writes nothing and is replaced by a fresh one, keeping choices that still hold", async () => {
     const { api, app } = await start({ connected: true });
-    const { clash } = await overlapping(api, app);
+    const { clean, clash } = await overlapping(api, app);
     await app.pull();
     const first = app.review!;
-    first.setPick(clash, { choice: "mine" });
+    app.openMerge(clash);
+    app.closeMerge({ text: "My careful hand-merged paragraph\n", snapshot: { json: { doc: 1 } } });
+    // An edit to a file the review isn't about: the choices still hold.
     api.mock.editOnDisk(NOTES, "Edited in vim meanwhile.\n");
     const before = new Map(api.mock.files);
     await app.applyReview();
@@ -403,9 +414,19 @@ describe("sync review", () => {
     expect(api.mock.calls).toContain("pullPreview");
     expect(app.overlay).toBe("review");
     expect(app.review).not.toBe(first);
-    expect(app.review!.notice).toBe(STALE_TEXT);
-    expect(app.review!.picks[clash]).toBeNull();
+    expect(app.review!.notice).toBe(`${STALE_TEXT} Your choices are kept.`);
+    expect(app.review!.picks[clash]).toEqual({ choice: "merged", text: "My careful hand-merged paragraph\n" });
+    expect(app.review!.snapshot(clash)).toEqual({ json: { doc: 1 } });
     expect(app.lastError).toBeNull();
+
+    // An edit to the clashing file itself: only its choice starts afresh, and the banner says so.
+    const second = app.review!;
+    api.mock.editOnDisk(clash, "typed in vim\n");
+    await app.applyReview();
+    expect(app.review).not.toBe(second);
+    expect(app.review!.notice).toMatch(/^Something changed since you opened the review\. “reading-list” is new or changed: check it\. Your other choices are kept\.$/);
+    expect(app.review!.picks[clash]).toBeNull();
+    expect(app.review!.picks[clean]).not.toBeNull();
 
     app.review!.setPick(clash, { choice: "theirs" });
     await app.applyReview();
@@ -481,7 +502,7 @@ describe("resolve with git", () => {
     expect(api.mock.calls.filter((c) => c === "pull")).toHaveLength(1);
   });
 
-  it("Abort merge puts back the files and the uncommitted edits, and says nothing more", async () => {
+  it("Abort merge puts back the files and the uncommitted edits, and says so", async () => {
     const { api, app, before, changes } = await merging();
     notice(app, "merge").actions![0].run();
     expect(app.overlay).toBe("abortMerge");
@@ -492,6 +513,27 @@ describe("resolve with git", () => {
     expect(app.overlay).toBeNull();
     expect(app.notices.list.map((n) => n.key)).not.toContain("merge");
     expect(app.notices.list.map((n) => n.text)).not.toContain("Merge finished.");
+    expect(app.notices.list.at(-1)?.text).toBe("Merge aborted.");
+  });
+
+  it("Abort merge says why when it can't, changing nothing", async () => {
+    const { api, app } = await merging();
+    api.mock.editOnDisk(DAWN, "Up before the sun.\nTyped during the merge.\n");
+    const during = new Map(api.mock.files);
+    const error = await app.abortMerge();
+    expect(error?.kind).toBe("invalid");
+    expect(error?.message).toContain(DAWN);
+    expect(new Map(api.mock.files)).toEqual(during);
+    expect(app.sync.merge).not.toBeNull();
+  });
+
+  it("tells a merge aborted in a terminal from one finished there", async () => {
+    vi.useFakeTimers();
+    const { api, app } = await merging();
+    api.mock.abortMergeWithGit();
+    await vi.advanceTimersByTimeAsync(MERGE_POLL_MS);
+    expect(app.sync.merge).toBeNull();
+    expect(app.notices.list.at(-1)?.text).toBe("Merge aborted with git. Your edits stay committed, as an unpushed commit.");
   });
 
   it("notices when the merge is finished in a terminal", async () => {

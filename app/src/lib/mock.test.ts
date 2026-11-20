@@ -4,7 +4,14 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
 import { createMockApi, type MockApi } from "./mock";
-import type { PullPreview, PullResult, Resolved } from "./types";
+import type { Overlap, PullPreview, PullResult, Resolved } from "./types";
+
+/** GitHub's text of an overlap, put back together from its suggestion's chunks. */
+function theirsOf(overlap: Overlap): string {
+  return overlap
+    .suggestion!.chunks.map((c) => (c.kind === "same" ? c.text : c.kind === "clash" ? c.theirs : c.kind === "mine" ? c.base : c.text))
+    .join("");
+}
 
 const RUN = "2026-11-16-1402-morning-run.md";
 const IDEAS = "2026-11-14-2130-ideas.md";
@@ -12,10 +19,10 @@ const LIST = "2026-10-28-0815-reading-list.md";
 const PHONE = "2026-11-15-0700-from-my-phone.md";
 const DAWN = "2026-11-16-0630-dawn.md";
 
-const at1530 = () => new Date(2026, 10, 16, 15, 30);
+const at15h30 = () => new Date(2026, 10, 16, 15, 30);
 
 async function connected(options: Parameters<typeof createMockApi>[0] = {}): Promise<MockApi> {
-  const api = createMockApi({ now: at1530, ...options });
+  const api = createMockApi({ now: at15h30, ...options });
   await api.githubSetPat("token");
   await api.githubConnect("octocat/journal");
   return api;
@@ -43,7 +50,7 @@ function reviewOf(result: PullResult): PullPreview {
 
 describe("connecting", () => {
   it("applies the one-sided history at once, with a summary Undo can reverse", async () => {
-    const api = createMockApi({ now: at1530 });
+    const api = createMockApi({ now: at15h30 });
     await api.githubSetPat("token");
     const result = await api.githubConnect("octocat/journal");
     expect(result.status).toBe("applied");
@@ -57,7 +64,7 @@ describe("connecting", () => {
   });
 
   it("opens a review when a file differs on both sides", async () => {
-    const api = createMockApi({ now: at1530 });
+    const api = createMockApi({ now: at15h30 });
     api.mock.remoteCommit(RUN, "GitHub's run\n");
     api.mock.editOnDisk(RUN, "my run\n");
     await api.githubSetPat("token");
@@ -69,7 +76,7 @@ describe("connecting", () => {
   });
 
   it("pushes this journal's history to an empty repository", async () => {
-    const api = createMockApi({ samples: false, now: at1530 });
+    const api = createMockApi({ samples: false, now: at15h30 });
     api.mock.editOnDisk("a.md", "a\n");
     await api.commit("First", ["a.md"]);
     await api.githubSetPat("token");
@@ -163,7 +170,7 @@ describe("Sync review", () => {
       kind: "both_modified",
       binary: false,
       choices: ["mine", "theirs", "both", "merged"],
-      copy: "2026-11-16-1402-morning-run.from-github-1530.md",
+      copy: "2026-11-16-1402-morning-run.from-github-15h30.md",
     });
     // The same state gives the same review.
     expect(reviewOf(await api.pullPreview()).id).toBe(preview.id);
@@ -181,12 +188,12 @@ describe("Sync review", () => {
     );
     expect(api.mock.files.get(clean)).toBe(merged);
     const copy = byPath.get(clash)!.copy!;
-    expect(copy).toBe("2026-10-28-0815-reading-list.from-github-1530.md");
+    expect(copy).toBe("2026-10-28-0815-reading-list.from-github-15h30.md");
     expect(api.mock.files.get(clash)).toContain("(again)");
     expect(api.mock.files.get(copy)).toContain("H. D. Thoreau");
     expect(summary.resolved).toEqual([
-      { path: clash, choice: "both", copy },
-      { path: clean, choice: "merged", copy: null },
+      { path: clash, kind: "both_modified", choice: "both", copy },
+      { path: clean, kind: "both_modified", choice: "merged", copy: null },
     ]);
     expect(summary.files.map((f) => f.path)).toContain(copy);
     // Left as uncommitted changes on top of GitHub's commits.
@@ -199,7 +206,7 @@ describe("Sync review", () => {
     const { clean, clash } = api.mock.seedOverlaps();
     const mine = api.mock.files.get(clash);
     const preview = reviewOf(await api.pull());
-    const theirs = preview.overlaps.find((o) => o.path === clean)!.theirs;
+    const theirs = theirsOf(preview.overlaps.find((o) => o.path === clean)!);
     await api.applyPull(
       preview.id,
       [
@@ -290,10 +297,10 @@ describe("Sync review", () => {
     expect(byPath.get("assets/x.jpg")).toMatchObject({
       kind: "both_added",
       binary: true,
-      mine: null,
-      theirs: null,
+      minePath: "assets/x.jpg",
+      theirsPath: "assets/x.jpg",
       choices: ["mine", "theirs", "both"],
-      copy: "assets/x.from-github-1530.jpg",
+      copy: "assets/x.from-github-15h30.jpg",
       suggestion: null,
     });
     expect(byPath.get(LIST)).toMatchObject({ kind: "modified_deleted", choices: ["mine", "theirs"], copy: null });
@@ -308,9 +315,30 @@ describe("Sync review", () => {
       null,
     );
     expect(api.mock.files.get("assets/x.jpg")).toBe("blob:mine");
-    expect(api.mock.files.get("assets/x.from-github-1530.jpg")).toBe("blob:github");
+    expect(api.mock.files.get("assets/x.from-github-15h30.jpg")).toBe("blob:github");
     expect(api.mock.files.has(LIST)).toBe(false);
     expect(api.mock.files.get(RUN)).toBe("edited on GitHub\n");
+  });
+});
+
+describe("renames", () => {
+  it("an entry retitled on GitHub and edited here is one file, merged under the new name", async () => {
+    const api = await connected();
+    const renamed = "2026-11-16-1402-long-run.md";
+    const text = api.mock.files.get(RUN)!;
+    api.mock.remoteCommit(RUN, null, "Retitle");
+    api.mock.remoteCommit(renamed, text, "Retitle");
+    api.mock.editOnDisk(RUN, `${text}Added here.\n`);
+    const preview = reviewOf(await api.pull());
+    expect(preview.auto.map((c) => c.path)).not.toContain(renamed);
+    expect(preview.overlaps).toHaveLength(1);
+    const overlap = preview.overlaps[0];
+    expect(overlap).toMatchObject({ path: renamed, kind: "modified_renamed", minePath: RUN, theirsPath: renamed, copy: renamed });
+    expect(overlap.suggestion?.clean).toBe(true);
+    const merged = overlap.suggestion!.chunks.map((c) => (c.kind === "clash" ? "" : c.text)).join("");
+    await api.applyPull(preview.id, [{ path: renamed, choice: "merged", text: merged }], null);
+    expect(api.mock.files.has(RUN)).toBe(false);
+    expect(api.mock.files.get(renamed)).toBe(`${text}Added here.\n`);
   });
 });
 
@@ -330,7 +358,8 @@ describe("Resolve with git", () => {
     expect(snapshot(api)).toEqual(before);
 
     const view = await api.startExternalMerge(preview.id, "My edits");
-    expect(view.merge).toEqual({ conflicted: [clash], startedByApp: true });
+    expect(view.merge).toMatchObject({ conflicted: [clash], startedByApp: true, precommit: true, autostash: false });
+    expect(view.merge!.merged).toContain(DAWN);
     const marked = api.mock.files.get(clash)!;
     expect(marked).toContain("<<<<<<< HEAD\n- *Walden* (again)\n=======\n- *Walden*, H. D. Thoreau\n>>>>>>> origin/main\n");
     // The clean file was merged; one-sided files arrived.
@@ -352,6 +381,16 @@ describe("Resolve with git", () => {
     await rejects(api.abortMerge(), "invalid");
   });
 
+  it("Abort refuses, changing nothing, once a file git merged was edited", async () => {
+    const { api, preview } = await inReview();
+    const view = await api.startExternalMerge(preview.id, "My edits");
+    api.mock.editOnDisk(DAWN, "Up before the sun.\nTyped during the merge.\n");
+    const during = snapshot(api);
+    await rejects(api.abortMerge(), "invalid");
+    expect(snapshot(api)).toEqual(during);
+    expect((await api.syncState()).merge).toEqual(view.merge);
+  });
+
   it("is finished in a terminal; the app then pushes the merge", async () => {
     const { api, clash, preview } = await inReview();
     await api.startExternalMerge(preview.id, "My edits");
@@ -366,7 +405,7 @@ describe("Resolve with git", () => {
 
 describe("commit with ticked paths", () => {
   it("commits only the ticked changes; a ticked rename drops the old name", async () => {
-    const api = createMockApi({ now: at1530 });
+    const api = createMockApi({ now: at15h30 });
     api.mock.editOnDisk(RUN, "edited\n");
     await api.renameEntry(IDEAS, "thoughts");
     const renamed = "2026-11-14-2130-thoughts.md";
@@ -398,7 +437,7 @@ describe("commit with ticked paths", () => {
   });
 
   it("diffs a changed file against HEAD", async () => {
-    const api = createMockApi({ now: at1530 });
+    const api = createMockApi({ now: at15h30 });
     api.mock.editOnDisk(RUN, (api.mock.files.get(RUN) ?? "").replace("Five miles", "Six miles"));
     const diff = await api.diff(RUN);
     expect(diff).toMatchObject({ path: RUN, oldPath: null, kind: "modified", binary: false });

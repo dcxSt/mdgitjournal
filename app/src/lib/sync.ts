@@ -92,13 +92,20 @@ export function isSyncFailure(kind: string): boolean {
   return ["auth", "reauth", "network", "not_connected", "io", "git", "unknown"].includes(kind);
 }
 
-/** "Pulled 3 commits from GitHub · 4 files changed · your 2 unpushed commits were placed after them" */
-export function summaryText(summary: SyncSummary): string {
+/**
+ * "Pulled 3 commits from GitHub · 4 files changed · your 2 unpushed commits were placed after them",
+ * and what is left to do: a merge commit to push, resolved files still uncommitted (in `changes`).
+ */
+export function summaryText(summary: SyncSummary, changes: readonly FileChange[] = []): string {
   const parts = [`Pulled ${plural(summary.incomingCount, "commit")} from GitHub`];
   if (summary.files.length) parts.push(`${plural(summary.files.length, "file")} changed`);
   if (summary.rebased > 0) {
     parts.push(`your ${plural(summary.rebased, "unpushed commit")} ${summary.rebased === 1 ? "was" : "were"} placed after them`);
   }
+  if (summary.mergeCommit) parts.push("merge commit ready to push");
+  const changed = new Set(changedPaths(changes));
+  const waiting = summary.resolved.filter((r) => changed.has(r.path) || (r.copy !== null && changed.has(r.copy))).length;
+  if (waiting) parts.push(`${plural(waiting, "resolved file")} ready to commit`);
   return parts.join(" · ");
 }
 

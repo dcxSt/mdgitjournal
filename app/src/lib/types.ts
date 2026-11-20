@@ -99,8 +99,14 @@ export interface CommandError {
 export interface MergeState {
   /** Paths with conflict entries in the index, sorted. */
   conflicted: string[];
+  /** Paths git merged without a conflict (and staged), which Abort also puts back, sorted. */
+  merged: string[];
   /** Started by Resolve with git (rather than with the git CLI). */
   startedByApp: boolean;
+  /** The app committed uncommitted edits first; Abort takes that commit back, `git merge --abort` keeps it. */
+  precommit: boolean;
+  /** `git merge --autostash` set uncommitted changes aside; Abort puts them back. */
+  autostash: boolean;
 }
 
 export interface SyncView {
@@ -133,13 +139,24 @@ export interface CommitInfo {
   time: number;
 }
 
+/** What happened here, then on GitHub. A rename may come with changes to the text. */
 export type OverlapKind =
   | "both_modified"
   | "both_added"
   /** Mine modified, GitHub deleted. */
   | "modified_deleted"
   /** Mine deleted, GitHub modified. */
-  | "deleted_modified";
+  | "deleted_modified"
+  /** Mine modified, GitHub renamed. */
+  | "modified_renamed"
+  /** Mine renamed, GitHub modified. */
+  | "renamed_modified"
+  /** Renamed here and on GitHub, to different names. */
+  | "both_renamed"
+  /** Mine renamed, GitHub deleted. */
+  | "renamed_deleted"
+  /** Mine deleted, GitHub renamed. */
+  | "deleted_renamed";
 
 export type Choice = "mine" | "theirs" | "both" | "merged";
 
@@ -158,17 +175,22 @@ export interface MergeSuggestion {
   chunks: MergeChunk[];
 }
 
-/** A path changed on both sides, where mine (the working tree) differs from GitHub's. */
+/** A file changed on both sides, where mine (the working tree) differs from GitHub's. */
 export interface Overlap {
+  /** The file's name after a merge (for a rename on one side, the new name); the review's key. */
   path: string;
   kind: OverlapKind;
   /** Some present side is not UTF-8 or contains a NUL byte. */
   binary: boolean;
-  /** Full text; null if that side is absent or the file is binary. */
-  base: string | null;
-  mine: string | null;
-  theirs: string | null;
-  /** Allowed, in this order: text [mine, theirs, both, merged]; binary [mine, theirs, both]; delete/modify [mine, theirs]. */
+  /** Where mine is; null if deleted here. */
+  minePath: string | null;
+  /** Where GitHub's is; null if deleted on GitHub. */
+  theirsPath: string | null;
+  /** The merge commit records this file's resolution (plan `merge`); otherwise it stays a change to commit. */
+  committed: boolean;
+  /** Opaque fingerprint of the three versions: a fresh review keeps choices for files whose versions are the same. */
+  versions: string;
+  /** Allowed, in this order: text [mine, theirs, both, merged]; binary [mine, theirs, both]; with a deletion [mine, theirs]. */
   choices: Choice[];
   /** Where Keep both puts GitHub's version; set iff `both` is allowed. */
   copy: string | null;
@@ -193,6 +215,15 @@ export interface PullPreview {
   auto: FileChange[];
   /** Sorted by path. */
   overlaps: Overlap[];
+  /** What Resolve with git would do (empty without overlaps). */
+  gitMerge: GitMerge;
+}
+
+export interface GitMerge {
+  /** Files git leaves with conflict markers. */
+  conflicted: string[];
+  /** Files whose uncommitted changes are committed first, because the merge writes them. */
+  uncommitted: string[];
 }
 
 export type Resolved =
@@ -201,6 +232,7 @@ export type Resolved =
 
 export interface ResolvedFile {
   path: string;
+  kind: OverlapKind;
   choice: Choice;
   copy: string | null;
 }
@@ -235,6 +267,11 @@ export interface ApplyResult {
 export interface RestoreResult {
   view: SyncView;
   restored: string[];
+}
+
+export interface AbortResult extends RestoreResult {
+  /** What `git merge --autostash` set aside didn't apply cleanly: it is a git stash now (`git stash pop`). */
+  stashed: boolean;
 }
 
 export type DiffLineKind = "context" | "added" | "removed";
