@@ -31,10 +31,6 @@
     }
   }
 
-  function openConflict(file: string) {
-    app.overlay = null;
-    void app.openEntry(file);
-  }
 </script>
 
 {#snippet patForm()}
@@ -178,23 +174,10 @@
   {:else}
     {#if step.result}
       <p>Connected to <strong>{step.fullName}</strong>.</p>
-      {#if step.result.updated.length}
-        <p class="muted">{plural(step.result.updated.length, "file")} came from GitHub.</p>
-      {/if}
-      {#if step.result.conflicts.length}
-        <p>
-          {plural(step.result.conflicts.length, "file")} existed on both sides. GitHub's version keeps the name; yours
-          is saved next to it:
-        </p>
-        <ul class="conflicts">
-          {#each step.result.conflicts as conflict (conflict.path)}
-            <li>
-              <button type="button" class="link" onclick={() => openConflict(conflict.copy ?? conflict.path)}>
-                {conflict.copy ?? conflict.path}
-              </button>
-            </li>
-          {/each}
-        </ul>
+      {#if step.result.status === "applied" && step.result.summary.files.length}
+        <p class="muted">{plural(step.result.summary.files.length, "file")} came from GitHub.</p>
+      {:else if step.result.status === "review"}
+        <p class="muted">Some files differ here and on GitHub. Pull to choose what to keep of each.</p>
       {/if}
     {:else}
       <p>Signed in again as <strong>@{app.auth.login}</strong>.</p>
@@ -258,8 +241,7 @@
     gap: 8px;
   }
 
-  .repos,
-  .conflicts {
+  .repos {
     margin: 0;
     padding: 0;
     list-style: none;
@@ -309,13 +291,6 @@
   .link:hover {
     background: none;
     text-decoration: underline;
-  }
-
-  .conflicts .link {
-    font-family: var(--font-source);
-    font-size: 12px;
-    text-align: left;
-    overflow-wrap: anywhere;
   }
 
   .error {

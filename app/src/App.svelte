@@ -1,12 +1,16 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import AbortMergeSheet from "./components/AbortMergeSheet.svelte";
   import CommitSheet from "./components/CommitSheet.svelte";
   import DeleteSheet from "./components/DeleteSheet.svelte";
   import Desktop from "./components/Desktop.svelte";
+  import MergeView from "./components/MergeView.svelte";
   import Mobile from "./components/Mobile.svelte";
   import Notices from "./components/Notices.svelte";
   import QuickOpen from "./components/QuickOpen.svelte";
   import SettingsSheet from "./components/SettingsSheet.svelte";
+  import SyncReview from "./components/SyncReview.svelte";
+  import SyncSummary from "./components/SyncSummary.svelte";
   import type { AppState } from "./lib/app.svelte";
   import { shortcutAction, yieldsToVim } from "./lib/shortcuts";
 
@@ -66,6 +70,19 @@
     <QuickOpen {app} />
   {:else if app.overlay === "delete"}
     <DeleteSheet {app} />
+  {:else if app.overlay === "summary" && app.summary}
+    <SyncSummary {app} summary={app.summary} />
+  {:else if app.overlay === "abortMerge"}
+    <AbortMergeSheet {app} />
+  {/if}
+  <!-- The review stays open under the merge view, as it was. -->
+  {#if app.review && (app.overlay === "review" || app.overlay === "merge")}
+    {#key app.review}
+      <SyncReview {app} review={app.review} />
+    {/key}
+    {#if app.overlay === "merge" && app.review.merging}
+      <MergeView {app} review={app.review} />
+    {/if}
   {/if}
 {/if}
 

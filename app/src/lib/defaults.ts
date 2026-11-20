@@ -24,6 +24,8 @@ export const EMPTY_VIEW: SyncView = {
   changes: [],
   lastFetch: null,
   error: null,
+  merge: null,
+  lastSync: null,
 };
 
 export const SIGNED_OUT: AuthStatus = { signedIn: false, kind: null, login: null };

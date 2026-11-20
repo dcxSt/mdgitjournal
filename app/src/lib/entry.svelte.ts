@@ -26,6 +26,8 @@ export class CurrentEntry {
   saveError = $state<string | null>(null);
   /** Bumped whenever `content` is replaced from disk, so the editor knows to reset. */
   version = $state(0);
+  /** The last replacement was the same file again (reloaded after it changed on disk). */
+  reloaded = false;
   words = $state(0);
 
   #hash: string | null = null;
@@ -46,6 +48,7 @@ export class CurrentEntry {
 
   load(entry: EntryContent): void {
     this.#cancelTimers();
+    this.reloaded = entry.file === this.file;
     this.file = entry.file;
     this.content = entry.content;
     this.#hash = entry.hash;
@@ -58,6 +61,7 @@ export class CurrentEntry {
   /** Forgets the entry, including unsaved edits. Callers flush first unless deleting. */
   close(): void {
     this.#cancelTimers();
+    this.reloaded = false;
     this.file = null;
     this.content = "";
     this.#hash = null;

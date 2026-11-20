@@ -4,7 +4,10 @@ use std::borrow::Cow;
 
 use chrono::Local;
 use mdgj_core::{EntryContent, EntryMeta, ImportedImage, RemoteConfig, SearchHit, Settings};
-use mdgj_git::{CommitPushOutcome, Conflict, PullOutcome, PushOutcome};
+use mdgj_git::{
+    CommitPushOutcome, FileDiff, PullOutcome, PullPreview, PushOutcome, Resolved, SyncState,
+    SyncSummary,
+};
 use mdgj_github::{AuthKind, DeviceCode, GitHub, Poll, RepoInfo, StoredAuth, Tokens};
 use percent_encoding::percent_decode;
 use serde::{Deserialize, Serialize};
@@ -163,25 +166,50 @@ fn image_bytes(body: &InvokeBody) -> Result<Vec<u8>> {
 
 // Sync
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PullResult {
-    view: SyncView,
-    updated: Vec<String>,
-    merged: Vec<String>,
-    conflicts: Vec<Conflict>,
+/// What a pull (or connecting) did: nothing, applied at once (one-sided changes only), or a
+/// review the user decides, with nothing written yet.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum PullResult {
+    UpToDate {
+        view: SyncView,
+    },
+    Applied {
+        view: SyncView,
+        summary: SyncSummary,
+    },
+    Review {
+        view: SyncView,
+        preview: PullPreview,
+    },
+}
+
+/// A [`PullOutcome`] without its state, which becomes the view.
+enum Incoming {
+    UpToDate,
+    Applied(SyncSummary),
+    Review(PullPreview),
+}
+
+fn split(outcome: PullOutcome) -> (SyncState, Incoming) {
+    match outcome {
+        PullOutcome::UpToDate { state } => (state, Incoming::UpToDate),
+        PullOutcome::Applied { state, summary } => (state, Incoming::Applied(summary)),
+        PullOutcome::Review { state, preview } => (state, Incoming::Review(preview)),
+    }
 }
 
 /// The result of a pull or connect; tells the UI to re-list entries if files changed.
-fn incoming(app: &AppHandle, view: SyncView, outcome: PullOutcome) -> PullResult {
-    if !outcome.updated.is_empty() {
-        emit(app, ENTRIES_CHANGED, ());
-    }
-    PullResult {
-        view,
-        updated: outcome.updated,
-        merged: outcome.merged,
-        conflicts: outcome.conflicts,
+fn incoming(app: &AppHandle, view: SyncView, incoming: Incoming) -> PullResult {
+    match incoming {
+        Incoming::UpToDate => PullResult::UpToDate { view },
+        Incoming::Applied(summary) => {
+            if !summary.files.is_empty() {
+                emit(app, ENTRIES_CHANGED, ());
+            }
+            PullResult::Applied { view, summary }
+        }
+        Incoming::Review(preview) => PullResult::Review { view, preview },
     }
 }
 
@@ -206,24 +234,129 @@ pub async fn fetch(app: AppHandle) -> Result<SyncView> {
     .await
 }
 
+/// Fetches, then applies at once only what changed on one side; anything else is a review.
 #[tauri::command]
 pub async fn pull(app: AppHandle) -> Result<PullResult> {
     run(app, |app, s| {
-        let (view, outcome) = s.sync(app, |repo| {
-            let outcome = repo.pull(s.creds(repo)?.as_ref(), &s.author(true))?;
-            Ok((outcome.state.clone(), outcome))
+        let (view, result) = s.sync(app, |repo| {
+            Ok(split(repo.pull(s.creds(repo)?.as_ref(), &s.author(true))?))
         })?;
-        Ok(incoming(app, view, outcome))
+        Ok(incoming(app, view, result))
     })
     .await
 }
 
-/// A commit on this device only, as used when no remote is connected.
+/// The review of what was last fetched. Local only, and never applies, even when Pull would:
+/// the UI asks for it when a review went stale, where "nothing written" must hold.
 #[tauri::command]
-pub async fn commit(app: AppHandle, message: String) -> Result<SyncView> {
+pub async fn pull_preview(app: AppHandle) -> Result<PullResult> {
+    run(app, |app, s| {
+        let (view, preview) = s.sync(app, |repo| {
+            let preview = repo.preview_pull()?;
+            Ok((repo.sync_state()?, preview))
+        })?;
+        Ok(match preview {
+            None => PullResult::UpToDate { view },
+            Some(preview) => PullResult::Review { view, preview },
+        })
+    })
+    .await
+}
+
+#[derive(Debug, Serialize)]
+pub struct Applied {
+    view: SyncView,
+    summary: SyncSummary,
+}
+
+/// Writes the review's choices. `stale_review` (nothing written) if anything moved since.
+#[tauri::command]
+pub async fn apply_pull(
+    app: AppHandle,
+    id: String,
+    resolutions: Vec<Resolved>,
+    message: Option<String>,
+) -> Result<Applied> {
+    run(app, move |app, s| {
+        let (view, summary) = s.sync(app, |repo| {
+            let summary =
+                repo.apply_pull(&id, &resolutions, message.as_deref(), &s.author(false))?;
+            Ok((repo.sync_state()?, summary))
+        })?;
+        if !summary.files.is_empty() {
+            emit(app, ENTRIES_CHANGED, ());
+        }
+        Ok(Applied { view, summary })
+    })
+    .await
+}
+
+/// Paths a command put back as they were.
+#[derive(Debug, Serialize)]
+pub struct Restored {
+    view: SyncView,
+    restored: Vec<String>,
+}
+
+fn restored(app: &AppHandle, view: SyncView, restored: Vec<String>) -> Restored {
+    if !restored.is_empty() {
+        emit(app, ENTRIES_CHANGED, ());
+    }
+    Restored { view, restored }
+}
+
+/// Reverses the last pull, or refuses (`undo_refused`) rather than overwrite newer text.
+#[tauri::command]
+pub async fn undo_sync(app: AppHandle) -> Result<Restored> {
+    run(app, |app, s| {
+        let (view, paths) = s.sync(app, |repo| {
+            let paths = repo.undo_last_sync()?;
+            Ok((repo.sync_state()?, paths))
+        })?;
+        Ok(restored(app, view, paths))
+    })
+    .await
+}
+
+/// Resolve with git: leaves a standard merge in progress, with conflict markers, for the git CLI.
+/// Uncommitted edits are committed first with `message`.
+#[tauri::command]
+pub async fn start_external_merge(
+    app: AppHandle,
+    id: String,
+    message: Option<String>,
+) -> Result<SyncView> {
     run(app, move |app, s| {
         let (view, ()) = s.sync(app, |repo| {
-            repo.commit_all(&message, &s.author(false))?;
+            repo.start_external_merge(&id, message.as_deref(), &s.author(false))?;
+            Ok((repo.sync_state()?, ()))
+        })?;
+        // It merged GitHub's changes into the working tree.
+        emit(app, ENTRIES_CHANGED, ());
+        Ok(view)
+    })
+    .await
+}
+
+/// `git merge --abort`, and the commit Resolve with git made first is undone.
+#[tauri::command]
+pub async fn abort_merge(app: AppHandle) -> Result<Restored> {
+    run(app, |app, s| {
+        let (view, paths) = s.sync(app, |repo| {
+            let paths = repo.abort_merge()?;
+            Ok((repo.sync_state()?, paths))
+        })?;
+        Ok(restored(app, view, paths))
+    })
+    .await
+}
+
+/// A commit of the ticked `paths`, on this device only, as used when no remote is connected.
+#[tauri::command]
+pub async fn commit(app: AppHandle, message: String, paths: Vec<String>) -> Result<SyncView> {
+    run(app, move |app, s| {
+        let (view, ()) = s.sync(app, |repo| {
+            repo.commit(&message, &paths, &s.author(false))?;
             Ok((repo.sync_state()?, ()))
         })?;
         Ok(view)
@@ -231,7 +364,7 @@ pub async fn commit(app: AppHandle, message: String) -> Result<SyncView> {
     .await
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitPush {
     Pushed,
@@ -239,26 +372,32 @@ pub enum CommitPush {
     Nothing,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct CommitPushResult {
     view: SyncView,
     result: CommitPush,
 }
 
-/// With a blank message and nothing to commit, pushes the local commits that are waiting.
+/// Commits the ticked `paths` and pushes. A blank message with no paths only pushes the local
+/// commits that are waiting.
 #[tauri::command]
-pub async fn commit_and_push(app: AppHandle, message: String) -> Result<CommitPushResult> {
+pub async fn commit_and_push(
+    app: AppHandle,
+    message: String,
+    paths: Vec<String>,
+) -> Result<CommitPushResult> {
     run(app, move |app, s| {
         let (view, result) = s.sync(app, |repo| {
             let creds = s.creds(repo)?;
-            if message.trim().is_empty() && repo.status()?.is_empty() {
+            if message.trim().is_empty() && paths.is_empty() {
                 return Ok(match repo.push(creds.as_ref())? {
                     PushOutcome::Pushed { state } => (state, CommitPush::Pushed),
                     PushOutcome::Rejected { state } => (state, CommitPush::NeedsPull),
                     PushOutcome::NothingToPush { state } => (state, CommitPush::Nothing),
                 });
             }
-            let outcome = repo.commit_and_push(&message, &s.author(true), creds.as_ref())?;
+            let outcome =
+                repo.commit_and_push(&message, &paths, &s.author(true), creds.as_ref())?;
             Ok(match outcome {
                 CommitPushOutcome::Pushed { state } => (state, CommitPush::Pushed),
                 CommitPushOutcome::NeedsPull { state } => (state, CommitPush::NeedsPull),
@@ -268,6 +407,12 @@ pub async fn commit_and_push(app: AppHandle, message: String) -> Result<CommitPu
         Ok(CommitPushResult { view, result })
     })
     .await
+}
+
+/// One changed file against HEAD, for the commit sheet.
+#[tauri::command]
+pub async fn diff(app: AppHandle, path: String) -> Result<FileDiff> {
+    run(app, move |_, s| s.diff(&path)).await
 }
 
 // GitHub
@@ -434,7 +579,7 @@ pub async fn github_list_repos(app: AppHandle) -> Result<Vec<RepoInfo>> {
 #[tauri::command]
 pub async fn github_connect(app: AppHandle, full_name: String) -> Result<PullResult> {
     run(app, move |app, s| {
-        let (view, outcome) = s.sync(app, |repo| {
+        let (view, result) = s.sync(app, |repo| {
             let kind = s.signed_in()?.kind;
             let token = s.token()?;
             let full_name = full_name.trim();
@@ -452,20 +597,21 @@ pub async fn github_connect(app: AppHandle, full_name: String) -> Result<PullRes
                     })?,
                 AuthKind::Pat => s.github().repo(&token, full_name)?,
             };
-            let outcome =
-                repo.connect(&info.clone_url, Some(&token_creds(token)), &s.author(true))?;
+            let (state, result) =
+                split(repo.connect(&info.clone_url, Some(&token_creds(token)), &s.author(true))?);
+            // A review is no failure: the journal is connected, and Pull is lit.
             s.set_remote(Some(RemoteConfig {
                 full_name: info.full_name,
                 url: info.clone_url,
-                branch: outcome.state.branch.clone(),
+                branch: state.branch.clone(),
                 auth: match kind {
                     AuthKind::GithubApp => mdgj_core::AuthKind::GithubApp,
                     AuthKind::Pat => mdgj_core::AuthKind::Pat,
                 },
             }))?;
-            Ok((outcome.state.clone(), outcome))
+            Ok((state, result))
         })?;
-        Ok(incoming(app, view, outcome))
+        Ok(incoming(app, view, result))
     })
     .await
 }
@@ -514,7 +660,11 @@ pub async fn third_party_notices() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use mdgj_git::{
+        ChangeKind, Choice, CommitInfo, DiffHunk, DiffLine, FileChange, LineKind, MergeChunk,
+        MergeSuggestion, Overlap, OverlapKind, PullPlan, Resolution,
+    };
+    use serde_json::{json, Value};
     use tauri::http::HeaderValue;
 
     use super::*;
@@ -566,6 +716,254 @@ mod tests {
         for json in [json!(null), json!({ "bytes": [1] }), json!([256])] {
             let err = image_bytes(&InvokeBody::Json(json)).unwrap_err();
             assert_eq!(err.kind, Kind::Invalid);
+        }
+    }
+
+    fn view() -> SyncView {
+        SyncView::new(
+            SyncState {
+                has_remote: true,
+                branch: "main".into(),
+                ahead: 0,
+                behind: 1,
+                changes: vec![],
+                last_fetch: None,
+                merge: None,
+                last_sync: None,
+            },
+            Some("https://github.com/dcxSt/journal.git"),
+            None,
+            None,
+        )
+    }
+
+    fn commit_info() -> CommitInfo {
+        CommitInfo {
+            id: "b".repeat(40),
+            message: "Edit on the phone".into(),
+            author: "Stephen".into(),
+            time: 1_763_301_000_000,
+        }
+    }
+
+    fn summary() -> SyncSummary {
+        SyncSummary {
+            at: 1_763_301_720_000,
+            plan: PullPlan::FastForward,
+            incoming: vec![commit_info()],
+            incoming_count: 1,
+            rebased: 0,
+            merge_commit: None,
+            files: vec![FileChange {
+                path: "2026-11-16-1402-run.md".into(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }],
+            resolved: vec![],
+        }
+    }
+
+    fn json_of(value: impl Serialize) -> Value {
+        serde_json::to_value(value).unwrap()
+    }
+
+    #[test]
+    fn pull_results_are_tagged_by_status() {
+        let up = json_of(PullResult::UpToDate { view: view() });
+        assert_eq!(up["status"], "up_to_date");
+        assert_eq!(up["view"]["behind"], 1);
+        assert_eq!(up.as_object().unwrap().len(), 2, "{up}");
+
+        let applied = json_of(PullResult::Applied {
+            view: view(),
+            summary: summary(),
+        });
+        assert_eq!(applied["status"], "applied");
+        assert_eq!(
+            applied["summary"],
+            json!({
+                "at": 1_763_301_720_000_i64,
+                "plan": "fast_forward",
+                "incoming": [{ "id": "b".repeat(40), "message": "Edit on the phone",
+                               "author": "Stephen", "time": 1_763_301_000_000_i64 }],
+                "incomingCount": 1,
+                "rebased": 0,
+                "mergeCommit": null,
+                "files": [{ "path": "2026-11-16-1402-run.md", "kind": "modified" }],
+                "resolved": [],
+            })
+        );
+
+        let file = "2026-11-16-1402-run.md";
+        let preview = PullPreview {
+            id: format!(
+                "main:{}:{}:{}",
+                "a".repeat(40),
+                "b".repeat(40),
+                "c".repeat(40)
+            ),
+            branch: "main".into(),
+            plan: PullPlan::Merge,
+            automatic: false,
+            incoming: vec![commit_info()],
+            incoming_count: 1,
+            local: vec![],
+            local_count: 0,
+            auto: vec![],
+            overlaps: vec![Overlap {
+                path: file.into(),
+                kind: OverlapKind::BothModified,
+                binary: false,
+                base: Some("a\nb\n".into()),
+                mine: Some("A\nb\n".into()),
+                theirs: Some("a\nB\n".into()),
+                choices: vec![Choice::Mine, Choice::Theirs, Choice::Both, Choice::Merged],
+                copy: Some("2026-11-16-1402-run.from-github-1530.md".into()),
+                suggestion: Some(MergeSuggestion {
+                    clean: false,
+                    chunks: vec![
+                        MergeChunk::Same {
+                            text: "# Run\n".into(),
+                        },
+                        MergeChunk::Mine {
+                            text: "A\n".into(),
+                            base: "a\n".into(),
+                        },
+                        MergeChunk::Clash {
+                            base: "b\n".into(),
+                            mine: "b!\n".into(),
+                            theirs: "B\n".into(),
+                        },
+                    ],
+                }),
+            }],
+        };
+        let review = json_of(PullResult::Review {
+            view: view(),
+            preview,
+        });
+        assert_eq!(review["status"], "review");
+        let preview = &review["preview"];
+        for key in [
+            "incomingCount",
+            "localCount",
+            "automatic",
+            "auto",
+            "overlaps",
+        ] {
+            assert!(preview.get(key).is_some(), "{key} missing: {preview}");
+        }
+        assert_eq!(preview["plan"], "merge");
+        let overlap = &preview["overlaps"][0];
+        assert_eq!(overlap["kind"], "both_modified");
+        assert_eq!(
+            overlap["choices"],
+            json!(["mine", "theirs", "both", "merged"])
+        );
+        assert_eq!(overlap["copy"], "2026-11-16-1402-run.from-github-1530.md");
+        assert_eq!(
+            overlap["suggestion"],
+            json!({ "clean": false, "chunks": [
+                { "kind": "same", "text": "# Run\n" },
+                { "kind": "mine", "text": "A\n", "base": "a\n" },
+                { "kind": "clash", "base": "b\n", "mine": "b!\n", "theirs": "B\n" },
+            ] })
+        );
+    }
+
+    #[test]
+    fn apply_undo_and_abort_shapes() {
+        let applied = json_of(Applied {
+            view: view(),
+            summary: summary(),
+        });
+        assert_eq!(applied["summary"]["plan"], "fast_forward");
+        assert_eq!(applied["view"]["connected"], true);
+        assert_eq!(applied.as_object().unwrap().len(), 2);
+
+        let restored = json_of(Restored {
+            view: view(),
+            restored: vec!["2026-11-16-1402-run.md".into()],
+        });
+        assert_eq!(restored["restored"], json!(["2026-11-16-1402-run.md"]));
+        assert_eq!(restored["view"]["merge"], Value::Null);
+        assert_eq!(restored["view"]["lastSync"], Value::Null);
+    }
+
+    #[test]
+    fn file_diff_shape() {
+        let diff = FileDiff {
+            path: "2026-11-16-1402-run.md".into(),
+            old_path: Some("2026-11-16-1402-walk.md".into()),
+            kind: ChangeKind::Renamed,
+            binary: false,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 2,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        text: "# Walk".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Removed,
+                        text: "slow".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Added,
+                        text: "fast".into(),
+                    },
+                ],
+            }],
+        };
+        assert_eq!(
+            json_of(diff),
+            json!({
+                "path": "2026-11-16-1402-run.md",
+                "oldPath": "2026-11-16-1402-walk.md",
+                "kind": "renamed",
+                "binary": false,
+                "hunks": [{ "oldStart": 1, "oldLines": 2, "newStart": 1, "newLines": 2, "lines": [
+                    { "kind": "context", "text": "# Walk" },
+                    { "kind": "removed", "text": "slow" },
+                    { "kind": "added", "text": "fast" },
+                ] }],
+            })
+        );
+    }
+
+    #[test]
+    fn resolutions_from_the_ui() {
+        let resolved: Vec<Resolved> = serde_json::from_value(json!([
+            { "path": "a.md", "choice": "merged", "text": "line\r\nno final newline" },
+            { "path": "b.md", "choice": "mine" },
+            { "path": "c.md", "choice": "theirs" },
+            { "path": "assets/x.jpg", "choice": "both" },
+        ]))
+        .unwrap();
+        assert_eq!(resolved[0].path, "a.md");
+        assert_eq!(
+            resolved[0].resolution,
+            Resolution::Merged {
+                text: "line\r\nno final newline".into()
+            }
+        );
+        assert_eq!(resolved[1].resolution, Resolution::Mine);
+        assert_eq!(resolved[2].resolution, Resolution::Theirs);
+        assert_eq!(resolved[3].resolution, Resolution::Both);
+
+        // The UI never sends these; they are refused rather than guessed at.
+        for bad in [
+            json!({ "path": "a.md", "choice": "merged" }),
+            json!({ "path": "a.md", "choice": "ours" }),
+            json!({ "choice": "mine" }),
+        ] {
+            assert!(
+                serde_json::from_value::<Resolved>(bad.clone()).is_err(),
+                "{bad}"
+            );
         }
     }
 

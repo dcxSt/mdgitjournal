@@ -1,48 +1,39 @@
-//! Two devices syncing through a local bare repository: connect, fetch, pull, push.
+//! Two devices syncing through a local bare repository: connect, fetch, push, and pulls where each
+//! file changed on one side only, which apply at once.
 
 mod common;
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 
-use common::{author, is_conflict_copy, Device, Remote};
-use mdgj_git::{ChangeKind, CommitPushOutcome, Conflict, Error, PullOutcome, PushOutcome};
-
-fn pull(d: &Device) -> PullOutcome {
-    d.repo.pull(None, &author()).unwrap()
-}
+use common::{author, overlap, two_devices, Device, Remote};
+use mdgj_git::{
+    ChangeKind, CommitInfo, CommitPushOutcome, Error, FileChange, OverlapKind, PullOutcome,
+    PullPlan, PushOutcome,
+};
 
 fn commit_and_push(d: &Device, message: &str) -> CommitPushOutcome {
-    d.repo.commit_and_push(message, &author(), None).unwrap()
+    let paths: Vec<String> = d
+        .repo
+        .status()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.path)
+        .collect();
+    d.repo
+        .commit_and_push(message, &paths, &author(), None)
+        .unwrap()
 }
 
-/// A remote holding `files` in one commit, and two devices connected to it.
-fn two_devices(files: &[(&str, &str)]) -> (Remote, Device, Device) {
-    let remote = Remote::new();
-    let a = Device::new();
-    for (path, content) in files {
-        a.write(path, content);
-    }
-    a.commit("Base");
-    a.repo.connect(&remote.url, None, &author()).unwrap();
-    let b = Device::connected(&remote);
-    assert_eq!(b.head(), a.head());
-    (remote, a, b)
-}
-
-fn no_conflict_markers(d: &Device) {
-    for file in d.files() {
-        let content = d.read(&file);
-        assert!(
-            !content
-                .windows(7)
-                .any(|w| w == b"<<<<<<<" || w == b">>>>>>>"),
-            "conflict markers in {file}"
-        );
+fn change(path: &str, kind: ChangeKind) -> FileChange {
+    FileChange {
+        path: path.into(),
+        kind,
+        old_path: None,
     }
 }
 
-// 2. connect
+// connect
 
 #[test]
 fn connect_to_an_empty_remote_pushes_local_history() {
@@ -51,13 +42,16 @@ fn connect_to_an_empty_remote_pushes_local_history() {
     a.write("a.md", "from a\n");
     let head = a.commit("First");
 
-    let out = a.repo.connect(&remote.url, None, &author()).unwrap();
-    assert!(out.state.has_remote);
+    let PullOutcome::UpToDate { state } = a.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected up to date");
+    };
+    assert!(state.has_remote);
     assert_eq!(
-        (out.state.branch.as_str(), out.state.ahead, out.state.behind),
+        (state.branch.as_str(), state.ahead, state.behind),
         ("main", 0, 0)
     );
-    assert!(out.state.last_fetch.is_some());
+    assert!(state.last_fetch.is_some());
     assert_eq!(remote.head("main"), Some(head));
 
     let config = a.git().config().unwrap().snapshot().unwrap();
@@ -70,15 +64,18 @@ fn connect_to_an_empty_remote_without_commits_pushes_nothing() {
     let remote = Remote::new();
     let a = Device::new();
     a.write("draft.md", "not committed\n");
-    let out = a.repo.connect(&remote.url, None, &author()).unwrap();
-    assert_eq!(out.state.branch, "main");
-    assert_eq!(out.state.changes.len(), 1);
+    let PullOutcome::UpToDate { state } = a.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected up to date");
+    };
+    assert_eq!(state.branch, "main");
+    assert_eq!(state.changes.len(), 1);
     assert_eq!(remote.head("main"), None);
     assert_eq!(a.text("draft.md"), "not committed\n");
 }
 
 #[test]
-fn connect_to_a_non_empty_remote_pulls_it() {
+fn connect_to_a_non_empty_remote_pulls_it_at_once() {
     let remote = Remote::new();
     let a = Device::new();
     a.write("a.md", "from a\n");
@@ -86,38 +83,29 @@ fn connect_to_a_non_empty_remote_pulls_it() {
     a.commit("First");
     a.repo.connect(&remote.url, None, &author()).unwrap();
 
-    // A fresh device with uncommitted work, including a file whose name the remote also uses.
+    // A fresh device with uncommitted work, including a file the remote has with the same bytes.
     let b = Device::new();
     b.write("draft.md", "draft\n");
-    b.write("a.md", "b's own a\n");
-    let out = b.repo.connect(&remote.url, None, &author()).unwrap();
-
+    b.write("a.md", "from a\n");
+    let PullOutcome::Applied { state, summary } =
+        b.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected the pull to apply");
+    };
     assert_eq!(b.head(), a.head());
     assert_eq!(b.text("a.md"), "from a\n");
     assert_eq!(b.text("assets/a-1.jpg"), "jpeg");
     assert_eq!(b.text("draft.md"), "draft\n");
-    let [Conflict {
-        path,
-        copy: Some(copy),
-    }] = &out.conflicts[..]
-    else {
-        panic!("expected one keep-both conflict: {:?}", out.conflicts);
-    };
-    assert_eq!(path, "a.md");
-    assert!(is_conflict_copy(copy, "a", ".md"), "{copy}");
-    assert_eq!(b.text(copy), "b's own a\n");
-    assert_eq!(
-        b.changes(),
-        [
-            (copy.clone(), ChangeKind::Added),
-            ("draft.md".into(), ChangeKind::Added)
-        ]
-    );
-    assert_eq!((out.state.ahead, out.state.behind), (0, 0));
+    assert_eq!(summary.plan, PullPlan::FastForward);
+    assert_eq!(summary.files, [change("assets/a-1.jpg", ChangeKind::Added)]);
+    assert_eq!(b.changes(), [("draft.md".into(), ChangeKind::Added)]);
+    assert_eq!((state.ahead, state.behind), (0, 0));
 }
 
+// 12. both_added through connect
+
 #[test]
-fn connect_with_unrelated_local_history_keeps_both() {
+fn connect_with_a_file_both_sides_have_differently_opens_a_review() {
     let remote = Remote::new();
     let a = Device::new();
     a.write("a.md", "from a\n");
@@ -130,34 +118,64 @@ fn connect_with_unrelated_local_history_keeps_both() {
     b.commit("B's first");
     b.write("shared.md", "b's version\n");
     b.commit("B's second");
-    let out = b.repo.connect(&remote.url, None, &author()).unwrap();
-
-    assert_eq!(out.rebased, 2);
-    let [Conflict {
-        path,
-        copy: Some(copy),
-    }] = &out.conflicts[..]
+    let before = b.state();
+    let PullOutcome::Review { state, preview } =
+        b.repo.connect(&remote.url, None, &author()).unwrap()
     else {
-        panic!("expected one keep-both conflict: {:?}", out.conflicts);
+        panic!("expected a review");
     };
-    assert_eq!(path, "shared.md");
-    assert_eq!(b.text("shared.md"), "a's version\n");
-    assert_eq!(b.text(copy), "b's version\n");
-    assert_eq!(b.text("a.md"), "from a\n");
-    assert_eq!(b.text("b.md"), "from b\n");
-    assert_eq!(b.changes(), []);
+    assert!(state.has_remote, "still connected");
+    assert_eq!(b.repo.remote_url(), Some(remote.url.clone()));
+    assert_eq!(b.state(), before, "nothing written");
+    assert_eq!(preview.plan, PullPlan::Merge, "the clash is committed here");
+    let shared = overlap(&preview, "shared.md");
+    assert_eq!(shared.kind, OverlapKind::BothAdded);
+    assert_eq!(shared.base, None);
+    assert_eq!(shared.mine.as_deref(), Some("b's version\n"));
+    assert_eq!(shared.theirs.as_deref(), Some("a's version\n"));
+    assert_eq!(preview.overlaps.len(), 1);
+    assert_eq!(preview.auto, [change("a.md", ChangeKind::Added)]);
+    assert_eq!(preview.local_count, 2);
+    assert_eq!(preview.incoming_count, 1);
+
+    // The same content on both sides needs no review.
+    let c = Device::new();
+    c.write("shared.md", "a's version\n");
+    c.write("c.md", "c\n");
+    let outcome = c.repo.connect(&remote.url, None, &author()).unwrap();
+    assert!(
+        matches!(outcome, PullOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(c.files(), ["a.md", "c.md", "shared.md"]);
+    assert_eq!(c.changes(), [("c.md".into(), ChangeKind::Added)]);
+}
+
+#[test]
+fn connect_with_unrelated_history_on_other_files_rebases_it() {
+    let remote = Remote::new();
+    let a = Device::new();
+    a.write("a.md", "from a\n");
+    a.commit("A's journal");
+    a.repo.connect(&remote.url, None, &author()).unwrap();
+
+    let b = Device::new();
+    b.write("b.md", "from b\n");
+    b.commit("B's first");
+    let PullOutcome::Applied { state, summary } =
+        b.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected the pull to apply");
+    };
+    assert_eq!(summary.plan, PullPlan::Rebase);
+    assert_eq!(summary.rebased, 1);
     assert_eq!(
         b.history(),
-        [
-            ("B's second".into(), 1),
-            ("B's first".into(), 1),
-            ("A's journal".into(), 0)
-        ]
+        [("B's first".into(), 1), ("A's journal".into(), 0)]
     );
-    assert_eq!((out.state.ahead, out.state.behind), (2, 0));
-
+    assert_eq!((state.ahead, state.behind), (1, 0));
     assert!(matches!(b.repo.push(None), Ok(PushOutcome::Pushed { .. })));
-    pull(&a);
+    a.pull_applied();
     assert_eq!(a.files(), b.files());
 }
 
@@ -172,8 +190,11 @@ fn connect_adopts_the_remote_branch_name() {
     let b = Device::with_branch("master");
     b.write("b.md", "b\n");
     b.commit("B");
-    let out = b.repo.connect(&remote.url, None, &author()).unwrap();
-    assert_eq!(out.state.branch, "main");
+    let PullOutcome::Applied { state, .. } = b.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected the pull to apply");
+    };
+    assert_eq!(state.branch, "main");
     assert!(b
         .git()
         .find_branch("master", git2::BranchType::Local)
@@ -181,9 +202,38 @@ fn connect_adopts_the_remote_branch_name() {
     assert_eq!(b.files(), ["a.md", "b.md"]);
 
     let unborn = Device::with_branch("master");
-    let out = unborn.repo.connect(&remote.url, None, &author()).unwrap();
-    assert_eq!(out.state.branch, "main");
+    let PullOutcome::Applied { state, .. } =
+        unborn.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected the pull to apply");
+    };
+    assert_eq!(state.branch, "main");
     assert_eq!(unborn.files(), ["a.md"]);
+}
+
+#[test]
+fn connect_follows_the_remotes_default_branch() {
+    let remote = Remote::new();
+    let a = Device::with_branch("journal");
+    a.write("a.md", "a\n");
+    a.commit("A");
+    a.repo.connect(&remote.url, None, &author()).unwrap();
+    git2::Repository::open_bare(&remote.path)
+        .unwrap()
+        .set_head("refs/heads/journal")
+        .unwrap();
+
+    let b = Device::new();
+    b.write("b.md", "b\n");
+    b.commit("B");
+    let PullOutcome::Applied { state, summary } =
+        b.repo.connect(&remote.url, None, &author()).unwrap()
+    else {
+        panic!("expected the pull to apply");
+    };
+    assert_eq!(state.branch, "journal");
+    assert_eq!(summary.rebased, 1);
+    assert_eq!(b.files(), ["a.md", "b.md"]);
 }
 
 #[test]
@@ -220,7 +270,7 @@ fn connect_that_cannot_push_leaves_no_remote() {
     assert_eq!(d.text("a.md"), "a\n");
 }
 
-// 3. fetch
+// fetch
 
 #[test]
 fn fetch_counts_ahead_and_behind() {
@@ -258,13 +308,15 @@ fn remote_operations_need_a_remote() {
     );
     assert_eq!(d.repo.push(None), Err(Error::NotConnected));
     assert_eq!(
-        d.repo.commit_and_push("A", &author(), None),
+        d.repo
+            .commit_and_push("A", &["a.md".into()], &author(), None),
         Err(Error::NotConnected)
     );
+    assert_eq!(d.repo.preview_pull(), Ok(None));
     assert!(d.git().head().is_err(), "nothing may be committed");
 }
 
-// 4. commit and push
+// commit and push
 
 #[test]
 fn commit_and_push_pushes_or_asks_for_a_pull() {
@@ -274,7 +326,7 @@ fn commit_and_push_pushes_or_asks_for_a_pull() {
         CommitPushOutcome::NothingToCommit { .. }
     ));
     assert_eq!(
-        a.repo.commit_and_push(" ", &author(), None),
+        a.repo.commit_and_push(" ", &[], &author(), None),
         Err(Error::EmptyMessage)
     );
 
@@ -298,7 +350,7 @@ fn commit_and_push_pushes_or_asks_for_a_pull() {
         commit_and_push(&b, "Again"),
         CommitPushOutcome::NeedsPull { .. }
     ));
-    pull(&b);
+    b.pull_applied();
     let CommitPushOutcome::Pushed { state } = commit_and_push(&b, "Unused") else {
         panic!("expected the waiting commit to be pushed");
     };
@@ -307,256 +359,20 @@ fn commit_and_push_pushes_or_asks_for_a_pull() {
     assert_eq!(b.history()[0], ("B".into(), 1));
 }
 
-// 5. fast-forward with uncommitted, unrelated work
-
 #[test]
-fn fast_forward_keeps_unrelated_local_work_byte_for_byte() {
-    let (_remote, a, b) =
-        two_devices(&[("x.md", "x\n"), ("y.md", "y\n"), ("gone.md", "remove me\n")]);
-    a.write("x.md", "x, edited on a\n");
-    a.write("new.md", "new on a\n");
-    a.write("assets/new-1.jpg", [0xff, 0xd8, 0xff]);
-    a.remove("gone.md");
-    commit_and_push(&a, "A's edits");
-
-    let dirty = b"y\r\nedited on b, no final newline";
-    b.write("y.md", dirty);
-    b.write("draft.md", "untracked draft\n");
-    let before = fs::metadata(b.root().join("y.md")).unwrap();
-
-    let out = pull(&b);
-    assert_eq!(
-        out.updated,
-        ["assets/new-1.jpg", "gone.md", "new.md", "x.md"]
-    );
-    assert_eq!(out.merged, Vec::<String>::new());
-    assert_eq!(out.conflicts, []);
-    assert_eq!(out.rebased, 0);
-
-    assert_eq!(b.head(), a.head());
-    assert_eq!(b.read("y.md"), dirty);
-    let after = fs::metadata(b.root().join("y.md")).unwrap();
-    assert_eq!(
-        (after.ino(), after.mtime_nsec()),
-        (before.ino(), before.mtime_nsec())
-    );
-    assert_eq!(b.text("draft.md"), "untracked draft\n");
-    assert_eq!(b.text("x.md"), "x, edited on a\n");
-    assert_eq!(b.read("assets/new-1.jpg"), [0xff, 0xd8, 0xff]);
-    assert!(!b.exists("gone.md"));
-    assert_eq!(
-        b.changes(),
-        [
-            ("draft.md".into(), ChangeKind::Added),
-            ("y.md".into(), ChangeKind::Modified)
-        ]
-    );
-    assert_eq!(out.state.changes.len(), 2);
-}
-
-#[test]
-fn pull_when_up_to_date_changes_nothing() {
-    let (_remote, a, b) = two_devices(&[("x.md", "x\n")]);
-    b.write("x.md", "dirty\n");
-    let out = pull(&b);
-    assert_eq!((out.updated.len(), out.conflicts.len()), (0, 0));
-    assert_eq!(b.text("x.md"), "dirty\n");
-
-    // Local commits the remote doesn't have yet: nothing to pull either.
-    a.write("y.md", "y\n");
-    a.commit("Y");
-    let out = pull(&a);
-    assert_eq!((out.updated.len(), out.state.ahead), (0, 1));
-}
-
-// 6. clean three-way merge of uncommitted edits
-
-#[test]
-fn edits_to_different_lines_merge_cleanly() {
-    let base = "one\ntwo\nthree\nfour\nfive\n";
-    let (_remote, a, b) = two_devices(&[("entry.md", base)]);
-    a.write("entry.md", "ONE\ntwo\nthree\nfour\nfive\n");
-    commit_and_push(&a, "A");
-    b.write("entry.md", "one\ntwo\nthree\nfour\nFIVE\n");
-
-    let out = pull(&b);
-    assert_eq!(out.merged, ["entry.md"]);
-    assert_eq!(out.updated, ["entry.md"]);
-    assert_eq!(out.conflicts, []);
-    assert_eq!(b.text("entry.md"), "ONE\ntwo\nthree\nfour\nFIVE\n");
-    assert_eq!(b.head(), a.head());
-    assert_eq!(b.changes(), [("entry.md".into(), ChangeKind::Modified)]);
-}
-
-// 7. true conflict with uncommitted edits
-
-#[test]
-fn same_line_conflict_keeps_both_versions() {
-    let (_remote, a, b) = two_devices(&[("2026-11-16-1402-run.md", "ran\n")]);
-    a.write("2026-11-16-1402-run.md", "ran 5k on a\n");
-    commit_and_push(&a, "A");
-    let local = b"ran 10k on b\r\nno final newline";
-    b.write("2026-11-16-1402-run.md", local);
-
-    let out = pull(&b);
-    let [Conflict {
-        path,
-        copy: Some(copy),
-    }] = &out.conflicts[..]
-    else {
-        panic!("expected one keep-both conflict: {:?}", out.conflicts);
-    };
-    assert_eq!(path, "2026-11-16-1402-run.md");
-    assert!(
-        is_conflict_copy(copy, "2026-11-16-1402-run", ".md"),
-        "{copy}"
-    );
-    assert_eq!(b.text(path), "ran 5k on a\n");
-    assert_eq!(b.read(copy), local);
-    assert_eq!(out.merged, Vec::<String>::new());
-    assert_eq!(out.updated, [copy.clone(), path.clone()]);
-    assert_eq!(b.changes(), [(copy.clone(), ChangeKind::Added)]);
-    no_conflict_markers(&b);
-}
-
-// 8. diverged commits on different files
-
-#[test]
-fn diverged_commits_are_rebased_into_a_line() {
-    let (remote, a, b) = two_devices(&[("base.md", "base\n")]);
-    for name in ["a1", "a2"] {
-        a.write(&format!("{name}.md"), name);
-        a.commit(name);
-    }
-    a.repo.push(None).unwrap();
-    for name in ["b1", "b2"] {
-        b.write(&format!("{name}.md"), name);
-        b.commit(name);
-    }
-
-    let out = pull(&b);
-    assert_eq!(out.rebased, 2);
-    assert_eq!(out.conflicts, []);
-    assert_eq!(out.updated, ["a1.md", "a2.md"]);
-    assert_eq!(b.files(), ["a1.md", "a2.md", "b1.md", "b2.md", "base.md"]);
-    assert_eq!(
-        b.history(),
-        [
-            ("b2".into(), 1),
-            ("b1".into(), 1),
-            ("a2".into(), 1),
-            ("a1".into(), 1),
-            ("Base".into(), 0)
-        ]
-    );
-    assert_eq!(b.changes(), []);
-    assert_eq!((out.state.ahead, out.state.behind), (2, 0));
-    let git = b.git();
-    let replayed = git.head().unwrap().peel_to_commit().unwrap();
-    assert_eq!(replayed.author().name(), Ok("Test Author"));
-
-    assert!(matches!(b.repo.push(None), Ok(PushOutcome::Pushed { .. })));
-    assert_eq!(remote.head("main"), Some(b.head()));
-    pull(&a);
-    assert_eq!(a.files(), b.files());
-}
-
-// 9. diverged commits on the same line
-
-#[test]
-fn rebase_conflicts_keep_both_versions_in_the_commit() {
-    let (_remote, a, b) = two_devices(&[("entry.md", "base\n")]);
-    a.write("entry.md", "from a\n");
-    commit_and_push(&a, "A");
-    b.write("entry.md", "from b\n");
-    b.commit("B");
-
-    let out = pull(&b);
-    assert_eq!(out.rebased, 1);
-    let [Conflict {
-        path,
-        copy: Some(copy),
-    }] = &out.conflicts[..]
-    else {
-        panic!("expected one keep-both conflict: {:?}", out.conflicts);
-    };
-    assert_eq!(path, "entry.md");
-    assert!(is_conflict_copy(copy, "entry", ".md"), "{copy}");
-    assert_eq!(b.text("entry.md"), "from a\n");
-    assert_eq!(b.text(copy), "from b\n");
-    assert_eq!(b.committed(copy), Some(b"from b\n".to_vec()));
-    assert_eq!(b.committed("entry.md"), Some(b"from a\n".to_vec()));
-    assert_eq!(b.changes(), []);
-    assert_eq!(b.history()[0], ("B".into(), 1));
-    no_conflict_markers(&b);
-
-    assert!(matches!(b.repo.push(None), Ok(PushOutcome::Pushed { .. })));
-    pull(&a);
-    assert_eq!(a.text(copy), "from b\n");
-}
-
-// 10. deleted on one side, changed on the other
-
-#[test]
-fn remote_deletion_keeps_a_local_modification() {
-    let (_remote, a, b) = two_devices(&[("x.md", "x\n"), ("y.md", "y\n")]);
-    a.remove("x.md");
-    a.remove("y.md");
-    commit_and_push(&a, "Delete");
-    b.write("x.md", "x, edited on b\n");
-
-    let out = pull(&b);
-    assert_eq!(b.text("x.md"), "x, edited on b\n");
-    assert!(
-        !b.exists("y.md"),
-        "an unmodified file follows the remote deletion"
-    );
-    assert_eq!(out.updated, ["y.md"]);
-    assert_eq!(b.changes(), [("x.md".into(), ChangeKind::Added)]);
-}
-
-#[test]
-fn local_deletion_keeps_a_remote_modification() {
-    let (_remote, a, b) = two_devices(&[("x.md", "x\n")]);
-    a.write("x.md", "x, edited on a\n");
-    commit_and_push(&a, "Edit");
-    b.remove("x.md");
-
-    let out = pull(&b);
-    assert_eq!(b.text("x.md"), "x, edited on a\n");
-    assert_eq!(
-        out.conflicts,
-        [Conflict {
-            path: "x.md".into(),
-            copy: None
-        }]
-    );
-    assert_eq!(b.changes(), []);
-}
-
-#[test]
-fn committed_deletions_keep_the_other_sides_modification() {
-    let (_remote, a, b) = two_devices(&[("ours.md", "o\n"), ("theirs.md", "t\n")]);
-    a.write("ours.md", "o, edited on a\n");
-    a.remove("theirs.md");
-    commit_and_push(&a, "A");
-    b.remove("ours.md");
-    b.write("theirs.md", "t, edited on b\n");
-    b.commit("B");
-
-    let out = pull(&b);
-    assert_eq!(b.text("ours.md"), "o, edited on a\n");
-    assert_eq!(b.text("theirs.md"), "t, edited on b\n");
-    assert_eq!(b.committed("ours.md"), Some(b"o, edited on a\n".to_vec()));
-    assert_eq!(b.committed("theirs.md"), Some(b"t, edited on b\n".to_vec()));
-    assert_eq!(
-        out.conflicts,
-        [Conflict {
-            path: "ours.md".into(),
-            copy: None
-        }]
-    );
-    assert_eq!(b.changes(), []);
+fn commit_and_push_takes_only_the_ticked_files() {
+    let (remote, a, _b) = two_devices(&[("base.md", "base\n")]);
+    a.write("ticked.md", "ticked\n");
+    a.write("unticked.md", "unticked\n");
+    let outcome = a
+        .repo
+        .commit_and_push("Ticked", &["ticked.md".into()], &author(), None)
+        .unwrap();
+    assert!(matches!(outcome, CommitPushOutcome::Pushed { .. }));
+    assert_eq!(remote.head("main"), Some(a.head()));
+    assert_eq!(a.committed("ticked.md"), Some(b"ticked\n".to_vec()));
+    assert_eq!(a.committed("unticked.md"), None);
+    assert_eq!(a.changes(), [("unticked.md".into(), ChangeKind::Added)]);
 }
 
 // 11. push race
@@ -581,75 +397,205 @@ fn push_race_is_rejected_without_losing_anything() {
     assert_eq!(a.text("a.md"), "a\n");
     assert_eq!(a.history()[0], ("A".into(), 1));
 
-    pull(&a);
+    a.pull_applied();
     assert!(matches!(a.repo.push(None), Ok(PushOutcome::Pushed { .. })));
-    pull(&b);
+    b.pull_applied();
     assert_eq!(b.files(), ["a.md", "b.md", "base.md"]);
     assert_eq!(a.files(), b.files());
 }
 
-// 12. line endings and missing final newlines
+// 1. up to date
 
 #[test]
-fn pulled_bytes_are_exact() {
-    let remote = Remote::new();
-    let a = Device::new();
-    let files: [(&str, &[u8]); 4] = [
-        ("crlf.md", b"one\r\ntwo\r\nthree\r\n"),
-        ("no-newline.md", b"no final newline"),
-        ("mixed.md", b"lf\ncrlf\r\nlone cr\rend"),
-        ("assets/binary.jpg", b"\xff\xd8\x00\r\n\x00\xff"),
-    ];
-    for (path, content) in files {
-        a.write(path, content);
-    }
-    a.commit("Files");
-    a.repo.connect(&remote.url, None, &author()).unwrap();
+fn pull_when_up_to_date_writes_nothing() {
+    let (_remote, a, b) = two_devices(&[("x.md", "x\n")]);
+    b.write("x.md", "dirty\n");
+    b.write("untracked.md", "untracked\n");
+    let before = b.state();
+    let PullOutcome::UpToDate { state } = b.pull() else {
+        panic!("expected up to date");
+    };
+    assert_eq!(state.changes.len(), 2);
+    assert_eq!(b.state(), before);
+    assert_eq!(b.repo.preview_pull(), Ok(None));
 
-    let b = Device::connected(&remote);
-    for (path, content) in files {
-        assert_eq!(b.read(path), content, "{path}");
-    }
-
-    // A clean merge of CRLF text keeps CRLF, and an edit keeps the missing final newline.
-    a.write("crlf.md", "ONE\r\ntwo\r\nthree\r\n");
-    a.write("no-newline.md", "still no final newline");
-    commit_and_push(&a, "Edits");
-    b.write("crlf.md", "one\r\ntwo\r\nTHREE\r\n");
-    let out = pull(&b);
-    assert_eq!(out.merged, ["crlf.md"]);
-    assert_eq!(b.read("crlf.md"), b"ONE\r\ntwo\r\nTHREE\r\n");
-    assert_eq!(b.read("no-newline.md"), b"still no final newline");
-    assert_eq!(b.read("mixed.md"), files[2].1);
+    // Local commits the remote doesn't have yet: nothing to pull either.
+    a.write("y.md", "y\n");
+    a.commit("Y");
+    let before = a.state();
+    let PullOutcome::UpToDate { state } = a.pull() else {
+        panic!("expected up to date");
+    };
+    assert_eq!(state.ahead, 1);
+    assert_eq!(a.state(), before);
 }
 
-// Beyond the basics
+// 2. no overlap, fast-forward, dirty unrelated files
 
 #[test]
-fn a_remote_rename_carries_the_local_edit() {
-    let body = "A long enough entry for rename detection to recognise it.\n".repeat(4);
-    let (_remote, a, b) = two_devices(&[("2026-11-16-1402-old.md", &body)]);
-    fs::rename(
-        a.root().join("2026-11-16-1402-old.md"),
-        a.root().join("2026-11-16-1402-new.md"),
-    )
-    .unwrap();
-    commit_and_push(&a, "Rename");
-    let edited = format!("{body}One more line from b.\n");
-    b.write("2026-11-16-1402-old.md", &edited);
+fn a_one_sided_pull_applies_at_once_and_keeps_local_work_byte_for_byte() {
+    let long = "A long enough entry for rename detection to recognise it.\n".repeat(4);
+    let (_remote, a, b) = two_devices(&[
+        ("x.md", "x\n"),
+        ("y.md", "y\n"),
+        ("gone.md", "remove me\n"),
+        ("old.md", &long),
+    ]);
+    a.write("x.md", "x, edited on a\n");
+    a.write("new.md", "new on a\n");
+    a.write("assets/new-1.jpg", [0xff, 0xd8, 0xff]);
+    a.remove("gone.md");
+    commit_and_push(&a, "A's edits\n\nWith a body.");
+    fs::rename(a.root().join("old.md"), a.root().join("renamed.md")).unwrap();
+    commit_and_push(&a, "A's rename");
 
-    let out = pull(&b);
-    assert_eq!(out.conflicts, []);
-    assert_eq!(b.files(), ["2026-11-16-1402-new.md"]);
-    assert_eq!(b.text("2026-11-16-1402-new.md"), edited);
+    let dirty = b"y\r\nedited on b, no final newline";
+    b.write("y.md", dirty);
+    b.write("draft.md", "untracked draft\n");
+    let before = fs::metadata(b.root().join("y.md")).unwrap();
+
+    let summary = b.pull_applied();
+    assert_eq!(summary.plan, PullPlan::FastForward);
+    assert_eq!(summary.rebased, 0);
+    assert_eq!(summary.merge_commit, None);
+    assert_eq!(summary.resolved, []);
+    assert_eq!(summary.incoming_count, 2);
+    let messages: Vec<_> = summary
+        .incoming
+        .iter()
+        .map(|c| c.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        ["A's rename", "A's edits\n\nWith a body."],
+        "newest first"
+    );
+    let CommitInfo {
+        id, author, time, ..
+    } = &summary.incoming[0];
+    assert_eq!(id, &a.head().to_string());
+    assert_eq!(author, "Test Author");
+    assert!((chrono::Utc::now().timestamp_millis() - time).abs() < 60_000);
+    let mut files = summary.files.clone();
+    files.sort_by(|x, y| x.path.cmp(&y.path));
+    assert_eq!(
+        files,
+        [
+            change("assets/new-1.jpg", ChangeKind::Added),
+            change("gone.md", ChangeKind::Deleted),
+            change("new.md", ChangeKind::Added),
+            FileChange {
+                path: "renamed.md".into(),
+                kind: ChangeKind::Renamed,
+                old_path: Some("old.md".into())
+            },
+            change("x.md", ChangeKind::Modified),
+        ]
+    );
+
+    assert_eq!(b.head(), a.head());
+    assert_eq!(b.read("y.md"), dirty);
+    let after = fs::metadata(b.root().join("y.md")).unwrap();
+    assert_eq!(
+        (after.ino(), after.mtime_nsec()),
+        (before.ino(), before.mtime_nsec())
+    );
+    assert_eq!(b.text("draft.md"), "untracked draft\n");
+    assert_eq!(b.text("x.md"), "x, edited on a\n");
+    assert_eq!(b.read("assets/new-1.jpg"), [0xff, 0xd8, 0xff]);
+    assert_eq!(b.text("renamed.md"), long);
+    assert!(!b.exists("gone.md"));
+    assert!(!b.exists("old.md"));
     assert_eq!(
         b.changes(),
-        [("2026-11-16-1402-new.md".into(), ChangeKind::Modified)]
+        [
+            ("draft.md".into(), ChangeKind::Added),
+            ("y.md".into(), ChangeKind::Modified)
+        ]
     );
+    // The index is GitHub's tree.
+    let git = b.git();
+    let mut index = git.index().unwrap();
+    assert_eq!(
+        index.write_tree().unwrap(),
+        git.head().unwrap().peel_to_tree().unwrap().id()
+    );
+    assert_eq!(b.repo.last_sync().unwrap(), Some(summary.clone()));
+    assert_eq!(b.repo.sync_state().unwrap().last_sync, Some(summary));
+    if let Some(status) = b.cli_ok(&["status", "--porcelain"]) {
+        assert_eq!(status, " M y.md\n?? draft.md\n");
+    }
+}
+
+// 4. diverged, no overlap
+
+#[test]
+fn diverged_commits_on_different_files_are_rebased_into_a_line() {
+    let (remote, a, b) = two_devices(&[("base.md", "base\n")]);
+    for name in ["a1", "a2", "a3"] {
+        a.write(&format!("{name}.md"), name);
+        a.commit(name);
+    }
+    a.repo.push(None).unwrap();
+    for name in ["b1", "b2"] {
+        b.write(&format!("{name}.md"), name);
+        b.commit(name);
+    }
+
+    let summary = b.pull_applied();
+    assert_eq!(summary.plan, PullPlan::Rebase);
+    assert_eq!(summary.rebased, 2);
+    assert_eq!(summary.incoming_count, 3);
+    let mut files: Vec<_> = summary.files.iter().map(|f| f.path.as_str()).collect();
+    files.sort();
+    assert_eq!(files, ["a1.md", "a2.md", "a3.md"]);
+    assert_eq!(
+        b.files(),
+        ["a1.md", "a2.md", "a3.md", "b1.md", "b2.md", "base.md"]
+    );
+    assert_eq!(
+        b.history(),
+        [
+            ("b2".into(), 1),
+            ("b1".into(), 1),
+            ("a3".into(), 1),
+            ("a2".into(), 1),
+            ("a1".into(), 1),
+            ("Base".into(), 0)
+        ]
+    );
+    assert_eq!(b.changes(), []);
+    let state = b.repo.sync_state().unwrap();
+    assert_eq!((state.ahead, state.behind), (2, 0));
+    let git = b.git();
+    let replayed = git.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(replayed.author().name(), Ok("Test Author"));
+
+    assert!(matches!(b.repo.push(None), Ok(PushOutcome::Pushed { .. })));
+    assert_eq!(remote.head("main"), Some(b.head()));
+    a.pull_applied();
+    assert_eq!(a.files(), b.files());
 }
 
 #[test]
-fn local_merge_commits_are_merged_not_rebased() {
+fn a_diverged_pull_with_a_same_change_on_both_sides_is_automatic() {
+    let (_remote, a, b) = two_devices(&[("entry.md", "base\n")]);
+    a.write("entry.md", "same edit\n");
+    a.write("a.md", "a\n");
+    commit_and_push(&a, "A");
+    b.write("entry.md", "same edit\n");
+    b.write("b.md", "b\n");
+    b.commit("B");
+    let summary = b.pull_applied();
+    assert_eq!(summary.plan, PullPlan::Rebase);
+    assert_eq!(b.text("entry.md"), "same edit\n");
+    assert_eq!(b.files(), ["a.md", "b.md", "entry.md"]);
+}
+
+// 15. local merge commits
+
+#[test]
+fn local_merge_commits_need_a_merge_commit_even_without_overlaps() {
     let (_remote, a, b) = two_devices(&[("base.md", "base\n")]);
     a.write("a.md", "a\n");
     commit_and_push(&a, "A");
@@ -659,7 +605,6 @@ fn local_merge_commits_are_merged_not_rebased() {
     let main = b.commit("B");
     let git = b.git();
     let base = git.find_commit(main).unwrap().parent(0).unwrap();
-    let mut index = git.index().unwrap();
     let side_blob = git.blob(b"side\n").unwrap();
     let mut builder = git.treebuilder(Some(&base.tree().unwrap())).unwrap();
     builder.insert("side.md", side_blob, 0o100644).unwrap();
@@ -681,17 +626,65 @@ fn local_merge_commits_are_merged_not_rebased() {
         &[&main, &side],
     )
     .unwrap();
+    let mut index = git.index().unwrap();
     index.read_tree(&tree).unwrap();
     index.write().unwrap();
     git.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
         .unwrap();
 
-    let out = pull(&b);
-    assert_eq!(out.rebased, 0);
-    assert_eq!(b.history()[0].1, 2, "a merge commit joins the two sides");
+    let before = b.state();
+    let preview = b.pull_review();
+    assert_eq!(b.state(), before);
+    assert_eq!(preview.plan, PullPlan::Merge);
+    assert!(!preview.automatic);
+    assert_eq!(preview.overlaps, []);
+    assert_eq!(preview.local_count, 3);
+    assert_eq!(
+        b.repo.apply_pull(&preview.id, &[], None, &author()),
+        Err(Error::EmptyMessage)
+    );
+    assert_eq!(b.state(), before);
+    let summary = b
+        .repo
+        .apply_pull(&preview.id, &[], Some("Merge from GitHub"), &author())
+        .unwrap();
+    assert_eq!(summary.plan, PullPlan::Merge);
+    assert_eq!(summary.merge_commit, Some(b.head().to_string()));
+    assert_eq!(b.history()[0], ("Merge from GitHub".into(), 2));
     assert_eq!(b.files(), ["a.md", "b.md", "base.md", "side.md"]);
     assert_eq!(b.changes(), []);
     assert!(matches!(b.repo.push(None), Ok(PushOutcome::Pushed { .. })));
+}
+
+// 21. kept from before: line endings, ignored files, links, case
+
+#[test]
+fn pulled_bytes_are_exact() {
+    let remote = Remote::new();
+    let a = Device::new();
+    let files: [(&str, &[u8]); 4] = [
+        ("crlf.md", b"one\r\ntwo\r\nthree\r\n"),
+        ("no-newline.md", b"no final newline"),
+        ("mixed.md", b"lf\ncrlf\r\nlone cr\rend"),
+        ("assets/binary.jpg", b"\xff\xd8\x00\r\n\x00\xff"),
+    ];
+    for (path, content) in files {
+        a.write(path, content);
+    }
+    a.commit("Files");
+    a.repo.connect(&remote.url, None, &author()).unwrap();
+
+    let b = Device::connected(&remote);
+    for (path, content) in files {
+        assert_eq!(b.read(path), content, "{path}");
+    }
+    a.write("crlf.md", "ONE\r\ntwo\r\nthree\r\n");
+    a.write("no-newline.md", "still no final newline");
+    commit_and_push(&a, "Edits");
+    b.pull_applied();
+    assert_eq!(b.read("crlf.md"), b"ONE\r\ntwo\r\nthree\r\n");
+    assert_eq!(b.read("no-newline.md"), b"still no final newline");
+    assert_eq!(b.read("mixed.md"), files[2].1);
 }
 
 #[test]
@@ -704,99 +697,25 @@ fn ignored_local_files_are_never_overwritten() {
     let mut index = git.index().unwrap();
     index.add_path(std::path::Path::new("notes.local")).unwrap();
     index.write().unwrap();
-    a.commit("Track an ignored path");
+    git.commit(
+        Some("HEAD"),
+        &git2::Signature::now("A", "a@example.com").unwrap(),
+        &git2::Signature::now("A", "a@example.com").unwrap(),
+        "Track an ignored path",
+        &git.find_tree(index.write_tree().unwrap()).unwrap(),
+        &[&git.head().unwrap().peel_to_commit().unwrap()],
+    )
+    .unwrap();
     a.repo.push(None).unwrap();
 
-    let out = pull(&b);
-    assert_eq!(b.text("notes.local"), "tracked on a\n");
-    let [Conflict {
-        copy: Some(copy), ..
-    }] = &out.conflicts[..]
-    else {
-        panic!(
-            "expected the ignored file to be moved aside: {:?}",
-            out.conflicts
-        );
-    };
-    assert!(is_conflict_copy(copy, "notes", ".local"), "{copy}");
-    assert_eq!(b.text(copy), "private, ignored\n");
-}
-
-#[test]
-fn connect_follows_the_remotes_default_branch() {
-    let remote = Remote::new();
-    let a = Device::with_branch("journal");
-    a.write("a.md", "a\n");
-    a.commit("A");
-    a.repo.connect(&remote.url, None, &author()).unwrap();
-    git2::Repository::open_bare(&remote.path)
-        .unwrap()
-        .set_head("refs/heads/journal")
-        .unwrap();
-
-    let b = Device::new();
-    b.write("b.md", "b\n");
-    b.commit("B");
-    let out = b.repo.connect(&remote.url, None, &author()).unwrap();
-    assert_eq!(out.state.branch, "journal");
-    assert_eq!(out.rebased, 1);
-    assert_eq!(b.files(), ["a.md", "b.md"]);
-}
-
-#[test]
-fn a_case_only_rename_loses_nothing() {
-    let (_remote, a, b) = two_devices(&[("entry.md", "text\n")]);
-    // Committed with plain git: the app itself only writes lowercase names.
-    let git = a.git();
-    let blob = git.blob(b"text\n").unwrap();
-    let head = git.head().unwrap().peel_to_commit().unwrap();
-    let mut builder = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
-    builder.remove("entry.md").unwrap();
-    builder.insert("Entry.md", blob, 0o100644).unwrap();
-    let tree = git.find_tree(builder.write().unwrap()).unwrap();
-    let sig = git2::Signature::now("Test Author", "test@example.com").unwrap();
-    git.commit(Some("HEAD"), &sig, &sig, "Capitalise", &tree, &[&head])
-        .unwrap();
-    a.repo.push(None).unwrap();
-
-    pull(&b);
-    // Whatever the file system's case rules, the remote's file is there and nothing is deleted.
-    assert_eq!(b.text("Entry.md"), "text\n");
-    assert!(b
-        .repo
-        .status()
-        .unwrap()
-        .iter()
-        .all(|change| change.kind != ChangeKind::Deleted));
-    for file in b.files() {
-        assert_eq!(b.text(&file), "text\n", "{file}");
-    }
-}
-
-#[test]
-fn rebase_and_uncommitted_edits_merge_together() {
-    let (_remote, a, b) = two_devices(&[("entry.md", "1\n2\n3\n4\n5\n6\n7\n")]);
-    a.write("entry.md", "1 from a\n2\n3\n4\n5\n6\n7\n");
-    commit_and_push(&a, "A");
-    b.write("entry.md", "1\n2\n3\n4 committed on b\n5\n6\n7\n");
-    b.commit("B");
-    b.write(
-        "entry.md",
-        "1\n2\n3\n4 committed on b\n5\n6\n7 typed on b\n",
+    let before = b.state();
+    let result = b.repo.pull(None, &author());
+    assert!(
+        matches!(&result, Err(Error::Git(m)) if m.contains("notes.local") && m.contains("ignored")),
+        "{result:?}"
     );
-
-    let out = pull(&b);
-    assert_eq!((out.rebased, out.conflicts.len()), (1, 0));
-    assert_eq!(out.merged, ["entry.md"]);
-    assert_eq!(
-        b.committed("entry.md"),
-        Some(b"1 from a\n2\n3\n4 committed on b\n5\n6\n7\n".to_vec())
-    );
-    assert_eq!(
-        b.text("entry.md"),
-        "1 from a\n2\n3\n4 committed on b\n5\n6\n7 typed on b\n"
-    );
-    assert_eq!(b.changes(), [("entry.md".into(), ChangeKind::Modified)]);
+    assert_eq!(b.state(), before);
+    assert_eq!(b.text("notes.local"), "private, ignored\n");
 }
 
 #[test]
@@ -819,46 +738,101 @@ fn a_remote_symlink_is_refused_and_nothing_is_written() {
         .unwrap();
     a.repo.push(None).unwrap();
 
-    let before = b.head();
+    let before = b.state();
     let result = b.repo.pull(None, &author());
     assert!(
         matches!(&result, Err(Error::Git(m)) if m.contains("symbolic link")),
         "{result:?}"
     );
-    assert_eq!(b.head(), before);
-    assert_eq!(b.files(), ["base.md"]);
+    assert_eq!(b.state(), before);
     assert!(b.root().join("assets").symlink_metadata().is_err());
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    assert!(matches!(b.repo.preview_pull(), Err(Error::Git(_))));
 }
 
 #[test]
-fn a_remote_rename_and_edit_with_a_local_edit_is_reported() {
+fn names_that_differ_only_in_case_are_refused() {
+    let (_remote, a, b) = two_devices(&[("base.md", "base\n")]);
+    let git = a.git();
+    let blob = git.blob(b"x\n").unwrap();
+    let head = git.head().unwrap().peel_to_commit().unwrap();
+    let mut builder = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    builder.insert("Note.md", blob, 0o100644).unwrap();
+    builder.insert("note.md", blob, 0o100644).unwrap();
+    let tree = git.find_tree(builder.write().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test Author", "test@example.com").unwrap();
+    git.commit(Some("HEAD"), &sig, &sig, "Case", &tree, &[&head])
+        .unwrap();
+    a.repo.push(None).unwrap();
+
+    let before = b.state();
+    let result = b.repo.pull(None, &author());
+    assert!(
+        matches!(&result, Err(Error::Git(m)) if m.contains("same name")),
+        "{result:?}"
+    );
+    assert_eq!(b.state(), before);
+}
+
+#[test]
+fn a_case_only_rename_loses_nothing() {
+    let (_remote, a, b) = two_devices(&[("entry.md", "text\n")]);
+    // Committed with plain git: the app itself only writes lowercase names.
+    let git = a.git();
+    let blob = git.blob(b"text\n").unwrap();
+    let head = git.head().unwrap().peel_to_commit().unwrap();
+    let mut builder = git.treebuilder(Some(&head.tree().unwrap())).unwrap();
+    builder.remove("entry.md").unwrap();
+    builder.insert("Entry.md", blob, 0o100644).unwrap();
+    let tree = git.find_tree(builder.write().unwrap()).unwrap();
+    let sig = git2::Signature::now("Test Author", "test@example.com").unwrap();
+    git.commit(Some("HEAD"), &sig, &sig, "Capitalise", &tree, &[&head])
+        .unwrap();
+    a.repo.push(None).unwrap();
+
+    b.pull_applied();
+    // Whatever the file system's case rules, the remote's file is there and nothing is deleted.
+    assert_eq!(b.text("Entry.md"), "text\n");
+    assert!(b
+        .repo
+        .status()
+        .unwrap()
+        .iter()
+        .all(|change| change.kind != ChangeKind::Deleted));
+    for file in b.files() {
+        assert_eq!(b.text(&file), "text\n", "{file}");
+    }
+    // And Undo brings the old name back.
+    b.repo.undo_last_sync().unwrap();
+    assert_eq!(b.text("entry.md"), "text\n");
+    assert_eq!(b.changes(), []);
+}
+
+#[test]
+fn a_remote_rename_of_a_file_edited_here_asks() {
     let body = "A long enough entry for rename detection to recognise it.\n".repeat(4);
     let (old, new) = ("2026-11-16-1402-old.md", "2026-11-16-1402-new.md");
     let (_remote, a, b) = two_devices(&[(old, &body)]);
-    a.remove(old);
-    a.write(new, format!("Top line from a.\n{body}"));
-    commit_and_push(&a, "Rename and edit");
-    let local = format!("{body}Bottom line from b.\n");
-    b.write(old, &local);
+    fs::rename(a.root().join(old), a.root().join(new)).unwrap();
+    commit_and_push(&a, "Rename");
+    let edited = format!("{body}One more line from b.\n");
+    b.write(old, &edited);
 
-    let out = pull(&b);
-    assert_eq!(
-        b.text(new),
-        format!("Top line from a.\n{body}Bottom line from b.\n")
+    let preview = b.pull_review();
+    let renamed = overlap(&preview, old);
+    assert_eq!(renamed.kind, OverlapKind::ModifiedDeleted);
+    assert_eq!(preview.auto, [change(new, ChangeKind::Added)]);
+    // Keeping mine keeps the edit at the old name, and GitHub's new name arrives too.
+    b.apply(
+        &preview,
+        &[common::resolved(old, mdgj_git::Resolution::Mine)],
     );
-    assert_eq!(b.text(old), local, "b's exact bytes stay on disk");
-    assert_eq!(
-        out.conflicts,
-        [Conflict {
-            path: new.into(),
-            copy: Some(old.into())
-        }]
-    );
+    assert_eq!(b.text(old), edited);
+    assert_eq!(b.text(new), body);
 }
 
 /// A small PNG with some texture; `seed` changes it.
-fn png(seed: u32) -> Vec<u8> {
+pub fn png(seed: u32) -> Vec<u8> {
     let image = image::RgbImage::from_fn(96, 64, |x, y| {
         image::Rgb([
             ((x + seed) % 256) as u8,
@@ -871,8 +845,10 @@ fn png(seed: u32) -> Vec<u8> {
     bytes.into_inner()
 }
 
+// 10 (second half). Photos added to one entry on two devices.
+
 #[test]
-fn photos_added_to_one_entry_on_two_devices_both_survive() {
+fn photos_added_to_one_entry_on_two_devices_both_arrive() {
     use mdgj_core::{ImageOpts, Journal};
     const OPTS: ImageOpts = ImageOpts {
         max_edge: 1024,
@@ -881,6 +857,10 @@ fn photos_added_to_one_entry_on_two_devices_both_survive() {
     let entry = "2026-11-16-1402-run.md";
     let base = "Line one.\nLine two.\nLine three.\n";
     for (b_commits_first, b_seed) in [(false, 1), (true, 1), (false, 0), (true, 0)] {
+        let case = format!(
+            "b commits first: {b_commits_first}, same photo: {}",
+            b_seed == 0
+        );
         let (_remote, a, b) = two_devices(&[(entry, base)]);
         let from_a = Journal::open(a.root())
             .unwrap()
@@ -904,17 +884,26 @@ fn photos_added_to_one_entry_on_two_devices_both_survive() {
             b.commit("Photo on b");
         }
 
-        let out = pull(&b);
-        let case = format!(
-            "b commits first: {b_commits_first}, same photo: {}",
-            b_seed == 0
-        );
-        assert_eq!(out.conflicts, [], "{case}");
+        // The photos never clash (named by content); the entry's two edits merge cleanly.
+        let preview = b.pull_review();
+        assert_eq!(preview.overlaps.len(), 1, "{case}");
+        let text = overlap(&preview, entry);
+        let suggestion = text.suggestion.as_ref().unwrap();
+        assert!(suggestion.clean, "{case}");
+        let merged = suggestion.text().unwrap();
         assert_eq!(
-            b.text(entry),
+            merged,
             format!("Line one.\n![]({from_a})\nLine two.\nLine three.\n![]({from_b})\n"),
             "{case}"
         );
+        let photo_arrives = from_a != from_b;
+        assert_eq!(
+            preview.auto.iter().any(|f| f.path == from_a),
+            photo_arrives,
+            "{case}"
+        );
+        b.apply(&preview, &[common::merged(entry, &merged)]);
+        assert_eq!(b.text(entry), merged, "{case}");
         assert_eq!(b.read(&from_a), a.read(&from_a), "{case}");
         assert_eq!(b.read(&from_b), b_bytes, "{case}");
         assert_eq!(from_a == from_b, b_seed == 0, "{case}");

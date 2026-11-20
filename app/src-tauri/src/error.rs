@@ -17,6 +17,23 @@ pub enum Kind {
     Invalid,
     Io,
     Git,
+    /// The review is out of date: something changed since it was computed. Nothing was written.
+    StaleReview,
+    /// A git merge is in progress; it must be finished or aborted first.
+    MergeInProgress,
+    /// Undo would overwrite newer text or rewind history that was pushed.
+    UndoRefused,
+}
+
+impl Kind {
+    /// Whether this failure is the sync's (the Pull button's red dot), rather than an answer for
+    /// the sheet that asked, such as an empty message or a review that went stale.
+    pub fn is_sync_failure(self) -> bool {
+        matches!(
+            self,
+            Kind::Auth | Kind::Reauth | Kind::Network | Kind::NotConnected | Kind::Io | Kind::Git
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -68,6 +85,10 @@ impl From<mdgj_git::Error> for Error {
             E::NotConnected => Kind::NotConnected,
             E::Git(_) => Kind::Git,
             E::Io(_) => Kind::Io,
+            E::StaleReview => Kind::StaleReview,
+            E::MergeInProgress => Kind::MergeInProgress,
+            E::UndoRefused(_) => Kind::UndoRefused,
+            E::Invalid(_) => Kind::Invalid,
         };
         Self::new(kind, err.to_string())
     }
@@ -125,11 +146,54 @@ mod tests {
             (E::NotConnected, Kind::NotConnected),
             (E::Git("index is locked".into()), Kind::Git),
             (E::Io("disk full".into()), Kind::Io),
+            (E::StaleReview, Kind::StaleReview),
+            (E::MergeInProgress, Kind::MergeInProgress),
+            (
+                E::UndoRefused("You've changed 2026-11-16-1402-run.md since the pull.".into()),
+                Kind::UndoRefused,
+            ),
+            (
+                E::Invalid("There is no pull to undo.".into()),
+                Kind::Invalid,
+            ),
         ];
         for (err, kind) in cases {
             let message = err.to_string();
             assert_eq!(Error::from(err), Error::new(kind, message));
         }
+    }
+
+    #[test]
+    fn new_kinds_serialize_in_snake_case() {
+        let kinds = [
+            (Kind::StaleReview, "stale_review"),
+            (Kind::MergeInProgress, "merge_in_progress"),
+            (Kind::UndoRefused, "undo_refused"),
+        ];
+        for (kind, name) in kinds {
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(name));
+        }
+    }
+
+    #[test]
+    fn only_sync_failures_light_the_red_dot() {
+        let red = [
+            Kind::Auth,
+            Kind::Reauth,
+            Kind::Network,
+            Kind::NotConnected,
+            Kind::Io,
+            Kind::Git,
+        ];
+        let answers = [
+            Kind::EmptyMessage,
+            Kind::Invalid,
+            Kind::StaleReview,
+            Kind::MergeInProgress,
+            Kind::UndoRefused,
+        ];
+        assert!(red.iter().all(|k| k.is_sync_failure()));
+        assert!(answers.iter().all(|k| !k.is_sync_failure()));
     }
 
     #[test]

@@ -15,13 +15,17 @@
 
   function open(dialog: HTMLDialogElement) {
     dialog.showModal();
-    dialog.querySelector<HTMLElement>("[data-autofocus]")?.focus();
+    const target = dialog.querySelector<HTMLElement>("[data-autofocus]");
+    if (target) target.focus();
+    // On the phone, nothing is chosen for the user: no ring on the first button, no keyboard.
+    else if (document.documentElement.dataset.layout === "phone") dialog.focus();
     return () => dialog.close();
   }
 </script>
 
 <dialog
   {@attach open}
+  tabindex="-1"
   class:wide
   aria-label={label}
   oncancel={(e) => {
@@ -52,6 +56,10 @@
     color: var(--color-text);
     box-shadow: var(--shadow-sheet);
     animation: sheet-in 100ms ease-out;
+  }
+
+  dialog:focus {
+    outline: none;
   }
 
   dialog.wide {

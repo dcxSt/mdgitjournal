@@ -1,4 +1,4 @@
-<!-- Banners (needs-pull, conflicts, errors) and short toasts. -->
+<!-- Banners (needs-pull, a pull's summary, a merge in progress, errors) and short toasts. -->
 <script lang="ts">
   import type { AppState } from "../lib/app.svelte";
   import Icon from "./Icon.svelte";
@@ -26,22 +26,23 @@
             </ul>
           {/if}
         </div>
-        {#if notice.action}
-          {@const action = notice.action}
+        {#each notice.actions ?? [] as action (action.label)}
           <button
             type="button"
             class="action"
             onclick={() => {
-              app.notices.dismiss(notice.id);
+              if (!action.keep) app.notices.dismiss(notice.id);
               action.run();
             }}
           >
             {action.label}
           </button>
+        {/each}
+        {#if !notice.persistent}
+          <button type="button" class="dismiss" aria-label="Dismiss" onclick={() => app.notices.dismiss(notice.id)}>
+            <Icon name="close" size={12} />
+          </button>
         {/if}
-        <button type="button" class="dismiss" aria-label="Dismiss" onclick={() => app.notices.dismiss(notice.id)}>
-          <Icon name="close" size={12} />
-        </button>
       </div>
     {/each}
   </div>
@@ -123,6 +124,10 @@
   .action {
     flex: none;
     color: var(--color-accent);
+  }
+
+  .action + .action {
+    margin-left: -4px;
   }
 
   .dismiss {

@@ -94,6 +94,10 @@ button:disabled {
   background: transparent;
 }
 
+input[type="checkbox"] {
+  accent-color: var(--color-accent);
+}
+
 :focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 1px;

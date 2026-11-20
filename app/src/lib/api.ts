@@ -7,6 +7,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type {
   AppInfo,
+  ApplyResult,
   AuthStatus,
   CommandError,
   CommitPushResult,
@@ -15,10 +16,13 @@ import type {
   EntryContent,
   EntryMeta,
   ErrorKind,
+  FileDiff,
   GithubUrls,
   ImportedImage,
   PullResult,
   RepoInfo,
+  Resolved,
+  RestoreResult,
   SearchHit,
   Settings,
   SyncView,
@@ -45,9 +49,24 @@ export interface Api {
 
   syncState(): Promise<SyncView>;
   fetch(): Promise<SyncView>;
+  /** Fetches, then applies at once only if nothing changed on both sides; otherwise a review. */
   pull(): Promise<PullResult>;
-  commit(message: string): Promise<SyncView>;
-  commitAndPush(message: string): Promise<CommitPushResult>;
+  /** The review for what was last fetched; local only and never applies (`up_to_date` or `review`). */
+  pullPreview(): Promise<PullResult>;
+  /** Writes the review's choices; `stale_review` if anything changed since it was computed. */
+  applyPull(id: string, resolutions: Resolved[], message: string | null): Promise<ApplyResult>;
+  /** Reverses the last pull (`view.lastSync`), or fails with `undo_refused`. */
+  undoSync(): Promise<RestoreResult>;
+  /** Resolve with git: leaves a standard merge in progress. `message` commits uncommitted edits first. */
+  startExternalMerge(id: string, message: string | null): Promise<SyncView>;
+  /** `git merge --abort`, and uncommits what Resolve with git committed first. */
+  abortMerge(): Promise<RestoreResult>;
+  /** A commit on this device only, of the given changed paths. */
+  commit(message: string, paths: string[]): Promise<SyncView>;
+  /** Commits the given paths and pushes; a blank message with no paths only pushes waiting commits. */
+  commitAndPush(message: string, paths: string[]): Promise<CommitPushResult>;
+  /** One changed file against HEAD. */
+  diff(path: string): Promise<FileDiff>;
 
   authStatus(): Promise<AuthStatus>;
   githubDeviceStart(): Promise<DeviceStart>;
@@ -150,8 +169,14 @@ export function createTauriApi(): Api {
     syncState: () => call("sync_state"),
     fetch: () => call("fetch"),
     pull: () => call("pull"),
-    commit: (message) => call("commit", { message }),
-    commitAndPush: (message) => call("commit_and_push", { message }),
+    pullPreview: () => call("pull_preview"),
+    applyPull: (id, resolutions, message) => call("apply_pull", { id, resolutions, message }),
+    undoSync: () => call("undo_sync"),
+    startExternalMerge: (id, message) => call("start_external_merge", { id, message }),
+    abortMerge: () => call("abort_merge"),
+    commit: (message, paths) => call("commit", { message, paths }),
+    commitAndPush: (message, paths) => call("commit_and_push", { message, paths }),
+    diff: (path) => call("diff", { path }),
 
     authStatus: () => call("auth_status"),
     githubDeviceStart: () => call("github_device_start"),

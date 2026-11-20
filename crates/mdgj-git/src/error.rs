@@ -18,6 +18,17 @@ pub enum Error {
     Git(String),
     #[error("File error: {0}")]
     Io(String),
+    /// The review no longer matches the journal: a fetch, an edit or a commit came in between.
+    #[error("Something changed since you opened the review.")]
+    StaleReview,
+    #[error("A merge is in progress. Finish it with git, or abort it.")]
+    MergeInProgress,
+    /// Why Undo would lose something; the message names the files, or the commit or push since.
+    #[error("{0}")]
+    UndoRefused(String),
+    /// A request that doesn't fit the repository, e.g. resolutions that don't match the review.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 impl From<git2::Error> for Error {

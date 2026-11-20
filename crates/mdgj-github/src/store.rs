@@ -128,6 +128,13 @@ impl KeyringStore {
         Self::with_keyring(keyring, fallback_file.into())
     }
 
+    /// The file alone: the OS keyring is never built, read or written, and `backend()` is
+    /// `"file"`. For `MDGJ_CONFIG_DIR`, so instances with their own folders never share (or
+    /// clobber) one keychain item, and test runs never touch the real keychain.
+    pub fn file_only(file: impl Into<PathBuf>) -> Self {
+        Self::with_keyring(None, file.into())
+    }
+
     fn with_keyring(keyring: Option<OsKeyring>, fallback_file: PathBuf) -> Self {
         Self {
             keyring,
@@ -549,6 +556,23 @@ mod tests {
         let err = keyring_store(&fake, &file).clear().unwrap_err();
         assert!(matches!(err, Error::Store(_)), "{err:?}");
         assert!(err.to_string().contains("keychain"), "{err}");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn file_only_never_builds_the_keyring() {
+        let (_dir, file) = credentials_file();
+        let store = KeyringStore::file_only(&file);
+        assert!(store.keyring.is_none());
+        // "file" from the start, not only after a keyring failure.
+        assert_eq!(store.backend(), "file");
+        assert_eq!(store.load().unwrap(), None);
+        store.save(&auth(AuthKind::Pat, "ghp_a")).unwrap();
+        assert_eq!(store.load().unwrap(), Some(auth(AuthKind::Pat, "ghp_a")));
+        #[cfg(unix)]
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(store.backend(), "file");
+        store.clear().unwrap();
         assert!(!file.exists());
     }
 

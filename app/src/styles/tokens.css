@@ -9,6 +9,8 @@
   --color-syntax: #b8b3a8;
   --color-accent: #3d6fb4;
   --color-danger: #a63f33;
+  /* GitHub's side in the merge view; "yours" is the accent. */
+  --color-theirs: #9a6818;
 
   --font-styled: ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif;
   --font-source: ui-monospace, "SF Mono", "JetBrains Mono", "DejaVu Sans Mono", monospace;
@@ -34,6 +36,7 @@
     --color-syntax: #5f5b54;
     --color-accent: #7ea6e0;
     --color-danger: #e07a6c;
+    --color-theirs: #d6ad62;
   }
 }
 
@@ -45,4 +48,5 @@
   --color-syntax: #5f5b54;
   --color-accent: #7ea6e0;
   --color-danger: #e07a6c;
+  --color-theirs: #d6ad62;
 }

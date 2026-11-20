@@ -78,7 +78,7 @@ All serde structs use `#[serde(rename_all = "camelCase")]`, so they cross the Ta
 
 ## Crate: `mdgj-git`
 
-The crate uses libgit2 via `git2 = { default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }`. OpenSSL is built from source on every target because libgit2-sys links it on all Unix targets, though macOS and iOS use Apple's TLS. No SSH. **No new dependency** is needed for the sync review: line diffs come from libgit2 (`git2::Patch::from_buffers`, the same xdiff git uses), and the three-way chunking is ~150 lines in `src/diff3.rs`.
+The crate uses libgit2 via `git2 = { default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }`. OpenSSL is built from source on every target because libgit2-sys links it on all Unix targets, though macOS and iOS use Apple's TLS. No SSH. Line diffs come from libgit2 (`git2::Patch::from_buffers`, the same xdiff git uses), and the three-way chunking is in `src/diff3.rs`. `serde_json` (already in the workspace, for mdgj-core and mdgj-github) reads and writes the undo and merge records.
 
 The rule everything below implements: **a path changed on one side only flows automatically; a path changed on both sides waits for the user.** Nothing in this crate ever writes conflict markers into the journal, except `start_external_merge`, which exists to do exactly that, the way `git merge` does.
 
@@ -133,9 +133,9 @@ pub struct PullPreview {
   pub branch: String,
   pub plan: PullPlan,
   pub automatic: bool,            // overlaps.is_empty() && plan != Merge: Pull applies it without asking
-  pub incoming: Vec<CommitInfo>,  // B..R, newest first, at most 50
+  pub incoming: Vec<CommitInfo>,  // L..R (in R, not in L), newest first, at most 50
   pub incoming_count: u32,
-  pub local: Vec<CommitInfo>,     // B..L (unpushed), newest first, at most 50
+  pub local: Vec<CommitInfo>,     // R..L (unpushed), newest first, at most 50
   pub local_count: u32,
   pub auto: Vec<FileChange>,      // one-sided incoming changes, as they will change the working tree (renames detected)
   pub overlaps: Vec<Overlap>,     // sorted by path
@@ -145,7 +145,7 @@ pub enum Choice { Mine, Theirs, Both, Merged }
 pub struct Overlap {
   pub path: String,
   pub kind: OverlapKind,
-  pub binary: bool,               // any present side is not UTF-8 or contains a NUL byte
+  pub binary: bool,               // any present side is not UTF-8, contains a NUL byte, or isn't a regular file (symlink, submodule)
   pub base: Option<String>, pub mine: Option<String>, pub theirs: Option<String>, // full text; None if that side is absent or the file is binary
   pub choices: Vec<Choice>,       // allowed, in this order: text both-sides [mine, theirs, both, merged]; binary both-sides [mine, theirs, both]; modified_deleted / deleted_modified [mine, theirs]
   pub copy: Option<String>,       // where Keep both puts GitHub's version; Some iff `both` is allowed
@@ -195,11 +195,11 @@ pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(
 // Display messages are user-readable; "failed to connect to …" is Network.
 ```
 
-`Conflict` and the old `PullOutcome { updated, merged, conflicts, rebased }` are **removed**, as is every keep-both / `.conflict-hhmm` path.
+There is no silent merge: no conflict copies, no remote-wins, no 3-way merge applied without the review.
 
 ### Names used below
 
-- `b` = the branch HEAD is on (a detached HEAD is `Error::Git`, as now). `L` = HEAD's commit (may be unborn). `R` = `refs/remotes/origin/<b>`. `B` = merge-base(L, R); none (unborn L, or unrelated histories) means the empty tree.
+- `b` = the branch HEAD is on (a detached HEAD is `Error::Git`). `L` = HEAD's commit (may be unborn). `R` = `refs/remotes/origin/<b>`. `B` = merge-base(L, R); none (unborn L, or unrelated histories) means the empty tree.
 - `W` = the working tree as a tree: tracked and untracked files, minus ignored ones (the existing in-memory `Snapshot`, which writes nothing).
 - For a path `p`: `base[p]`, `local[p]` (in L), `work[p]` (in W), `remote[p]` (in R), each a `(blob, mode)` or absent. **Mine = `work[p]`** (what is on disk, including unpushed commits and uncommitted edits); **GitHub's = `remote[p]`**.
 - **Remote-changed** `C_R = { p : base[p] ≠ remote[p] }`. **Locally changed** `C_W = { p : base[p] ≠ work[p] }`.
@@ -213,12 +213,12 @@ pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(
 1. `repo.state()` must be clean: a merge → `Error::MergeInProgress`; any other operation (rebase, cherry-pick, …) → `Error::Git("a git <op> is in progress; finish it with git first")`. A leftover `merge.json` with a clean state is deleted first (the user finished or aborted with git).
 2. No R, or L == R, or R is an ancestor of L → `None` (up to date).
 3. Compute W, O, `O_c`, the plan, `auto`, the overlaps and their suggestions.
-4. Check the target tree it would write (W with `auto` applied and any resolution) as `worktree::apply` does today: no symlinks from the remote, no two paths that differ only in case, no folder in the way of a file. A failure is `Error::Git`/`Error::Io` naming the path and asking to fix it with git; there is no review for these.
+4. Check the target tree it would write (W with `auto` applied and any resolution) as `worktree::apply` does: no symlinks from the remote, no two paths that differ only in case, no folder in the way of a file, no ignored local file where GitHub has a file ("…is on this device but ignored by git… move it out of the way"), no file name that isn't UTF-8 among the paths it writes or removes (the undo record keys them as JSON strings). A failure is `Error::Git`/`Error::Io` naming the path and asking to fix it with git; there is no review for these.
 5. Everything is computed on the snapshot's in-memory object database (mempack), so **no object, ref, index or file is written**. `Cancel` therefore needs no backend call at all.
 
 **Plan:**
 - `FastForward` — L is unborn, or L is an ancestor of R.
-- `Rebase` — diverged, and all of: no commit in B..L has more than one parent; `O_c` is empty; every commit of B..L replays onto R with `merge_trees` without a conflict (tried in memory, oldest first, as the current `rebase` does; commits that become empty are dropped).
+- `Rebase` — diverged, and all of: no commit in R..L has more than one parent; `O_c` is empty; every commit of R..L replays onto R with `merge_trees` without a conflict (tried in memory, oldest first, with rename detection off to match the per-path overlaps; commits that become empty are dropped); and the replay ends with exactly the per-path tree (local's version where the local commits changed a path, else GitHub's).
 - `Merge` — diverged otherwise. A merge commit is always shown to the user first, so **`Merge` is never automatic**, even with no overlaps (then the review only asks for the commit message).
 
 **Suggestion (`diff3.rs`):** split base, mine and theirs into lines *including their line break* (`split_inclusive('\n')`, so `\r\n` and a missing last newline survive byte for byte). Diff base→mine and base→theirs with `git2::Patch::from_buffers` (`context_lines(0)`, `interhunk_lines(0)`, force text, Myers). Walk the hunks in base order; hunks from the two sides that overlap **or touch** (as git does: adjacent edits clash) form one group. A group with hunks from one side is `Mine`/`Theirs`; from both sides, it is `Both` if the two replacements are identical, else `Clash` (over the union of their base ranges, each side's text for that range). Unchanged runs are `Same`. `clean` = no `Clash`. For `both_added`, base is `""`.
@@ -232,12 +232,12 @@ pub enum Error { EmptyMessage, Auth(String), Network(String), NotConnected, Git(
 3. Target working tree `T`: `T[p] = work[p]` for p ∉ C_R; `T[p] = remote[p]` for p ∈ C_R \ O; for p ∈ O by its resolution — `mine`: `work[p]` (absent if deleted here); `theirs`: `remote[p]` (absent if deleted on GitHub); `both`: `work[p]` at p and `remote[p]` at `copy`; `merged`: the given text's bytes exactly, with mine's file mode.
 4. New head `N`:
    - `FastForward`: N = R.
-   - `Rebase`: replay B..L onto R (as today: original author and message, the app's author as committer). Summary: `rebased` = commits replayed.
+   - `Rebase`: replay R..L onto R, oldest first (original author and message, the app's author as committer). Summary: `rebased` = commits replayed.
    - `Merge`: a commit with parents `[L, R]`, the given message (`message_prettify`d), the app's author as author and committer, and this tree: for each path, if `local[p] == base[p]` then `remote[p]`; else if `remote[p] == base[p]` or `local[p] == remote[p]` then `local[p]`; else (p ∈ O_c) `T[p]`, plus `T[copy]` for a Keep both. So **the merge commit records how committed clashes were resolved** (with whatever uncommitted text those files had), and nothing else that was uncommitted.
    - In every plan, `T` minus `tree(N)` stays as uncommitted changes. With no committed overlap this means: **resolutions of files changed only by uncommitted edits are left uncommitted on top of GitHub's commits**, just as those edits were before the pull. No commit is made that the user didn't write.
 5. Plan every write and removal (paths where T ≠ W) with the existing safety checks; any problem → error, nothing written.
 6. Write the **undo record** (below) before touching a file.
-7. Write files (each re-checked against W immediately before it is replaced or removed; a file that changed in that instant stops the apply with `Error::StaleReview`; files already written are covered by Undo). Then the index = `tree(N)`; then `refs/heads/<b>` = N (reflog `mdgitjournal: pull (fast-forward|rebase|merge)`). Files first, as today: a failure part way leaves HEAD at L.
+7. Write files (each new content staged and fsynced first, then the file re-checked against W immediately before it is replaced or removed). Then the index = `tree(N)`; then `refs/heads/<b>` = N, as a compare-and-swap against L (reflog `mdgitjournal: pull (fast-forward|rebase|merge)`). Files first: a failure part way leaves HEAD at L. **Any failure after the undo record is written rolls everything back** — every file this pull wrote that is still as it left them, the index bytes, and the previous undo record — and returns the error; a file that changed in that instant, or a branch the git CLI moved meanwhile, is `Error::StaleReview`. So `StaleReview` always means nothing was written.
 8. Return the `SyncSummary` (also stored in the undo record).
 
 **`pull(creds, author)`** = fetch; `preview_pull`; `None` → `UpToDate`; `automatic` → `apply_pull(&preview.id, &[], None, author)` → `Applied`; else `Review` (nothing written).
@@ -254,14 +254,14 @@ Every applied pull (automatic or reviewed) replaces the single undo record:
 2. Refuse (`Error::UndoRefused`, nothing changed) if: HEAD is not on `branch`, or its tip ≠ `after` ("you've committed since"); or `after` ≠ `remote` and origin/<b> contains `after` ("it has been pushed"); or any recorded file is now neither its `after` nor its `before` content (message names the files: "You've changed X since the pull; Undo would overwrite it.").
 3. Restore each file to `before` (removing it if `before` is null) with the safe write path, put `undo-index` back as `.git/index` (or reset the index to L if there was none), set `refs/heads/<b>` to `before` (or delete the ref, keeping HEAD on the unborn branch), and delete the record and the ref. Returns the restored paths.
 
-The record is cleared by: a new apply, `commit`/`commit_and_push` that commits or pushes, `start_external_merge`, `remove_remote`. `last_sync()`/`SyncState.last_sync` report it only while the branch tip still equals `after`.
+The record is cleared by: a new apply, a `commit` (or `commit_and_push`) that commits, a `push` that pushes (`commit_and_push`'s too), `start_external_merge`, `remove_remote`. `last_sync()`/`SyncState.last_sync` report it only while the branch tip still equals `after`.
 
 ### Resolve with git (`start_external_merge(id, message)`), `merge_state`, `abort_merge`
 
 `start_external_merge`:
-1. Clean state, fresh `id` (else `Error::StaleReview`).
-2. If there are uncommitted changes (W ≠ tree(L)): `message` is required (`Error::EmptyMessage`), and they are committed first as one ordinary commit `P` (all paths, `commit_all`), so git can merge them and Abort can bring them back exactly. With no uncommitted changes `message` is ignored.
-3. Merge R into HEAD the way `git merge origin/<b>` does, with libgit2 (`Repository::merge`, checkout `safe` + `allow_conflicts` + standard `merge` conflict style, labels `HEAD` and `origin/<b>`, never overwriting ignored files): `MERGE_HEAD` = R, `MERGE_MSG` = `Merge remote-tracking branch 'origin/<b>'`, `MERGE_MODE`, `ORIG_HEAD` = HEAD (written by us; libgit2 doesn't), clean paths staged, conflicted paths with stage 1/2/3 index entries and conflict markers in the files. HEAD stays where it was. Unrelated histories are allowed (empty base).
+1. Clean state, fresh `id` (else `Error::StaleReview`). With no uncommitted changes and plan `fast_forward` there is nothing for git to merge: `Error::Invalid("There is nothing to merge: Pull brings in GitHub's commits as they are.")` (the review never offers it then, since it has no overlaps).
+2. Copy `.git/index` to `.git/mdgitjournal/merge-index`, so Abort restores it byte for byte. If there are uncommitted changes (W ≠ tree(L)): `message` is required (`Error::EmptyMessage`), and they are committed first as one ordinary commit `P` (all paths, `commit_all`), so git can merge them and Abort can bring them back exactly. With no uncommitted changes `message` is ignored.
+3. Merge R into HEAD the way `git merge origin/<b>` does, with libgit2 (`Repository::merge`, checkout `safe` + standard `merge` conflict style, labels `HEAD` and `origin/<b>`, never overwriting ignored files): `MERGE_HEAD` = R, `MERGE_MSG` = `Merge remote-tracking branch 'origin/<b>'`, `MERGE_MODE`, `ORIG_HEAD` = HEAD (written by us; libgit2 doesn't), clean paths staged, conflicted paths with stage 1/2/3 index entries and conflict markers in the files. HEAD stays where it was. Unrelated histories are allowed (empty base). The checkout is all-or-nothing (no `allow_conflicts`, with which libgit2 would skip a blocked file and leave half a merge); if it fails, `P` is taken back and the index restored before the error is returned.
 4. Write `.git/mdgitjournal/merge.json`: `{ "version": 1, "head": <L | null>, "precommit": <P | null>, "mergeHead": <R>, "startedAt": <ms> }`. Clear the undo record.
 
 `merge_state()` = `Some` iff `repo.state()` is `Merge` (also for a merge the user started with the CLI; `started_by_app` = `merge.json` exists). `conflicted` = paths with conflict entries in the index, sorted.
@@ -270,11 +270,11 @@ While a merge is in progress, `preview_pull`, `pull`, `apply_pull`, `commit`, `c
 
 `abort_merge()` (`git merge --abort` semantics):
 1. Not in a merge → `Error::Invalid("No merge is in progress.")`.
-2. Every path that is unmerged in the index, or whose index entry differs from HEAD, goes back to HEAD's version in the index and the working tree (removed if HEAD doesn't have it). Other files are left alone. Remove `MERGE_HEAD`, `MERGE_MSG`, `MERGE_MODE` (`cleanup_state`).
-3. If `merge.json` has a `precommit` and HEAD is still that commit: set the branch back to `head` (or unborn) and the index to `tree(head)`, leaving the working tree as it is — the edits are uncommitted again, exactly as before.
-4. Delete `merge.json`. Returns the restored paths.
+2. Every path that is unmerged in the index, or whose index entry differs from HEAD where the merged commit differs from HEAD too, goes back to HEAD's version in the working tree (removed if HEAD doesn't have it). Other files are left alone.
+3. The index: for a merge the app started (`merge.json` describes this merge), `merge-index` is put back byte for byte; otherwise the reset paths get HEAD's entries. If `merge.json` has a `precommit` and HEAD is still that commit, the branch goes back to `head` (or unborn), leaving the working tree as step 2 left it — the edits are uncommitted again, exactly as before.
+4. Remove `MERGE_HEAD`, `MERGE_MSG`, `MERGE_MODE` (`cleanup_state`); delete `merge.json` and `merge-index`. Returns the restored paths.
 
-**Finishing with git:** the user resolves, `git add`s and `git commit`s (or `git merge --abort`s). The repository is then clean; the next `sync_state` reports `merge: None`, and the next locked operation deletes the stale `merge.json`. A CLI abort leaves `P` as a commit; that was the user's own git command.
+**Finishing with git:** the user resolves, `git add`s and `git commit`s (or `git merge --abort`s). The repository is then clean; the next `sync_state` reports `merge: None`, and the next locked operation deletes the stale `merge.json` and `merge-index`. A CLI abort leaves `P` as a commit; that was the user's own git command.
 
 ### Commit
 
@@ -285,7 +285,7 @@ While a merge is in progress, `preview_pull`, `pull`, `apply_pull`, `commit`, `c
 - Clears the undo record.
 
 `commit_and_push(message, paths, …)`:
-1. `commit(message, paths)`. If nothing was committed and ahead == 0 → `NothingToCommit`.
+1. `commit(message, paths)` (so a blank message is `EmptyMessage`, even with no paths: pushing waiting commits alone is `push`). If nothing was committed and ahead == 0 → `NothingToCommit`.
 2. Fetch. 3. If behind > 0 → `NeedsPull` (the commit stays local). 4. Push; a rejected ref in the push-update-reference callback means `NeedsPull` (rejection is detected via that callback, **not** only via the returned Err).
 
 ### Diff
@@ -296,7 +296,7 @@ While a merge is in progress, `preview_pull`, `pull`, `apply_pull`, `commit`, `c
 
 **`fetch`** updates `refs/remotes/origin/<branch>`, then returns `sync_state`. `ahead` and `behind` are counted HEAD vs `origin/<branch>`.
 
-**`push`**: pushes `refs/heads/<b>:refs/heads/<b>`, never forces, sets upstream config `branch.<b>.remote/merge`.
+**`push`**: pushes `refs/heads/<b>:refs/heads/<b>`, never forces, sets upstream config `branch.<b>.remote/merge`, and clears the undo record (a pushed pull is no longer the user's to undo).
 
 **`connect(url)`**
 1. `set_remote`, then fetch.
@@ -319,7 +319,7 @@ While a merge is in progress, `preview_pull`, `pull`, `apply_pull`, `commit`, `c
 |---|---|
 | `.git/mdgitjournal-last-fetch` | time of the last fetch (existing) |
 | `.git/mdgitjournal/undo.json`, `.git/mdgitjournal/undo-index`, `refs/mdgitjournal/undo` | the undo record |
-| `.git/mdgitjournal/merge.json` | a merge started by Resolve with git |
+| `.git/mdgitjournal/merge.json`, `.git/mdgitjournal/merge-index` | a merge started by Resolve with git, and the index from before it |
 
 All are local to the clone; plain git ignores them (`git gc` keeps the undo ref's objects).
 
@@ -364,11 +364,11 @@ Tests use a mock `Http`. No real network in unit tests.
 
 ## Tauri commands (`app/src-tauri`) ⇄ `app/src/lib/api.ts`
 
-All commands are `async` and run their blocking work on `tauri::async_runtime::spawn_blocking`. **All git operations share one `Mutex`**, so they never overlap. `sync_state` reads through a second repository handle and never waits for them: during one, it reports the state from before it, and the operation sends `sync://state` when it ends. libgit2 gives up after 15 s without a connection and after 30 s without data, so no stalled fetch or push holds the lock for long.
+All commands are `async` and run their blocking work on `tauri::async_runtime::spawn_blocking`. **All git operations share one `Mutex`**, so they never overlap. `sync_state` and `diff` are read-only and go through a second repository handle, so they never wait for them: during one, `sync_state` reports the state from before it, and the operation sends `sync://state` when it ends; the commit sheet's diffs don't wait behind a fetch. libgit2 gives up after 15 s without a connection and after 30 s without data, so no stalled fetch or push holds the lock for long.
 
 On opening a journal, the shell adds `.mdgj-tmp-*` (mdgj-core's temp files) and `.DS_Store` to `.git/info/exclude`, which belongs to the clone and is never committed. A file already tracked stays tracked.
 
-Errors cross the boundary as `{ kind: string, message: string }`. Kinds: `auth`, `reauth`, `network`, `not_connected`, `empty_message`, `invalid`, `io`, `git`, and new: **`stale_review`** (mdgj-git `StaleReview`), **`merge_in_progress`** (`MergeInProgress`), **`undo_refused`** (`UndoRefused`); mdgj-git `Invalid` maps to `invalid`. Only `auth`, `reauth`, `network`, `not_connected`, `io` and `git` become `SyncView.error` (the red dot); the others are answers for the sheet that asked.
+Errors cross the boundary as `{ kind: string, message: string }`. Kinds: `auth`, `reauth`, `network`, `not_connected`, `empty_message`, `invalid`, `io`, `git`, **`stale_review`** (mdgj-git `StaleReview`), **`merge_in_progress`** (`MergeInProgress`), **`undo_refused`** (`UndoRefused`); mdgj-git `Invalid` maps to `invalid`. Only `auth`, `reauth`, `network`, `not_connected`, `io` and `git` become `SyncView.error` (the red dot); the others are answers for the sheet that asked.
 
 Paths and environment:
 - The journal lives in `app_data_dir()/journal`; on iOS, `document_dir()/journal`. **`MDGJ_JOURNAL_DIR`** overrides it.
@@ -446,7 +446,7 @@ type FileDiff = { path: string; oldPath: string | null; kind: FileChange["kind"]
                            lines: { kind: "context" | "added" | "removed"; text: string }[] }[] };
 ```
 
-`SyncView` is built from `SyncState` (which now carries `merge` and `lastSync`) as before. `PullResult` is one `#[serde(tag = "status", rename_all = "snake_case")]` enum in `commands.rs`; `PullOutcome::*.state` becomes `view`.
+`SyncView` is built from `SyncState`, including its `merge` and `lastSync`. `PullResult` is one `#[serde(tag = "status", rename_all = "snake_case")]` enum in `commands.rs`; `PullOutcome::*.state` becomes `view`.
 
 Events emitted by the backend:
 - `sync://state` (SyncView), after any git operation.
@@ -460,16 +460,16 @@ The commit author is taken from settings `authorName`/`authorEmail`. If those ar
 scripts/two-devices.sh [--dev] [--reset]
 ```
 - Starts two instances as **Device A** and **Device B**, each with its own `MDGJ_JOURNAL_DIR=~/mdgitjournal-test-devices/<a|b>/journal`, `MDGJ_CONFIG_DIR=~/mdgitjournal-test-devices/<a|b>/config` and `MDGJ_DEVICE_NAME="Device A"`/`"Device B"`. The folders persist across runs, so sign-ins and journals survive restarts. Logs go to `~/mdgitjournal-test-devices/<a|b>/app.log`.
-- The binary: `$MDGJ_BIN` if set; else on macOS `target/release/bundle/macos/mdgitjournal.app/Contents/MacOS/mdgitjournal` (run directly, so each instance gets its environment and a second instance really starts); on Linux `target/release/mdgitjournal`. If it is missing the script says how to build it (`pnpm -C app tauri build --bundles app`, or `--no-bundle` on Linux) and exits 1. `--dev` uses `target/debug/mdgitjournal`, which loads the UI from the dev server: the script checks that `localhost:1420` answers, and otherwise says to run `pnpm -C app dev`.
-- `--reset` deletes `~/mdgitjournal-test-devices` (and only that) first, saying so.
-- It stays in the foreground; Ctrl-C (or closing both windows) ends both instances. It never touches the real journal, settings or keychain: both variables are always set.
+- The binary: `$MDGJ_BIN` if set; else on macOS `target/release/bundle/macos/mdgitjournal.app/Contents/MacOS/mdgitjournal` (run directly, so each instance gets its environment and a second instance really starts); on Linux `target/release/mdgitjournal` (`target/` is `$CARGO_TARGET_DIR` if set). If it is missing the script says how to build it (`pnpm -C app tauri build --bundles app`, or `--no-bundle` on Linux) and exits 1. `--dev` uses `target/debug/mdgitjournal`, which loads the UI from the dev server: the script checks that `localhost:1420` answers, and otherwise says to run `pnpm -C app dev`.
+- `--reset` deletes `~/mdgitjournal-test-devices` (and only that) first, saying so, once the binary has been found.
+- It stays in the foreground; Ctrl-C, closing the terminal, or closing both windows ends both instances. It never touches the real journal, settings or keychain: both variables are always set.
 - POSIX `sh`, `set -eu`, shellcheck-clean. Each device signs in on its own (Settings › Connect GitHub; a PAT works) and connects to the same test repository.
 
 ### Frontend owns timing
 
 - It runs `fetch` on launch, on window focus, and every `fetchIntervalMin` — except while the Sync review or the merge view is open (a fetch that moved R would only make the review stale).
 - It flushes pending autosave **before** `pull`, `pull_preview`, `apply_pull`, `undo_sync`, `start_external_merge`, `abort_merge`, `commit`, `commit_and_push` and `github_connect`. A fetch in flight holds the git lock, so these wait for it first, and autosave keeps working meanwhile.
-- While an operation that writes the working tree runs (`pull`, `apply_pull`, `undo_sync`, `start_external_merge`, `abort_merge`, `github_connect`), autosave is paused **and the editor is read-only** (`EditorHandle.setReadOnly`). So the buffer can't diverge from a file the operation rewrites; the old "buffer moved to a `.conflict-hhmm` copy" path is removed. Afterwards it re-lists entries and, if the operation touched the open entry (`summary.files`, `restored`), reloads it, or closes it if the file is gone.
+- While an operation that writes the working tree runs (`pull`, `apply_pull`, `undo_sync`, `start_external_merge`, `abort_merge`, `github_connect`), autosave is paused **and the editor is read-only** (`EditorHandle.setReadOnly`), so the buffer can't diverge from a file the operation rewrites. Afterwards it re-lists entries and, if the operation touched the open entry (`summary.files`, `restored`), reloads it (keeping the cursor), follows it if it was renamed, or closes it if the file is gone. Meanwhile the `entries://changed` handler only re-lists entries and leaves the open entry to that operation.
 - Working-tree operations (open, create, rename, delete, the ones above, image imports) run one at a time, in order. An image import doesn't start once another entry is open.
 - A `sync_state` reply that a git operation's report (its result, or `sync://state`) overtook is dropped and read again.
 - On focus it re-lists entries, reloads the open entry from disk if the hash changed and the buffer is clean, and re-reads the sync state; while `sync.merge` is set it also re-reads the sync state every 5 s, so finishing the merge in a terminal is noticed.
@@ -477,21 +477,22 @@ scripts/two-devices.sh [--dev] [--reset]
 
 ### Sync flows in the UI (`app/src/lib/app.svelte.ts`, `app/src/components/`)
 
-- **Pull** (button, ⌘⇧L): `pull()`. `up_to_date` → toast "Up to date." `applied` → the **summary notice** (below). `review` → overlay `"review"`.
-- **Summary notice** (key `sync-summary`, stays until dismissed or replaced): "Pulled 3 commits from GitHub · 4 files changed" (and "· your 2 unpushed commits were placed after them" for `rebase`), with actions **Details** (opens the `SyncSummary` sheet: each commit's first line, author and relative time; each file with added/updated/deleted/renamed; each resolution) and **Undo**. `Notice` gets an optional second action for this. Undo → `undo_sync()` → toast "Pull undone." `undo_refused` → an error notice with the backend's message. The sheet and notice go away when `sync.lastSync` becomes null.
+- **Pull** (button, ⌘⇧L): `pull()`. `up_to_date` → toast "Up to date." `applied` → the **summary notice** (below). `review` → overlay `"review"`. While a working-tree operation runs, the Pull button says "Updating files…" (`SyncOp` `"apply"`).
+- **Summary notice** (key `sync-summary`, stays until dismissed or replaced): "Pulled 3 commits from GitHub · 4 files changed" (and "· your 2 unpushed commits were placed after them" for `rebase`), with actions **Details** (opens the `SyncSummary` sheet: each commit's first line, author and relative time; each file with new/updated/deleted/renamed; each resolution) and **Undo**. A `Notice` has up to two `actions` (each may `keep` the notice open) and may be `persistent` (no dismiss button). Undo → `undo_sync()` → toast "Pull undone." `undo_refused` → an error notice with the backend's message. The sheet and notice go away when `sync.lastSync` stops describing that pull.
 - **Sync review** (`SyncReview.svelte`, a wide `Sheet`; full screen on the phone):
   - Header: "3 commits from GitHub" (expandable list of `incoming`) and, if any, "2 unpushed commits here".
-  - "Changed on both sides": one row per overlap — an entry by its title and date (as the sidebar shows it), any other file by path — and a `Segmented` choice of its `choices`, labelled **Keep mine · Keep GitHub's · Keep both · Merge…**. `modified_deleted` rows say "deleted on GitHub" and label the choices **Keep mine · Delete**; `deleted_modified` rows say "deleted here" with **Keep deleted · Keep GitHub's**. Keep both shows where GitHub's version goes (`copy`). Binary rows say "image (or file) changed on both sides".
+  - "Changed on both sides": one row per overlap — an entry by its title and date (as the sidebar shows it), any other file by path — with a note ("Changed here and on GitHub", "Changed here, deleted on GitHub", "Deleted here, changed on GitHub", "New here and on GitHub, with different text", "Image changed here and on GitHub", …) and a row of buttons for its `choices`, labelled **Keep mine · Keep GitHub's · Keep both · Merge…**; `modified_deleted` labels them **Keep mine · Delete**, `deleted_modified` **Keep deleted · Keep GitHub's**. Under the buttons, what the current choice does ("Yours stays; GitHub's is saved next to it as `<copy>`.", "Merged: 1 change of yours and 1 change from GitHub, no clashes.", …).
   - Default choice: `merged` with `joinChunks(suggestion.chunks)` when `suggestion.clean`; otherwise none.
-  - **Merge…** opens the merge view for that file; **Done** there sets the choice to `merged` with the editor's text.
-  - "Will apply automatically" (collapsed): `auto`, as added/updated/deleted/renamed.
-  - When `plan === "merge"`: a commit message box, prefilled `mergeMessage(preview, choices)` = `"Merge from GitHub\n\n"` + one line per overlap (`- <path>: kept mine` / `kept GitHub's` / `kept both (GitHub's saved as <copy>)` / `merged`), editable, required.
-  - **Apply** (enabled once every overlap has a choice and, for `merge`, the message isn't blank) → `apply_pull(id, resolutions, message)` → close, summary notice. `stale_review` → notice "Something changed since you opened the review." and `pull_preview()` reopens a fresh review (choices reset). **Cancel** / Esc → close; no backend call.
-  - **Resolve with git** (a small link at the bottom): a confirmation inside the sheet explains what happens ("Conflict markers will be written into these files for you to finish with git…"); if `sync.changes` isn't empty it asks for a commit message for those changes (required). → `start_external_merge(id, message)`.
-- **Merge view** (`MergeView.svelte`, overlay `"merge"` on top of the review state; full window on desktop and phone): title (the entry's title or path), a legend ("yours" / "GitHub's" tints), the merge editor, "N clashes left", **Done** (disabled while clashes remain) and **Cancel** (back to the review, choice unchanged).
-- **Merge in progress** (`sync.merge` set): a persistent notice (key `merge`, no dismiss button): "Merge in progress — finish it with git, or abort it." with the conflicted files, and action **Abort merge**, which first confirms ("Files git merged go back to how they were before the merge; changes made to them since are discarded.") then `abort_merge()`. Pull and Commit & Push are disabled with the title "Merge in progress — finish it with git". When `sync.merge` becomes null the notice goes and a toast says "Merge finished." (or nothing, after Abort).
+  - **Merge…** opens the merge view for that file; **Done** there sets the choice to `merged` with the editor's text (and "Check the merge" reopens it as Done left it).
+  - "N files changed on GitHub only: they apply automatically" (collapsed): `auto`, as new/updated/deleted/renamed.
+  - A line says what Apply does to history (brings in GitHub's commits; places the unpushed commits after GitHub's; or joins them with a merge commit), and that resolved files stay as changes for the next commit when there is no merge commit.
+  - When `plan === "merge"`: a commit message box, prefilled `mergeMessage(preview, choices)` = `"Merge from GitHub\n\n"` + one line per overlap (`- <path>: kept mine` / `kept mine (deleted)` / `kept GitHub's` / `kept GitHub's (deleted)` / `kept both (GitHub's saved as <copy>)` / `merged`), kept in step with the choices until the user edits it; required.
+  - **Apply** (enabled once every overlap has a choice and, for `merge`, the message isn't blank; ⌘Enter) → `apply_pull(id, resolutions, message)` → close, summary notice. `stale_review` → `pull_preview()` reopens a fresh review (choices reset) with the banner "Something changed since you opened the review." inside it (a notice would sit under the modal); if there is nothing to pull any more, the review closes with a toast saying so. **Cancel** / Esc → close; no backend call.
+  - **Resolve with git…** (a small link at the bottom, only when there are overlaps): a confirmation inside the sheet explains what happens (a standard `git merge origin/<b>`, conflict markers where changes clash, the files listed, Pull and Commit & Push off until it is committed); if `sync.changes` isn't empty it asks for a commit message for those changes (required), saying Abort merge makes them uncommitted again. → `start_external_merge(id, message)`. An `empty_message` answer (changes the review didn't know of) re-reads the sync state, so the message box appears.
+- **Merge view** (`MergeView.svelte`, overlay `"merge"` on top of the review state; full window on desktop and phone, with a two-row header on the phone): title (the entry's title or path), a legend ("yours" / "GitHub's" tints), "N clashes left", **Undo** (the phone has no ⌘Z), **Done** (disabled while clashes remain; ⌘Enter) and **Cancel** (back to the review, choice unchanged). Esc cancels only while nothing has been edited, so edits aren't lost to a stray key.
+- **Merge in progress** (`sync.merge` set): a persistent notice (key `merge`): "Merge in progress — finish it with git, or abort it. These files have conflict markers:" with the conflicted files (or "No conflicts are left: commit with git to finish."), and action **Abort merge**, which first confirms ("Files git merged go back to how they were before the merge; changes made to them since are discarded.") then `abort_merge()`. Pull and Commit & Push are disabled with the title "Merge in progress — finish it with git". When `sync.merge` becomes null the notice goes and a toast says "Merge finished." (or nothing, after Abort).
 - **Commit sheet**: each change has a checkbox (all ticked when the sheet opens); the button is disabled with none ticked (unless push-only); `commit(message, ticked paths)` / `commit_and_push(message, ticked paths)`. Clicking a file's name toggles its diff underneath (`diff(path)`, fetched on demand): a plain unified view, removed lines in the danger tint and added in the accent tint, monospace, hunk headers as "…"; binary files say "image added/changed/deleted" (or "file …"). Renames show `old → new`.
-- **Connect**: `github_connect` returns a `PullResult`; on `review` the connect flow finishes ("Connected.") and the review opens.
+- **Connect**: `github_connect` returns a `PullResult`. `applied` → the summary notice; `review` → the review opens at once, in front of Settings, with the banner "Connected to owner/repo. Some files differ here and on GitHub: choose what to keep."
 
 ## Editor module (`app/src/editor/index.ts`)
 
@@ -506,10 +507,10 @@ export interface EditorOptions {
   resolveImageUrl?(relPath: string): string;   // for styled-mode previews (convertFileSrc)
 }
 export interface EditorHandle {
-  setDoc(doc: string): void;   // replaces content, resets history (used when switching entries / reload)
+  setDoc(doc: string, options?: { keepCursor?: boolean }): void; // replaces content, resets history (switching entries, reloads); keepCursor keeps the cursor's line and column and the scroll position (a reload after a pull, Undo or focus)
   getDoc(): string;
   setMode(m: EditorMode): void; setVim(on: boolean): void; setDark(on: boolean): void;
-  setReadOnly(on: boolean): void;              // NEW: no edits from keys, vim, paste, drop or image imports while on; selection and scrolling still work
+  setReadOnly(on: boolean): void;              // no edits from keys, vim, paste, drop, the phone toolbar or image imports while on; selection and scrolling still work. Links for images that finish importing meanwhile are inserted once it is off (or reported through onImagesUnlinked if the document was replaced)
   focus(): void; insertAtCursor(text: string): void; wrapSelection(before: string, after: string): void; // mobile toolbar
   importImages(files: File[]): void;           // the phone's photo picker: imports like a paste
   toggleLinePrefix(prefix: string): void;      // "# ", "- ", "- [ ] "
@@ -531,15 +532,19 @@ export type MergeChunk =                      // = the backend's, see types.ts
   | { kind: "mine" | "theirs" | "both"; text: string; base: string }
   | { kind: "clash"; base: string; mine: string; theirs: string };
 export type ClashPick = "mine" | "theirs" | "both";
+export interface MergeSnapshot { readonly json: unknown }  // a document and its picks, to reopen the editor where Done left it
 export interface MergeEditorOptions {
   chunks: MergeChunk[];
   dark: boolean; mobile: boolean;
-  onChange(doc: string, unresolved: number): void;   // after every edit or pick
+  onChange(doc: string, unresolved: number): void;   // after every edit, pick or undo
+  snapshot?: MergeSnapshot;                          // reopen an earlier editor of the same chunks (undo history starts afresh: CodeMirror can't store a pick's undo as JSON)
 }
 export interface MergeEditorHandle {
   getDoc(): string;            // the result; unpicked clashes contribute nothing (Done stays disabled until unresolved() is 0)
   unresolved(): number;
   pick(clash: number, pick: ClashPick): void;        // what the block's buttons do; clash = 0-based, in document order
+  undo(): boolean; redo(): boolean; undoDepth(): number; // as Mod-z / Mod-Shift-z; the merge view's Undo button (the phone has no Mod-z)
+  snapshot(): MergeSnapshot;
   setDark(on: boolean): void; focus(): void; destroy(): void;
 }
 export function createMergeEditor(parent: HTMLElement, opts: MergeEditorOptions): MergeEditorHandle;
@@ -548,9 +553,9 @@ export function joinChunks(chunks: MergeChunk[], picks?: readonly (ClashPick | n
 /** "Use both": mine then theirs; if mine is non-empty and doesn't end in a line break, one is put between ("\r\n" if mine has one, else "\n"). */
 export function bothText(mine: string, theirs: string): string;
 ```
-- The initial document is `joinChunks` with every clash empty. `mine`, `theirs` and `both` chunks are marked (`.mdgj-merge-mine`, `.mdgj-merge-theirs`, `.mdgj-merge-both`: faint accent / faint second tint / faint grey backgrounds, with a left bar), so the user can check what was taken from each side; a chunk whose text is empty (lines deleted) shows a thin marker whose title is the deleted text. The marks follow edits and disappear where their text is deleted.
+- The initial document is `joinChunks` with every clash empty. `mine`, `theirs` and `both` chunks are marked (`.mdgj-merge-mine`, `.mdgj-merge-theirs`, `.mdgj-merge-both`: faint accent / faint `--color-theirs` / faint grey backgrounds, with a left bar), so the user can check what was taken from each side; a chunk whose text is empty (lines deleted) shows a thin marker whose title is the deleted text. The marks follow edits and disappear where their text is deleted.
 - Each unpicked clash is a block widget at its position: "Yours" and "GitHub's" versions one above the other (monospace, wrapped), and **Use mine · Use GitHub's · Use both**. A pick inserts that text (`bothText` for both) at the slot and marks it `.mdgj-merge-picked`; the user may then edit it like any text, and undo (Mod-z) undoes the pick.
-- Free editing everywhere else, Source-mode look (monospace, line wrapping; no line numbers on the phone), no vim, no image paste. The same `lineBreaks`/`fileText` handling as the main editor, so `getDoc()` keeps `\r\n` and a missing final newline; picks are inserted with the document's line break.
+- Free editing everywhere else, Source-mode look (monospace, line wrapping; no line numbers on the phone, where the buttons are 44 px tall and the text 16 px), no vim, no image paste. The markdown language setup is shared with the main editor (`language.ts`). The same `lineBreaks`/`fileText` handling as the main editor, so `getDoc()` keeps `\r\n` and a missing final newline; picks are inserted with the document's line break.
 
 ## Mock backend (`app/src/lib/mock.ts`)
 
@@ -562,8 +567,10 @@ remoteCommit(file: string, content: string | null /*null deletes*/, message?: st
 editOnDisk(file: string, content: string | null): void;  // an edit made outside the app (makes an open review stale)
 finishMergeWithGit(): void;                              // as `git add -A && git commit` in a terminal: clears `merge`
 failNext(method: keyof Api, kind: ErrorKind, message: string): void;
+seedOverlaps(): { clean: string; clash: string };       // once connected: two entries changed on both sides, one merging cleanly, one clashing (for `pnpm dev` and screenshots)
 readonly files: Map<string, string>; readonly calls: string[];
 ```
+`remoteCommit` also works before connecting: the repository connect will use already has that history. The sample journal shares its first commit with the mock GitHub repository, which also has a phone entry, so connecting is `applied` (one commit, with Undo).
 
 ## Design tokens (UI + editor share `app/src/styles/tokens.css`)
 
@@ -575,6 +582,7 @@ readonly files: Map<string, string>; readonly calls: string[];
 | syntax marks | `#b8b3a8` | `#5f5b54` |
 | accent | `#3d6fb4` | `#7ea6e0` |
 | danger | `#a63f33` | `#e07a6c` |
+| GitHub's side in the merge view (`--color-theirs`) | `#9a6818` | `#d6ad62` |
 
 Typography:
 - Styled mode: `ui-serif, "New York", "Source Serif 4", "Noto Serif", Georgia, serif`, 18px / 1.6, `max-width: 31em` (about 66 characters; `66ch` would be 66 zeros, some 90 characters of serif prose).
@@ -619,7 +627,7 @@ CI (`.github/workflows/`):
 - **`pages.yml`** deploys `site/` to GitHub Pages.
 - All actions are pinned to commit SHAs; Dependabot (`.github/dependabot.yml`) proposes updates.
 
-## Decisions taken by architect (sync review)
+## Decisions (sync review)
 
 Where the product decisions left a choice, the option that keeps the user most in control with the least UI:
 
@@ -631,17 +639,18 @@ Where the product decisions left a choice, the option that keeps the user most i
 6. **Undo** is one level, for every applied pull (automatic or reviewed), stored as a ref plus a small JSON in `.git/mdgitjournal/`. It ends at the next commit, push, pull, Resolve with git or disconnect, and refuses rather than overwrite a file edited since, or rewind history that was pushed.
 7. **Resolve with git with uncommitted edits** asks for a commit message and commits them first. A real `git merge` can't start over uncommitted changes to the files it merges, and a stash would have to be popped onto the very files that conflict. Committing keeps the user's text in the merge (on the "ours" side, where they'll expect it), and the app's Abort undoes that commit again, so Abort is exact. An abort with the git CLI leaves the commit: that was the user's own command.
 8. **Abort merge discards what was done to merged files since the merge started**, as `git merge --abort` does, after a confirmation. No extra state to compare.
-9. **The editor is read-only while the working tree is being rewritten** (a second or two), instead of the old rule that moved a buffer typed during a pull into a conflict copy. Copies are never made without being asked for.
+9. **The editor is read-only while the working tree is being rewritten** (a second or two), so a buffer typed during a pull never has to be moved aside into a copy. Copies are never made without being asked for.
 10. **The review is stateless**: its id is a fingerprint of branch, HEAD, origin/branch and the working tree's tree id. Nothing is kept between preview and apply; Cancel is free; staleness is exact.
 11. **A merge commit is never automatic**: a review with no overlaps can appear (local merge commits, a commit that doesn't replay) and only asks for the message.
-12. **Structural problems** (a symlink from the remote, names that differ only in case, a file where a folder is) still stop the pull with a message to fix it with git; they're rare, and git is the right tool.
+12. **Structural problems** (a symlink from the remote, names that differ only in case, a file where a folder is, an ignored local file where GitHub has one) still stop the pull with a message to fix it with git; they're rare, and git is the right tool.
 13. **After `stale_review`** the fresh review comes from `pull_preview`, which never applies — "nothing written" holds even if the fresh state turned out to be one-sided.
 14. **A merge started with the git CLI** is shown and abortable the same way; the app just didn't make it (`startedByApp: false`).
-15. **Dependencies:** none added. Diffs use libgit2's (git's own algorithm, so the review and the commit sheet agree with `git diff`); the merge editor is CodeMirror decorations; `@codemirror/merge` was considered and not needed. No lockfile changes.
+15. **Dependencies:** no new crate or package. Diffs use libgit2's (git's own algorithm, so the review and the commit sheet agree with `git diff`); the merge editor is CodeMirror decorations; `@codemirror/merge` was considered and not needed. mdgj-git uses the workspace's `serde_json` for its records (one line in `Cargo.lock`).
 16. **Commit selection** builds the commit from HEAD's tree plus the ticked paths, not from the index, so something staged with the CLI never sneaks into a commit; it stays staged.
 17. **`MDGJ_CONFIG_DIR` makes the token store file-only**, so two instances can never share or clobber one keychain item, and testing never touches the real keychain.
+18. **A failed Apply puts everything back** (files it wrote, the index, the previous undo record) rather than leaving a partial pull for Undo, so `stale_review` always means nothing was written.
 
-## Test scenarios for the sync review (each builder covers its own)
+## Test scenarios for the sync review
 
 **mdgj-git** (`crates/mdgj-git/tests/`, `file://` remotes, two `Device`s; byte comparisons with `fs::read`, refs via `git2`; where marked *CLI*, also check with the `git` binary if it is on `PATH`, skipping otherwise):
 1. Up to date: `UpToDate`, nothing written (refs, index file bytes, files).
@@ -664,7 +673,7 @@ Where the product decisions left a choice, the option that keeps the user most i
 18. Finish by "CLI" (resolve, stage, commit with parents `[HEAD, MERGE_HEAD]` and `cleanup_state` through `git2`, and *CLI* `git commit --no-edit` when available): `merge_state` None, `merge.json` removed by the next operation, push works, the other device pulls it automatically.
 19. `commit(message, paths)`: only the ticked paths are in the commit, the rest still changed; a ticked rename removes the old path; an unticked staged entry stays staged; paths no longer changed are ignored; none left → `None`.
 20. `diff`: modified text (hunks with 3 lines of context), added, deleted, renamed, binary.
-21. Kept from today: ignored local files never overwritten; remote symlink refused and nothing written; case-only collisions refused; push race → `NeedsPull`; `commit_and_push` needs pull when behind; credentials only to `url_prefix`.
+21. Also: ignored local files never overwritten; remote symlink refused and nothing written; case-only collisions refused; push race → `NeedsPull`; `commit_and_push` needs pull when behind; credentials only to `url_prefix`.
 
 **app/src-tauri** (unit tests; `tests/github_e2e.rs`):
 1. Serialized shapes of every new response (`PullResult` × 3, `{view, summary}`, `{view, restored}`, `FileDiff`, `SyncView` with `merge` and `lastSync`), and `Resolved` deserializing from `{ path, choice: "merged", text }` and `{ path, choice: "mine" }`.
@@ -676,18 +685,8 @@ Where the product decisions left a choice, the option that keeps the user most i
 
 **app/src** (vitest with the mock; Playwright WebKit in `app/e2e/`):
 1. `sync.ts`: buttons disabled with the merge title while `merge` is set.
-2. Review logic (`app/src/lib/review.ts` or in `app.svelte.ts`): defaults (clean → merged, clash → none), Apply enabled only when complete (and with a message for `merge`), `mergeMessage`, resolutions sent exactly.
+2. Review logic (`app/src/lib/review.svelte.ts`): defaults (clean → merged, clash → none), Apply enabled only when complete (and with a message for `merge`), `mergeMessage`, resolutions sent exactly.
 3. Merge editor: `joinChunks`, `bothText` (with and without final newline, CRLF), `pick` per kind, `unresolved` count, undo of a pick, editing around clash slots keeps them in place, `getDoc` lossless for CRLF and no final newline, never a conflict marker.
 4. Flows on the mock: one-sided pull → summary notice → Undo → files back; Undo refused after an edit; overlap → review, Cancel leaves `mock.files` identical; each choice through Apply; stale (`editOnDisk` while open) → message and a fresh review; Resolve with git → notice, buttons disabled, Abort (confirmed) restores; `finishMergeWithGit` → notice gone; connect → review; the editor is read-only during a pull; fetch doesn't run while the review is open.
 5. Commit sheet: all ticked; untick one → only the rest committed (`mock.calls` / args); none ticked → disabled; a diff opens and closes; binary says "image changed".
-6. e2e: the flows of 4 and 5 in the desktop layout, the review and the merge view at the phone size, and screenshots of the review and merge view (light and dark) in `screenshots.spec.ts`. Remove the old conflict-copy tests.
-
-## Who builds what (sync review)
-
-Three builders work in parallel from this contract and don't edit each other's files. Docs (`PLAN.md`, this file, `README.md`) belong to the architect: report a mismatch rather than editing them.
-
-| builder | owns | notes |
-|---|---|---|
-| **git** | `crates/mdgj-git/**` | Implements the mdgj-git API above, `src/diff3.rs`, and its tests. Removes keep-both. No new dependencies. |
-| **shell** | `app/src-tauri/**`, `crates/mdgj-github/src/store.rs` (+ its export in `lib.rs`), `scripts/two-devices.sh` | Commands, `SyncView`, error kinds, events, `MDGJ_CONFIG_DIR`/`MDGJ_DEVICE_NAME`, the script, `github_e2e`. Codes against the mdgj-git signatures above; until that lands, a local uncommitted stub may be used to compile, never committed. |
-| **ui** | `app/src/**`, `app/e2e/**` | `types.ts`, `api.ts`, `mock.ts`, `mockmerge.ts`, `app.svelte.ts`, `sync.ts`, `notices.svelte.ts`, components (`SyncReview`, `MergeView`, `SyncSummary`, `CommitSheet`, `SyncButtons`, `Notices`, `ConnectGitHub`, mobile), the editor's `setReadOnly` and `merge.ts`. No `package.json`/lockfile changes are needed. |
+6. e2e: the flows of 4 and 5 in the desktop layout, the review and the merge view at the phone size, and screenshots of the review and merge view (light and dark) in `screenshots.spec.ts`.

@@ -11,7 +11,6 @@
   const pull = $derived(pullButton(app.sync, app.ops));
   const commit = $derived(commitButton(app.sync, app.ops));
   const error = $derived(app.lastError);
-  const pulling = $derived(app.ops.includes("pull"));
 </script>
 
 {#if app.sync.connected}
@@ -19,8 +18,8 @@
     type="button"
     class="sync"
     class:accent={pull.accent}
-    disabled={pulling}
-    title={error ? `Last sync failed: ${error.message}` : `${pull.title} (${shortcutLabel("pull", app.mac)})`}
+    disabled={pull.disabled}
+    title={error && !app.sync.merge ? `Last sync failed: ${error.message}` : `${pull.title} (${shortcutLabel("pull", app.mac)})`}
     onclick={() => void app.pull()}
   >
     {#if pull.busy}<span class="spinner" aria-hidden="true"></span>{:else}<Icon name="pull" size={13} />{/if}

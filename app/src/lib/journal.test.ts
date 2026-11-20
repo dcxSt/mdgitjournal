@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
-  conflictCopyName,
   dayOfMonth,
   entryTimestamp,
   filterByName,
   groupByMonth,
   groupHits,
   isEntryFile,
+  pathLabel,
   quickOpen,
   slugPreview,
   snippetParts,
@@ -97,15 +97,16 @@ describe("slugPreview", () => {
   });
 });
 
-describe("conflictCopyName", () => {
-  const at1402 = new Date(2026, 10, 16, 14, 2);
-
-  it("names copies like mdgj-git's keep-both copies, never reusing a name", () => {
-    const taken = new Set(["x.conflict-1402.md", "x.conflict-1402-2.md"]);
-    expect(conflictCopyName("2026-11-16-1402-run.md", () => false, at1402)).toBe(
-      "2026-11-16-1402-run.conflict-1402.md",
-    );
-    expect(conflictCopyName("x.md", (name) => taken.has(name), at1402)).toBe("x.conflict-1402-3.md");
+describe("pathLabel", () => {
+  it("names entries by title and date, other files by path", () => {
+    expect(pathLabel("2026-11-16-1402-morning-run.md")).toEqual({
+      title: "morning-run",
+      when: "2026-11-16 14:02",
+      entry: true,
+    });
+    expect(pathLabel("2026-11-16-1402-run.from-github-1530.md").title).toBe("run.from-github-1530");
+    expect(pathLabel("notes.md")).toEqual({ title: "notes.md", when: null, entry: true });
+    expect(pathLabel("assets/run-5f3a09c2.jpg")).toEqual({ title: "assets/run-5f3a09c2.jpg", when: null, entry: false });
   });
 });
 

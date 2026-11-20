@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AppState, NEEDS_PULL_TEXT, mobileLayout } from "./app.svelte";
+import { AppState, MERGE_POLL_MS, MERGE_TEXT, NEEDS_PULL_TEXT, STALE_TEXT, mobileLayout } from "./app.svelte";
 import { AUTOSAVE_MS } from "./entry.svelte";
 import { createMockApi, type MockApi } from "./mock";
+import { commitButton, pullButton } from "./sync";
 
 const RUN = "2026-11-16-1402-morning-run.md";
 const IDEAS = "2026-11-14-2130-ideas.md";
+const LIST = "2026-10-28-0815-reading-list.md";
+const NOTES = "notes.md";
 
 const apps: AppState[] = [];
 
@@ -92,7 +95,7 @@ describe("autosave is flushed before git work", () => {
   it("before commit", async () => {
     const { api, app } = await start();
     app.current.edit("unsaved");
-    expect(await app.commit("Morning")).toBeNull();
+    expect(await app.commit("Morning", [RUN])).toBeNull();
     const [write, commit] = order(api, "writeEntry", "commit");
     expect(write).toBeGreaterThanOrEqual(0);
     expect(write).toBeLessThan(commit);
@@ -103,7 +106,7 @@ describe("autosave is flushed before git work", () => {
     const { api, app } = await start({ connected: true });
     await app.pull();
     app.current.edit("unsaved");
-    expect(await app.commit("Morning")).toBeNull();
+    expect(await app.commit("Morning", [RUN])).toBeNull();
     const [write, push] = order(api, "writeEntry", "commitAndPush");
     expect(write).toBeGreaterThanOrEqual(0);
     expect(write).toBeLessThan(push);
@@ -132,26 +135,48 @@ describe("commit", () => {
   it("requires a message", async () => {
     const { api, app } = await start();
     app.current.edit("unsaved");
-    const error = await app.commit("  \n ");
+    const error = await app.commit("  \n ", [RUN]);
     expect(error?.kind).toBe("empty_message");
     expect(api.mock.calls).not.toContain("commit");
+  });
+
+  it("commits only the ticked files; the rest stay changed", async () => {
+    const { api, app } = await start();
+    api.mock.editOnDisk(IDEAS, "changed too\n");
+    app.current.edit("unsaved");
+    await app.openCommit();
+    expect(app.sync.changes.map((c) => c.path)).toEqual([IDEAS, RUN]);
+    const commit = vi.spyOn(api, "commit");
+    expect(await app.commit("Run only", [RUN])).toBeNull();
+    expect(commit).toHaveBeenCalledWith("Run only", [RUN]);
+    expect(app.sync.changes).toEqual([{ path: IDEAS, kind: "modified" }]);
+  });
+
+  it("won't commit with nothing ticked", async () => {
+    const { api, app } = await start();
+    app.current.edit("unsaved");
+    const error = await app.commit("Message", []);
+    expect(error?.kind).toBe("invalid");
+    expect(api.mock.calls).not.toContain("commit");
+    expect(app.lastError).toBeNull();
   });
 
   it("pushes local commits without a message when nothing is uncommitted", async () => {
     const { api, app } = await start({ connected: true });
     app.current.edit("x");
-    await app.commit("first"); // needs_pull: the commit stays local
+    await app.commit("first", [RUN]); // needs_pull: the commit stays local
     await app.pull();
     expect(app.sync).toMatchObject({ ahead: 1, behind: 0, changes: [] });
-    expect(await app.commit("")).toBeNull();
-    expect(api.mock.calls.at(-1)).toBe("commitAndPush");
+    const push = vi.spyOn(api, "commitAndPush");
+    expect(await app.commit("", [])).toBeNull();
+    expect(push).toHaveBeenCalledWith("", []);
     expect(app.sync.ahead).toBe(0);
   });
 
   it("asks to pull first when GitHub has new commits, keeping the commit", async () => {
     const { app } = await start({ connected: true });
     app.current.edit("x");
-    expect(await app.commit("Morning")).toBeNull();
+    expect(await app.commit("Morning", [RUN])).toBeNull();
     expect(app.sync).toMatchObject({ ahead: 1, behind: 2, changes: [] });
     expect(app.notices.list.map((n) => n.text)).toContain(NEEDS_PULL_TEXT);
 
@@ -169,87 +194,114 @@ describe("commit", () => {
   });
 });
 
+/** Lets GitHub and this device both change files, so the next pull opens the review. */
+async function overlapping(api: MockApi, app: AppState) {
+  const seeded = api.mock.seedOverlaps();
+  await app.refresh();
+  await vi.waitFor(() => expect(app.sync.changes).toHaveLength(2));
+  return seeded;
+}
+
 describe("pull", () => {
-  it("reloads the open entry when the pull changed it", async () => {
+  it("applies one-sided changes at once and says what came, with Undo", async () => {
     const { api, app } = await start({ connected: true });
     await app.open(IDEAS);
     await app.pull();
     expect(app.current.content).toBe(api.mock.files.get(IDEAS));
     expect(app.current.content).toContain("Edited on the phone.");
     expect(app.entries.map((e) => e.file)).toContain("2026-11-16-0630-dawn.md");
+    const notice = app.notices.list.find((n) => n.key === "sync-summary")!;
+    expect(notice.text).toBe("Pulled 2 commits from GitHub · 2 files changed.");
+    expect(notice.actions?.map((a) => a.label)).toEqual(["Details", "Undo"]);
+    expect(app.summary?.incoming.map((c) => c.message)).toEqual(["Ideas from the phone", "Dawn"]);
+    expect(app.canUndo).toBe(true);
   });
 
-  it("lists conflict copies in a banner; the local text is in the copy", async () => {
-    const { api, app } = await start({ connected: true });
-    await app.open(IDEAS);
-    app.current.edit("my version");
+  it("says Up to date when there is nothing new", async () => {
+    const { app } = await start({ connected: true });
     await app.pull();
-    const banner = app.notices.list.find((n) => n.key === "conflicts");
-    const copy = banner?.files?.[0].file ?? "";
-    expect(copy).toMatch(/^2026-11-14-2130-ideas\.conflict-\d{4}\.md$/);
-    expect(api.mock.files.get(copy)).toBe("my version");
-    expect(app.current.content).toContain("Edited on the phone.");
-  });
-
-  it("keeps both when the open entry is typed in while the pull changes it", async () => {
-    const { api, app } = await start({ connected: true });
-    await app.open(IDEAS);
-    const typed = `${app.current.content}typed during the pull\n`;
-    duringNextPull(api, () => app.current.edit(typed));
     await app.pull();
-    await app.current.settle();
-
-    // GitHub's version keeps the name; the buffer, still open, is saved next to it.
-    expect(api.mock.files.get(IDEAS)).toContain("Edited on the phone.");
-    expect(api.mock.files.get(IDEAS)).not.toContain("typed during the pull");
-    const copy = app.current.file!;
-    expect(copy).toMatch(/^2026-11-14-2130-ideas\.conflict-\d{4}\.md$/);
-    expect(api.mock.files.get(copy)).toBe(typed);
-    expect(app.current.dirty).toBe(false);
-    await vi.waitFor(() => expect(app.currentMeta?.file).toBe(copy));
-    const notice = app.notices.list.find((n) => n.key === "kept-buffer");
-    expect(notice?.text).toContain(copy);
-    expect(notice?.files?.map((f) => f.file)).toEqual([IDEAS]);
+    expect(app.notices.list.at(-1)?.text).toBe("Up to date.");
   });
 
-  it("keeps a saved edit and the typing after it when the pull conflicts", async () => {
+  it("Undo puts back every file the pull touched and the commits it brought", async () => {
     const { api, app } = await start({ connected: true });
     await app.open(IDEAS);
-    app.current.edit("my saved edit\n");
+    const before = new Map(api.mock.files);
+    await app.pull();
+    const undo = app.notices.list.find((n) => n.key === "sync-summary")!.actions!.find((a) => a.label === "Undo")!;
+    undo.run();
+    await vi.waitFor(() => expect(app.notices.list.at(-1)?.text).toBe("Pull undone."));
+    expect(new Map(api.mock.files)).toEqual(before);
+    expect(app.current.content).toBe(before.get(IDEAS));
+    expect(app.sync).toMatchObject({ behind: 2, lastSync: null });
+    expect(app.canUndo).toBe(false);
+    expect(app.notices.list.map((n) => n.key)).not.toContain("sync-summary");
+  });
+
+  it("Undo refuses, naming the file, once a pulled file was edited; nothing changes", async () => {
+    const { api, app } = await start({ connected: true });
+    await app.pull();
+    await app.open(IDEAS);
+    app.current.edit("written after the pull\n");
     await app.current.flush();
-    duringNextPull(api, () => app.current.edit("my saved edit\nand a line typed while pulling\n"));
-    await app.pull();
-    await app.current.settle();
-
-    const conflictCopy = app.notices.list.find((n) => n.key === "conflicts")?.files?.[0].file ?? "";
-    expect(api.mock.files.get(conflictCopy)).toBe("my saved edit\n");
-    expect(app.current.file).not.toBe(conflictCopy);
-    expect(api.mock.files.get(app.current.file!)).toBe("my saved edit\nand a line typed while pulling\n");
-    expect(api.mock.files.get(IDEAS)).toContain("Edited on the phone.");
+    const files = new Map(api.mock.files);
+    const error = await app.undoSync();
+    expect(error?.kind).toBe("undo_refused");
+    expect(error?.message).toContain(IDEAS);
+    expect(new Map(api.mock.files)).toEqual(files);
+    expect(app.lastError).toBeNull();
   });
 
-  it("autosaves typing as usual when the pull leaves the open entry alone", async () => {
-    const { api, app } = await start({ connected: true });
-    duringNextPull(api, () => app.current.edit("typed during the pull"));
+  it("the summary goes when the pull can't be undone any more", async () => {
+    const { app } = await start({ connected: true });
     await app.pull();
-    await app.current.settle();
-    expect(app.current.file).toBe(RUN);
-    expect(api.mock.files.get(RUN)).toBe("typed during the pull");
-    expect(app.notices.list.map((n) => n.key)).not.toContain("kept-buffer");
+    app.openSummary();
+    expect(app.overlay).toBe("summary");
+    app.current.edit("x");
+    await app.commit("After the pull", [RUN]);
+    expect(app.summary).toBeNull();
+    expect(app.overlay).toBeNull();
+    expect(app.notices.list.map((n) => n.key)).not.toContain("sync-summary");
   });
 
-  it("writes the typing back, and lists the entry again, when the pull removed it", async () => {
+  it("places unpushed commits after GitHub's, and says so", async () => {
     const { api, app } = await start({ connected: true });
-    vi.spyOn(api, "pull").mockImplementationOnce(async () => {
-      app.current.edit("typed during the pull");
-      api.mock.files.delete(RUN);
-      return { view: await api.syncState(), updated: [RUN], merged: [], conflicts: [] };
-    });
+    api.mock.editOnDisk(NOTES, "Notes from here.\n");
+    await app.refresh();
+    await app.commit("Notes", [NOTES]);
     await app.pull();
-    await app.current.settle();
-    expect(app.current.file).toBe(RUN);
-    expect(api.mock.files.get(RUN)).toBe("typed during the pull");
-    await vi.waitFor(() => expect(app.currentMeta?.file).toBe(RUN));
+    expect(app.summary).toMatchObject({ plan: "rebase", rebased: 1 });
+    expect(app.notices.list.find((n) => n.key === "sync-summary")?.text).toBe(
+      "Pulled 2 commits from GitHub · 2 files changed · your 1 unpushed commit was placed after them.",
+    );
+    expect(app.sync).toMatchObject({ ahead: 1, behind: 0 });
+  });
+
+  it("the editor is read-only while the pull runs, and writable after", async () => {
+    const { api, app } = await start({ connected: true });
+    let during: boolean | undefined;
+    duringNextPull(api, () => (during = app.readOnly));
+    await app.pull();
+    expect(during).toBe(true);
+    expect(app.readOnly).toBe(false);
+  });
+
+  it("closes the open entry when the pull deleted it", async () => {
+    const { api, app } = await start({ connected: true });
+    api.mock.remoteCommit(RUN, null, "Delete the run");
+    await app.pull();
+    expect(app.current.file).toBeNull();
+    expect(api.mock.files.has(RUN)).toBe(false);
+  });
+
+  it("follows the open entry when the pull renamed it", async () => {
+    const { api, app } = await start({ connected: true });
+    const renamed = "2026-11-16-1402-long-run.md";
+    api.mock.remoteCommit(RUN, null, "Rename");
+    api.mock.remoteCommit(renamed, api.mock.files.get(RUN)!, "Rename");
+    await app.pull();
+    expect(app.current.file).toBe(renamed);
   });
 
   it("marks the error for the red dot and clears it on success", async () => {
@@ -261,6 +313,203 @@ describe("pull", () => {
     expect(app.lastError).toBeNull();
   });
 });
+
+describe("sync review", () => {
+  it("opens when a file changed on both sides, and nothing changes on disk", async () => {
+    const { api, app } = await start({ connected: true });
+    const { clean, clash } = await overlapping(api, app);
+    const before = new Map(api.mock.files);
+    await app.pull();
+    expect(app.overlay).toBe("review");
+    expect(new Map(api.mock.files)).toEqual(before);
+    const review = app.review!;
+    expect(review.preview.overlaps.map((o) => o.path)).toEqual([clash, clean]);
+    // The clean merge is prefilled; the clash waits, so Apply does too.
+    expect(review.picks[clean]?.choice).toBe("merged");
+    expect(review.picks[clash]).toBeNull();
+    expect(review.ready).toBe(false);
+    expect(app.readOnly).toBe(false);
+  });
+
+  it("Cancel leaves everything as it was, without a call to the backend", async () => {
+    const { api, app } = await start({ connected: true });
+    await overlapping(api, app);
+    await app.pull();
+    const before = new Map(api.mock.files);
+    const calls = api.mock.calls.length;
+    app.cancelReview();
+    expect(app.overlay).toBeNull();
+    expect(app.review).toBeNull();
+    expect(api.mock.calls.length).toBe(calls);
+    expect(new Map(api.mock.files)).toEqual(before);
+  });
+
+  for (const choice of ["mine", "theirs", "both"] as const) {
+    it(`Apply with “${choice}” writes that, merges the clean file, and shows the summary`, async () => {
+      const { api, app } = await start({ connected: true });
+      const { clean, clash } = await overlapping(api, app);
+      const mine = api.mock.files.get(clash)!;
+      await app.pull();
+      const review = app.review!;
+      const overlap = review.overlap(clash)!;
+      const merged = (review.picks[clean] as { text: string }).text;
+      review.setPick(clash, { choice });
+      await app.applyReview();
+      expect(app.overlay).toBeNull();
+      expect(api.mock.files.get(clash)).toBe(choice === "theirs" ? overlap.theirs : mine);
+      if (choice === "both") expect(api.mock.files.get(overlap.copy!)).toBe(overlap.theirs);
+      expect(api.mock.files.get(clean)).toBe(merged);
+      expect(merged).toContain("Six miles");
+      expect(merged).toContain("- [x] new shoes");
+      expect(app.summary?.resolved.map((r) => r.choice)).toEqual([choice, "merged"]);
+      // The resolved files stay as changes for the next commit.
+      expect(app.sync.changes.map((c) => c.path)).toContain(clean);
+      expect(app.canUndo).toBe(true);
+    });
+  }
+
+  it("Done in the merge view applies its text byte for byte", async () => {
+    const { api, app } = await start({ connected: true });
+    const { clash } = await overlapping(api, app);
+    await app.pull();
+    app.openMerge(clash);
+    expect(app.overlay).toBe("merge");
+    app.closeMerge({ text: "My own merge\r\nno final newline", snapshot: { json: null } });
+    expect(app.overlay).toBe("review");
+    await app.applyReview();
+    expect(api.mock.files.get(clash)).toBe("My own merge\r\nno final newline");
+  });
+
+  it("Cancel in the merge view leaves the file's choice alone", async () => {
+    const { api, app } = await start({ connected: true });
+    const { clash } = await overlapping(api, app);
+    await app.pull();
+    app.openMerge(clash);
+    app.closeMerge();
+    expect(app.overlay).toBe("review");
+    expect(app.review!.picks[clash]).toBeNull();
+  });
+
+  it("a stale review writes nothing and is replaced by a fresh one", async () => {
+    const { api, app } = await start({ connected: true });
+    const { clash } = await overlapping(api, app);
+    await app.pull();
+    const first = app.review!;
+    first.setPick(clash, { choice: "mine" });
+    api.mock.editOnDisk(NOTES, "Edited in vim meanwhile.\n");
+    const before = new Map(api.mock.files);
+    await app.applyReview();
+    expect(new Map(api.mock.files)).toEqual(before);
+    expect(api.mock.calls).toContain("pullPreview");
+    expect(app.overlay).toBe("review");
+    expect(app.review).not.toBe(first);
+    expect(app.review!.notice).toBe(STALE_TEXT);
+    expect(app.review!.picks[clash]).toBeNull();
+    expect(app.lastError).toBeNull();
+
+    app.review!.setPick(clash, { choice: "theirs" });
+    await app.applyReview();
+    expect(app.overlay).toBeNull();
+    expect(api.mock.files.get(NOTES)).toBe("Edited in vim meanwhile.\n");
+  });
+
+  it("doesn't fetch while the review or the merge view is open", async () => {
+    const { api, app } = await start({ connected: true });
+    const { clash } = await overlapping(api, app);
+    await app.pull();
+    api.mock.calls.length = 0;
+    await app.fetch();
+    app.openMerge(clash);
+    await app.fetch();
+    await app.onFocus();
+    expect(api.mock.calls).not.toContain("fetch");
+    app.closeMerge();
+    app.cancelReview();
+    await app.fetch();
+    expect(api.mock.calls).toContain("fetch");
+  });
+
+  it("opens from connect when the journal and GitHub both have a file, differently", async () => {
+    const api = createMockApi({ platform: "macos" });
+    api.mock.remoteCommit(IDEAS, "# Ideas\n\nWritten on GitHub.\n", "Ideas on GitHub");
+    const { app } = await start({ api });
+    api.mock.editOnDisk(IDEAS, "# Ideas\n\nWritten here.\n");
+    await api.githubSetPat("token");
+    const result = await app.connect("octocat/journal");
+    expect(result.status).toBe("review");
+    expect(app.sync.connected).toBe(true);
+    expect(app.overlay).toBe("review");
+    expect(app.review!.notice).toMatch(/^Connected to octocat\/journal\./);
+    expect(api.mock.files.get(IDEAS)).toBe("# Ideas\n\nWritten here.\n");
+  });
+});
+
+describe("resolve with git", () => {
+  async function merging() {
+    const started = await start({ connected: true });
+    const { api, app } = started;
+    await overlapping(api, app);
+    const before = new Map(api.mock.files);
+    const changes = app.sync.changes;
+    await app.pull();
+    app.review!.resolveWithGit = true;
+    app.review!.gitMessage = "My edits";
+    await app.resolveWithGit();
+    return { ...started, before, changes };
+  }
+
+  it("needs a commit message when there are uncommitted changes", async () => {
+    const { api, app } = await start({ connected: true });
+    await overlapping(api, app);
+    await app.pull();
+    await app.resolveWithGit();
+    expect(app.review?.error).toMatch(/commit message/);
+    expect(api.mock.calls).not.toContain("startExternalMerge");
+  });
+
+  it("leaves a merge in progress: markers in the files, a notice, Pull and Commit off", async () => {
+    const { api, app } = await merging();
+    expect(app.overlay).toBeNull();
+    expect(app.sync.merge?.conflicted).toEqual([LIST]);
+    expect(api.mock.files.get(LIST)).toMatch(/^<{7} HEAD/m);
+    const notice = app.notices.list.find((n) => n.key === "merge")!;
+    expect(notice).toMatchObject({ persistent: true, text: expect.stringContaining(MERGE_TEXT) });
+    expect(notice.files).toEqual([{ label: LIST, file: LIST }]);
+    expect(pullButton(app.sync, app.ops).disabled).toBe(true);
+    expect(commitButton(app.sync, app.ops).disabled).toBe(true);
+    await app.pull();
+    expect(api.mock.calls.filter((c) => c === "pull")).toHaveLength(1);
+  });
+
+  it("Abort merge puts back the files and the uncommitted edits, and says nothing more", async () => {
+    const { api, app, before, changes } = await merging();
+    notice(app, "merge").actions![0].run();
+    expect(app.overlay).toBe("abortMerge");
+    expect(await app.abortMerge()).toBeNull();
+    expect(new Map(api.mock.files)).toEqual(before);
+    expect(app.sync.changes).toEqual(changes);
+    expect(app.sync.merge).toBeNull();
+    expect(app.overlay).toBeNull();
+    expect(app.notices.list.map((n) => n.key)).not.toContain("merge");
+    expect(app.notices.list.map((n) => n.text)).not.toContain("Merge finished.");
+  });
+
+  it("notices when the merge is finished in a terminal", async () => {
+    vi.useFakeTimers();
+    const { api, app } = await merging();
+    api.mock.files.set(LIST, "# Reading list\n\nResolved in vim.\n");
+    api.mock.finishMergeWithGit();
+    await vi.advanceTimersByTimeAsync(MERGE_POLL_MS);
+    expect(app.sync.merge).toBeNull();
+    expect(app.notices.list.map((n) => n.key)).not.toContain("merge");
+    expect(app.notices.list.at(-1)?.text).toBe("Merge finished.");
+    expect(pullButton(app.sync, app.ops).disabled).toBe(false);
+  });
+});
+
+function notice(app: AppState, key: string) {
+  return app.notices.list.find((n) => n.key === key)!;
+}
 
 /** A promise the test resolves. */
 function gate<T = void>() {
@@ -360,25 +609,6 @@ describe("images", () => {
     expect(notice?.files).toEqual([
       { label: "![](assets/run-1a2b3c4d.jpg)" },
       { label: "![](<assets/my run-5e6f7a8b.jpg>)" },
-    ]);
-  });
-
-  it("a conflict banner links entries only; an image copy is just named", async () => {
-    const { api, app } = await start({ connected: true });
-    const copy = "assets/run-1.conflict-1402.jpg";
-    vi.spyOn(api, "pull").mockImplementationOnce(async () => ({
-      view: await api.syncState(),
-      updated: [],
-      merged: [],
-      conflicts: [
-        { path: "assets/run-1.jpg", copy },
-        { path: IDEAS, copy: "2026-11-14-2130-ideas.conflict-1402.md" },
-      ],
-    }));
-    await app.pull();
-    expect(app.notices.list.find((n) => n.key === "conflicts")?.files).toEqual([
-      { label: copy, file: undefined },
-      { label: "2026-11-14-2130-ideas.conflict-1402.md", file: "2026-11-14-2130-ideas.conflict-1402.md" },
     ]);
   });
 });
@@ -488,7 +718,7 @@ describe("closing the window", () => {
     expect(await app.beforeClose()).toBe(false);
     const notice = app.notices.list.find((n) => n.key === "close")!;
     expect(notice.text).toContain("Disk full.");
-    notice.action!.run();
+    notice.actions![0].run();
     expect(closeWindow).toHaveBeenCalledOnce();
   });
 

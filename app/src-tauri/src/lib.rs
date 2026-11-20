@@ -9,6 +9,18 @@ mod view;
 
 use tauri::Manager;
 
+/// The window's title, and the product's name.
+const APP_NAME: &str = "mdgitjournal";
+
+/// "mdgitjournal — Device A" for `MDGJ_DEVICE_NAME="Device A"`, so two instances on one machine
+/// (scripts/two-devices.sh) can be told apart; "mdgitjournal" without one.
+pub fn window_title(device: Option<&str>) -> String {
+    match device.map(str::trim).filter(|name| !name.is_empty()) {
+        Some(name) => format!("{APP_NAME} — {name}"),
+        None => APP_NAME.to_owned(),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // SAFETY: the first thing the app does, before any thread uses libgit2.
@@ -19,6 +31,14 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            let device = std::env::var("MDGJ_DEVICE_NAME").ok();
+            if let (Some(name), Some(window)) = (
+                device.filter(|name| !name.trim().is_empty()),
+                app.get_webview_window("main"),
+            ) {
+                // Cosmetic; a platform without window titles (iOS) just keeps none.
+                let _ = window.set_title(&window_title(Some(&name)));
+            }
             // If the journal can't be opened, the window still is, and the UI says why.
             let backend: state::Backend = state::AppState::open(app.handle());
             app.manage(backend);
@@ -39,8 +59,14 @@ pub fn run() {
             commands::sync_state,
             commands::fetch,
             commands::pull,
+            commands::pull_preview,
+            commands::apply_pull,
+            commands::undo_sync,
+            commands::start_external_merge,
+            commands::abort_merge,
             commands::commit,
             commands::commit_and_push,
+            commands::diff,
             commands::auth_status,
             commands::github_device_start,
             commands::github_device_poll,
@@ -62,6 +88,20 @@ mod tests {
     use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
     use tauri::webview::InvokeRequest;
     use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    #[test]
+    fn window_title_names_the_device() {
+        assert_eq!(
+            super::window_title(Some("Device A")),
+            "mdgitjournal — Device A"
+        );
+        assert_eq!(
+            super::window_title(Some("  Device B ")),
+            "mdgitjournal — Device B"
+        );
+        assert_eq!(super::window_title(Some("   ")), "mdgitjournal");
+        assert_eq!(super::window_title(None), "mdgitjournal");
+    }
 
     /// capabilities/default.json lets the window use what app/src/lib/api.ts needs of Tauri, and
     /// nothing else: no menu, tray, path, app or emitting events.

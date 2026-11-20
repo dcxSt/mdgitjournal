@@ -39,9 +39,11 @@
     const version = app.current.version;
     if (editor && version !== shown) {
       shown = version;
-      editor.setDoc(untrack(() => app.current.content));
+      // The same entry reloaded after a pull or an edit elsewhere keeps its cursor.
+      editor.setDoc(untrack(() => app.current.content), { keepCursor: app.current.reloaded });
     }
   });
+  $effect(() => editor?.setReadOnly(app.readOnly));
   $effect(() => editor?.setMode(app.mode));
   $effect(() => editor?.setVim(vim));
   $effect(() => editor?.setDark(app.dark));

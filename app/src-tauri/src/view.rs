@@ -1,7 +1,7 @@
 //! The sync state as the UI shows it.
 
 use mdgj_core::RemoteConfig;
-use mdgj_git::{FileChange, SyncState};
+use mdgj_git::{FileChange, MergeState, SyncState, SyncSummary};
 use serde::Serialize;
 
 use crate::error::Error;
@@ -19,6 +19,10 @@ pub struct SyncView {
     pub last_fetch: Option<i64>,
     /// Why the last sync operation failed, until one succeeds.
     pub error: Option<Error>,
+    /// A git merge is in progress (`MERGE_HEAD` exists).
+    pub merge: Option<MergeState>,
+    /// The pull Undo would reverse, while it still can.
+    pub last_sync: Option<SyncSummary>,
 }
 
 impl SyncView {
@@ -43,6 +47,8 @@ impl SyncView {
             changes: state.changes,
             last_fetch: state.last_fetch,
             error,
+            merge: state.merge,
+            last_sync: state.last_sync,
         }
     }
 }
@@ -50,7 +56,7 @@ impl SyncView {
 #[cfg(test)]
 mod tests {
     use mdgj_core::AuthKind;
-    use mdgj_git::ChangeKind;
+    use mdgj_git::{ChangeKind, Choice, CommitInfo, PullPlan, ResolvedFile};
     use serde_json::json;
 
     use super::*;
@@ -77,6 +83,8 @@ mod tests {
                 },
             ],
             last_fetch: Some(1_763_301_720_000),
+            merge: None,
+            last_sync: None,
         }
     }
 
@@ -108,6 +116,68 @@ mod tests {
                 ],
                 "lastFetch": 1_763_301_720_000_i64,
                 "error": { "kind": "network", "message": "Network error: offline" },
+                "merge": null,
+                "lastSync": null,
+            })
+        );
+    }
+
+    #[test]
+    fn carries_the_merge_and_the_pull_undo_would_reverse() {
+        let summary = SyncSummary {
+            at: 1_763_301_720_000,
+            plan: PullPlan::Rebase,
+            incoming: vec![CommitInfo {
+                id: "a".repeat(40),
+                message: "Run\n\nAlong the river.".into(),
+                author: "Stephen".into(),
+                time: 1_763_301_000_000,
+            }],
+            incoming_count: 1,
+            rebased: 2,
+            merge_commit: None,
+            files: vec![FileChange {
+                path: "2026-11-16-1402-run.md".into(),
+                kind: ChangeKind::Added,
+                old_path: None,
+            }],
+            resolved: vec![ResolvedFile {
+                path: "2026-11-15-0700-walk.md".into(),
+                choice: Choice::Both,
+                copy: Some("2026-11-15-0700-walk.from-github-1402.md".into()),
+            }],
+        };
+        let view = SyncView::new(
+            SyncState {
+                merge: Some(MergeState {
+                    conflicted: vec!["2026-11-15-0700-walk.md".into()],
+                    started_by_app: true,
+                }),
+                last_sync: Some(summary),
+                ..state(true)
+            },
+            Some(URL),
+            Some(&remote(URL)),
+            None,
+        );
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(
+            json["merge"],
+            json!({ "conflicted": ["2026-11-15-0700-walk.md"], "startedByApp": true })
+        );
+        assert_eq!(
+            json["lastSync"],
+            json!({
+                "at": 1_763_301_720_000_i64,
+                "plan": "rebase",
+                "incoming": [{ "id": "a".repeat(40), "message": "Run\n\nAlong the river.",
+                               "author": "Stephen", "time": 1_763_301_000_000_i64 }],
+                "incomingCount": 1,
+                "rebased": 2,
+                "mergeCommit": null,
+                "files": [{ "path": "2026-11-16-1402-run.md", "kind": "added" }],
+                "resolved": [{ "path": "2026-11-15-0700-walk.md", "choice": "both",
+                               "copy": "2026-11-15-0700-walk.from-github-1402.md" }],
             })
         );
     }

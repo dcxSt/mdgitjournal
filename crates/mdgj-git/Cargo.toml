@@ -1,6 +1,6 @@
 [package]
 name = "mdgj-git"
-description = "libgit2 wrapper for mdgitjournal: commit, fetch, pull with keep-both merges, push, connect"
+description = "libgit2 wrapper for mdgitjournal: commit, fetch, pull with review, undo and user-chosen merges, push, connect"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,8 @@ chrono.workspace = true
 # target; vendoring it keeps builds from picking up a non-portable system copy (e.g. Homebrew's).
 git2 = { version = "0.21.0", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
 serde.workspace = true
+# The undo and merge records in .git/mdgitjournal/ (already in the workspace for mdgj-core).
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

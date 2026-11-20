@@ -117,24 +117,21 @@ export function slugPreview(title: string): string | null {
   return slug || "untitled";
 }
 
-const pad2 = (n: number) => String(n).padStart(2, "0");
-
 /** A name the entry list shows (mdgj-core's rule): a top-level `.md` file, not a dotfile. */
 export function isEntryFile(path: string): boolean {
   return path.length > 3 && path.endsWith(".md") && !path.startsWith(".") && !/\.\.|[/\\\0]/.test(path);
 }
 
+const ENTRY_NAME = /^(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})-(.+)\.md$/;
+
 /**
- * Name for the keep-both copy of `file` (PLAN §5), as mdgj-git names them: `name.conflict-hhmm.md`,
- * else `name.conflict-hhmm-2.md`, `-3`, … whichever is free first.
+ * How the sync sheets name a file: an entry by its title and date, as the sidebar shows it, and
+ * anything else (an image, a file outside the naming scheme) by its path.
  */
-export function conflictCopyName(file: string, taken: (name: string) => boolean, now: Date): string {
-  const stem = file.replace(/\.md$/, "");
-  const stamp = `${pad2(now.getHours())}${pad2(now.getMinutes())}`;
-  for (let n = 1; ; n++) {
-    const name = `${stem}.conflict-${stamp}${n > 1 ? `-${n}` : ""}.md`;
-    if (!taken(name)) return name;
-  }
+export function pathLabel(path: string): { title: string; when: string | null; entry: boolean } {
+  const m = ENTRY_NAME.exec(path);
+  if (m && isEntryFile(path)) return { title: m[4], when: `${m[1]} ${m[2]}:${m[3]}`, entry: true };
+  return { title: path, when: null, entry: isEntryFile(path) };
 }
 
 const segmenter = new Intl.Segmenter(undefined, { granularity: "word" });

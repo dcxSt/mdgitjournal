@@ -3,35 +3,58 @@
 // entry after a pull. Operations that touch the working tree run one at a time.
 
 import { imageLink } from "../editor/commands";
+import type { MergeSnapshot } from "../editor/merge";
 import { ApiError, onHidden, toApiError, type Api, type Unlisten } from "./api";
 import { DEFAULT_SETTINGS, EMPTY_VIEW, SIGNED_OUT } from "./defaults";
 import { CurrentEntry, SaveError } from "./entry.svelte";
-import { conflictCopyName, isEntryFile } from "./journal";
-import { Notices, type Notice } from "./notices.svelte";
+import { isEntryFile } from "./journal";
+import { Notices } from "./notices.svelte";
+import { Review } from "./review.svelte";
 import { Search } from "./search.svelte";
 import type { Action } from "./shortcuts";
-import { commitButton, commitMessageValid, isPushOnly, plural, type SyncOp } from "./sync";
+import {
+  changedPaths,
+  commitButton,
+  commitMessageValid,
+  isPushOnly,
+  isSyncFailure,
+  MERGE_TITLE,
+  plural,
+  summaryText,
+  type SyncOp,
+} from "./sync";
 import type {
   AppInfo,
   AuthStatus,
   CommandError,
-  Conflict,
   EntryMeta,
+  FileChange,
+  MergeState,
   Mode,
   Platform,
+  PullPreview,
   PullResult,
   Settings,
+  SyncSummary,
   SyncView,
 } from "./types";
 
-export type Overlay = "commit" | "settings" | "quickOpen" | "delete";
+/**
+ * The sheet (or full-window view) in front of everything. "merge" is the merge view, on top of
+ * the review it belongs to; "summary" is a pull's details; "abortMerge" confirms Abort merge.
+ */
+export type Overlay = "commit" | "settings" | "quickOpen" | "delete" | "review" | "merge" | "summary" | "abortMerge";
 
 /** Below this width a browser preview uses the phone layout. */
 export const MOBILE_MAX_WIDTH = 700;
 const FOCUS_REFRESH_GAP_MS = 2000;
 const TOAST_MS = 3000;
+/** While a merge is in progress, how often to look whether it was finished in a terminal. */
+export const MERGE_POLL_MS = 5000;
 
 export const NEEDS_PULL_TEXT = "GitHub has new changes — Pull first. Your commit is saved locally.";
+export const STALE_TEXT = "Something changed since you opened the review.";
+export const MERGE_TEXT = "Merge in progress — finish it with git, or abort it.";
 
 /** iOS always gets the phone layout; desktop windows never do (their minimum width fits both panes). */
 export function mobileLayout(platform: Platform, width: number, native: boolean): boolean {
@@ -60,6 +83,12 @@ export class AppState {
   /** Focus requests, cleared by the component that takes focus (it may not be mounted yet). */
   focusEditor = $state(false);
   focusSearch = $state(false);
+  /** The editor takes no edits: git is rewriting the working tree. */
+  readOnly = $state(false);
+  /** The Sync review in progress (overlay "review", or "merge" on top of it). */
+  review = $state.raw<Review | null>(null);
+  /** The pull the summary notice and its Details sheet describe. */
+  summary = $state.raw<SyncSummary | null>(null);
 
   readonly current: CurrentEntry;
   readonly search: Search;
@@ -70,6 +99,8 @@ export class AppState {
   currentMeta = $derived(this.entries.find((e) => e.file === this.current.file) ?? null);
   lastError = $derived(this.syncError ?? this.sync.error);
   mac = $derived(this.info?.platform === "macos" || this.info?.platform === "ios");
+  /** Undo can still reverse the pull the summary describes. */
+  canUndo = $derived(this.summary !== null && this.sync.lastSync?.at === this.summary.at);
 
   #lock: Promise<unknown> = Promise.resolve();
   #unlisten: Unlisten[] = [];
@@ -82,6 +113,11 @@ export class AppState {
   /** The fetch in flight, if any; pull and commit wait for it before pausing autosave. */
   #fetching: Promise<unknown> = Promise.resolve();
   #settingsWrites: Promise<void> = Promise.resolve();
+  #mergePoll: ReturnType<typeof setInterval> | undefined;
+  /** Abort merge is running: the merge ending is no news. */
+  #aborting = false;
+  /** Nested working-tree operations holding the editor read-only. */
+  #writing = 0;
 
   constructor(readonly api: Api) {
     this.current = new CurrentEntry(
@@ -134,6 +170,8 @@ export class AppState {
     for (const unlisten of this.#unlisten) unlisten();
     this.#unlisten = [];
     clearInterval(this.#fetchTimer);
+    clearInterval(this.#mergePoll);
+    this.#mergePoll = undefined;
   }
 
   // Entries
@@ -142,20 +180,28 @@ export class AppState {
     this.entries = await this.api.listEntries();
   }
 
-  /** Re-reads the list and the open entry (if its buffer is clean) after changes on disk. */
+  /**
+   * Re-reads the list and the open entry (if its buffer is clean) after changes on disk. While
+   * git rewrites the working tree, that operation takes care of the open entry itself.
+   */
   async refresh(): Promise<void> {
     try {
       await this.refreshEntries();
-      const file = this.current.file;
-      if (file !== null && !this.entries.some((e) => e.file === file)) {
-        // Gone from disk. Unsaved text stays and autosave writes it back.
-        if (!this.current.dirty) this.current.close();
-      } else {
-        await this.current.reloadIfClean();
-      }
+      if (this.#writing === 0) await this.#followOpenEntry();
       this.refreshSync();
     } catch (e) {
       this.#report(e);
+    }
+  }
+
+  /** The open entry after changes on disk: reloaded if its buffer is clean, closed if it is gone. */
+  async #followOpenEntry(): Promise<void> {
+    const file = this.current.file;
+    if (file !== null && !this.entries.some((e) => e.file === file)) {
+      // Gone from disk. Unsaved text stays and autosave writes it back.
+      if (!this.current.dirty) this.current.close();
+    } else {
+      await this.current.reloadIfClean();
     }
   }
 
@@ -305,8 +351,13 @@ export class AppState {
 
   // Sync
 
+  /** The review or the merge view is open; a fetch now would only make it stale. */
+  get reviewing(): boolean {
+    return this.overlay === "review" || this.overlay === "merge";
+  }
+
   async fetch(userInitiated = false): Promise<void> {
-    if (!this.sync.connected || this.ops.length) return;
+    if (!this.sync.connected || this.ops.length || this.reviewing) return;
     const fetched = this.#track("fetch", async () => {
       this.#setSync(await this.api.fetch());
     });
@@ -315,22 +366,166 @@ export class AppState {
     if (error && userInitiated) this.#report(error);
   }
 
+  /**
+   * Pull: applied at once when only one side changed each file (then the summary notice, with
+   * Undo), otherwise the Sync review opens and nothing has changed on disk.
+   */
   async pull(): Promise<void> {
-    if (!this.sync.connected || this.ops.includes("pull")) return;
+    if (!this.sync.connected || this.ops.includes("pull") || this.ops.includes("apply") || this.reviewing) return;
+    if (this.sync.merge) {
+      this.#toast(`${MERGE_TITLE}.`);
+      return;
+    }
+    let result: PullResult | undefined;
     const error = await this.#track("pull", () =>
-      this.#gitWork(async () => {
-        const result = await this.api.pull();
+      this.#writeWork(async () => {
+        result = await this.api.pull();
         this.#setSync(result.view);
         this.notices.dismiss("needs-pull");
-        await this.#afterIncoming(result);
+        if (result.status === "applied") await this.#afterWrite(result.summary.files);
       }),
     );
-    if (error) this.#report(error);
+    if (!result) {
+      this.#report(error);
+      return;
+    }
+    if (result.status === "up_to_date") this.#toast("Up to date.");
+    else if (result.status === "applied") this.#showSummary(result.summary);
+    else this.openReview(result.preview);
+  }
+
+  /** Opens the Sync review of `preview`; `notice` says why it opened (connect, a stale review). */
+  openReview(preview: PullPreview, notice: string | null = null): void {
+    const review = new Review(preview);
+    review.notice = notice;
+    this.review = review;
+    this.overlay = "review";
+  }
+
+  /** Cancel: nothing was written, so there is nothing to tell the backend. */
+  cancelReview(): void {
+    if (this.review?.busy) return;
+    this.review = null;
+    if (this.reviewing) this.overlay = null;
+  }
+
+  openMerge(path: string): void {
+    const review = this.review;
+    if (!review?.overlap(path)?.suggestion || review.busy) return;
+    review.merging = path;
+    this.overlay = "merge";
+  }
+
+  /** Done in the merge view (with its text), or Cancel (without): back to the review. */
+  closeMerge(done?: { text: string; snapshot: MergeSnapshot }): void {
+    const review = this.review;
+    if (!review) return;
+    if (done && review.merging) review.merged(review.merging, done.text, done.snapshot);
+    review.merging = null;
+    this.overlay = "review";
+  }
+
+  /** Apply: writes the review's choices. A stale review is replaced by a fresh one. */
+  async applyReview(): Promise<void> {
+    const review = this.review;
+    if (!review || review.busy || !review.ready) return;
+    review.busy = true;
+    review.error = null;
+    let summary: SyncSummary | undefined;
+    const error = await this.#track("apply", () =>
+      this.#writeWork(async () => {
+        const result = await this.api.applyPull(review.preview.id, review.resolutions(), review.commitMessage());
+        this.#setSync(result.view);
+        summary = result.summary;
+        this.#closeReview(review);
+        await this.#afterWrite(result.summary.files);
+      }),
+    );
+    review.busy = false;
+    if (summary) this.#showSummary(summary);
+    else if (error?.kind === "stale_review") await this.#freshReview();
+    else if (error) review.error = error.message;
+  }
+
+  /**
+   * Resolve with git: leaves a standard git merge in progress. Uncommitted changes are committed
+   * first, with the message the review asked for.
+   */
+  async resolveWithGit(): Promise<void> {
+    const review = this.review;
+    if (!review || review.busy) return;
+    const needsMessage = this.sync.changes.length > 0;
+    if (needsMessage && !commitMessageValid(review.gitMessage)) {
+      review.error = "Write a commit message for your changes first.";
+      return;
+    }
+    review.busy = true;
+    review.error = null;
+    let started = false;
+    const error = await this.#track("apply", () =>
+      this.#writeWork(async () => {
+        const view = await this.api.startExternalMerge(review.preview.id, needsMessage ? review.gitMessage.trim() : null);
+        this.#setSync(view);
+        started = true;
+        this.#closeReview(review);
+        await this.#afterWrite(null);
+      }),
+    );
+    review.busy = false;
+    if (started) return;
+    if (error?.kind === "stale_review") {
+      await this.#freshReview();
+      return;
+    }
+    // There were changes the review didn't know of: the message box appears.
+    if (error?.kind === "empty_message") this.refreshSync();
+    review.error = error?.message ?? null;
+  }
+
+  /** Undo of the last pull. Returns why it couldn't, for whoever asked to show. */
+  async undoSync(): Promise<ApiError | null> {
+    let restored = false;
+    const error = await this.#track("apply", () =>
+      this.#writeWork(async () => {
+        const result = await this.api.undoSync();
+        this.#setSync(result.view);
+        restored = true;
+        await this.#afterWrite(result.restored);
+      }),
+    );
+    if (!restored) return error;
+    this.#dropSummary();
+    this.#toast("Pull undone.");
+    return null;
+  }
+
+  openSummary(): void {
+    if (this.summary && this.overlay === null) this.overlay = "summary";
+  }
+
+  /** Abort merge (after its confirmation): back to how things were before the merge. */
+  async abortMerge(): Promise<ApiError | null> {
+    this.#aborting = true;
+    try {
+      return await this.#track("apply", () =>
+        this.#writeWork(async () => {
+          const result = await this.api.abortMerge();
+          this.#setSync(result.view);
+          await this.#afterWrite(result.restored);
+        }),
+      );
+    } finally {
+      this.#aborting = false;
+    }
   }
 
   /** Opens the commit sheet with an up-to-date list of changes. */
   async openCommit(): Promise<void> {
     if (this.overlay) return;
+    if (this.sync.merge) {
+      this.#toast(`${MERGE_TITLE}.`);
+      return;
+    }
     if (this.sync.connected && this.sync.behind > 0) {
       this.#toast("GitHub has new changes. Pull first.");
       return;
@@ -342,27 +537,28 @@ export class AppState {
       this.#report(e);
       return;
     }
-    if (commitButton(this.sync, this.ops).disabled) this.#toast("Nothing to commit.");
+    if (commitButton(this.sync, this.ops).disabled) this.#toast(this.sync.merge ? `${MERGE_TITLE}.` : "Nothing to commit.");
     else this.overlay = "commit";
   }
 
   /**
-   * Commits (and pushes, when connected). Returns an error for the sheet to show, or null.
-   * The message may only be blank when there is nothing to commit and local commits to push.
+   * Commits the ticked `paths` (and pushes, when connected). Returns an error for the sheet to
+   * show, or null. The message may only be blank, with nothing ticked, when there is nothing
+   * to commit and local commits to push.
    */
-  async commit(message: string): Promise<ApiError | null> {
-    if (!commitMessageValid(message) && !isPushOnly(this.sync)) {
-      return new ApiError("empty_message", "Write a commit message.");
-    }
+  async commit(message: string, paths: string[]): Promise<ApiError | null> {
+    const pushOnly = isPushOnly(this.sync) && paths.length === 0;
+    if (!pushOnly && !commitMessageValid(message)) return new ApiError("empty_message", "Write a commit message.");
+    if (!pushOnly && paths.length === 0) return new ApiError("invalid", "Tick at least one file to commit.");
     const text = message.trim();
     const error = await this.#track("commit", () =>
       this.#gitWork(async () => {
         if (!this.sync.connected) {
-          this.#setSync(await this.api.commit(text));
+          this.#setSync(await this.api.commit(text, paths));
           this.#toast("Committed.");
           return;
         }
-        const { view, result } = await this.api.commitAndPush(text);
+        const { view, result } = await this.api.commitAndPush(text, paths);
         this.#setSync(view);
         if (result === "needs_pull") this.notices.show({ key: "needs-pull", tone: "info", text: NEEDS_PULL_TEXT });
         else this.#toast(result === "pushed" ? `Pushed to ${view.repo ?? "GitHub"}.` : "Nothing to commit.");
@@ -402,7 +598,7 @@ export class AppState {
         key: "close",
         tone: "error",
         text: toApiError(e).message,
-        action: { label: "Close anyway", run: () => void this.api.closeWindow() },
+        actions: [{ label: "Close anyway", run: () => void this.api.closeWindow() }],
       });
       return false;
     }
@@ -422,17 +618,24 @@ export class AppState {
     this.auth = await this.api.authStatus();
   }
 
-  /** Connects the journal to `owner/repo`; errors are thrown for the connect flow to show. */
+  /**
+   * Connects the journal to `owner/repo`; errors are thrown for the connect flow to show. If files
+   * differ on both sides, the Sync review opens in front of Settings.
+   */
   async connect(fullName: string): Promise<PullResult> {
-    const result = await this.#gitWork(async () => {
+    const result = await this.#writeWork(async () => {
       const result = await this.api.githubConnect(fullName);
       this.#setSync(result.view);
       this.syncError = null;
-      await this.#afterIncoming(result);
+      if (result.status === "applied") await this.#afterWrite(result.summary.files);
       return result;
     });
     // The backend records the remote in settings.
     [this.settings, this.auth] = await Promise.all([this.api.getSettings(), this.api.authStatus()]);
+    if (result.status === "applied") this.#showSummary(result.summary);
+    else if (result.status === "review") {
+      this.openReview(result.preview, `Connected to ${fullName}. Some files differ here and on GitHub: choose what to keep.`);
+    }
     return result;
   }
 
@@ -522,13 +725,31 @@ export class AppState {
   }
 
   /**
-   * A pull, commit or connect: after earlier operations and any fetch in flight (which holds the
-   * backend's git lock, so autosave isn't paused while waiting for it), with autosave paused.
+   * A commit: after earlier operations and any fetch in flight (which holds the backend's git
+   * lock, so autosave isn't paused while waiting for it), with autosave paused.
    */
   #gitWork<T>(fn: () => Promise<T>): Promise<T> {
     return this.#serial(async () => {
       await this.#fetching;
       return this.#withSavesPaused(fn);
+    });
+  }
+
+  /**
+   * Git work that rewrites the working tree (pull, apply, undo, Resolve with git, abort,
+   * connect): as `#gitWork`, and the editor is read-only from before the last save until it is
+   * done, so the buffer can't drift from a file the operation replaces.
+   */
+  #writeWork<T>(fn: () => Promise<T>): Promise<T> {
+    return this.#serial(async () => {
+      await this.#fetching;
+      this.#writing++;
+      this.readOnly = true;
+      try {
+        return await this.#withSavesPaused(fn);
+      } finally {
+        if (--this.#writing === 0) this.readOnly = false;
+      }
     });
   }
 
@@ -553,8 +774,8 @@ export class AppState {
       return null;
     } catch (e) {
       const error = toApiError(e);
-      // A failed save is not a sync failure; it is reported on its own.
-      if (!(e instanceof SaveError)) this.syncError = error;
+      // A failed save is not a sync failure, and neither is an answer such as a stale review.
+      if (!(e instanceof SaveError) && isSyncFailure(error.kind)) this.syncError = error;
       return error;
     } finally {
       this.ops.splice(this.ops.indexOf(op), 1);
@@ -562,8 +783,102 @@ export class AppState {
   }
 
   #setSync(view: SyncView): void {
+    const before = this.sync;
     this.#syncReports++;
     this.sync = view;
+    this.#followMerge(before.merge, view.merge);
+    // The summary's pull can't be undone any more (a commit, a push, another pull): it goes.
+    const shown = this.summary?.at;
+    if (shown !== undefined && before.lastSync?.at === shown && view.lastSync?.at !== shown) this.#dropSummary();
+  }
+
+  /** The merge notice follows the merge; finishing it in a terminal is noticed and said. */
+  #followMerge(before: MergeState | null, after: MergeState | null): void {
+    if (after) {
+      const same = before && before.conflicted.join("\0") === after.conflicted.join("\0");
+      if (!same || !this.notices.has("merge")) this.notices.update(this.#mergeNotice(after));
+      this.#mergePoll ??= setInterval(() => this.refreshSync(), MERGE_POLL_MS);
+      return;
+    }
+    clearInterval(this.#mergePoll);
+    this.#mergePoll = undefined;
+    if (!before) return;
+    this.notices.dismiss("merge");
+    if (this.overlay === "abortMerge") this.overlay = null;
+    if (this.#aborting) return;
+    this.#toast("Merge finished.");
+    // git changed files: the list and the open entry follow.
+    void this.refresh();
+  }
+
+  #mergeNotice(merge: MergeState) {
+    return {
+      key: "merge",
+      tone: "info" as const,
+      persistent: true,
+      text: merge.conflicted.length
+        ? `${MERGE_TEXT} ${merge.conflicted.length === 1 ? "This file has" : "These files have"} conflict markers:`
+        : `${MERGE_TEXT} No conflicts are left: commit with git to finish.`,
+      files: merge.conflicted.map((path) => ({ label: path, file: isEntryFile(path) ? path : undefined })),
+      actions: [{ label: "Abort merge", keep: true, run: () => this.#openOverlay("abortMerge") }],
+    };
+  }
+
+  #showSummary(summary: SyncSummary): void {
+    this.summary = summary;
+    const undoable = this.sync.lastSync?.at === summary.at;
+    this.notices.show({
+      key: "sync-summary",
+      tone: "info",
+      text: `${summaryText(summary)}.`,
+      actions: [
+        { label: "Details", keep: true, run: () => this.openSummary() },
+        ...(undoable ? [{ label: "Undo", keep: true, run: () => void this.#undoFromNotice() }] : []),
+      ],
+    });
+  }
+
+  async #undoFromNotice(): Promise<void> {
+    const error = await this.undoSync();
+    if (error) this.notices.show({ key: "undo-error", tone: "error", text: error.message });
+  }
+
+  #dropSummary(): void {
+    this.summary = null;
+    this.notices.dismiss("sync-summary");
+    this.notices.dismiss("undo-error");
+    if (this.overlay === "summary") this.overlay = null;
+  }
+
+  #openOverlay(overlay: Overlay): void {
+    if (this.overlay === null) this.overlay = overlay;
+  }
+
+  #closeReview(review: Review): void {
+    if (this.review !== review) return;
+    this.review = null;
+    if (this.reviewing) this.overlay = null;
+  }
+
+  /** After `stale_review`: a fresh review, from a preview that never applies anything. */
+  async #freshReview(): Promise<void> {
+    try {
+      const result = await this.#serial(async () => {
+        await this.current.flush();
+        return this.api.pullPreview();
+      });
+      this.#setSync(result.view);
+      if (result.status === "review") {
+        this.openReview(result.preview, STALE_TEXT);
+        return;
+      }
+      this.review = null;
+      if (this.reviewing) this.overlay = null;
+      this.#toast(`${STALE_TEXT} There is nothing to pull now.`);
+    } catch (e) {
+      if (this.review) this.review.error = toApiError(e).message;
+      else this.#report(e);
+    }
   }
 
   /** Reads the sync state; false if a git operation reported it meanwhile, which then stands. */
@@ -582,39 +897,25 @@ export class AppState {
     else void this.refresh();
   }
 
-  /** Runs with autosave paused; the open entry is reloaded, or kept next to the pulled version. */
-  async #afterIncoming({ updated, merged, conflicts }: PullResult): Promise<void> {
+  /**
+   * After git rewrote files (`changes`, or any file when null): re-lists entries and reloads the
+   * open one if it changed, follows it if renamed, or closes it if it is gone. Runs with autosave
+   * paused and the editor read-only, so the buffer is what is on disk.
+   */
+  async #afterWrite(changes: readonly FileChange[] | readonly string[] | null): Promise<void> {
     await this.refreshEntries();
     const file = this.current.file;
-    const touched =
-      file !== null && (updated.includes(file) || merged.includes(file) || conflicts.some((c) => c.path === file));
-    if (touched) {
-      const exists = this.entries.some((e) => e.file === file);
-      if (!this.current.dirty) {
-        if (exists) await this.current.reloadIfClean();
-        else this.current.close();
-      } else if (exists) {
-        // Typed during the pull. As in any conflict, GitHub's version keeps the name and the local
-        // one goes next to it: the buffer moves to a copy, which autosave writes when the pause ends.
-        const names = new Set(this.entries.map((e) => e.file));
-        const copy = conflictCopyName(file, (name) => names.has(name), new Date());
-        this.current.renamed(copy);
-        this.notices.show({
-          key: "kept-buffer",
-          tone: "info",
-          text: `This entry changed on GitHub while you were typing. GitHub's version keeps the name; what you have open is saved next to it as ${copy}.`,
-          files: [{ label: `${file} (GitHub's version)`, file }],
-        });
-      } else {
-        // Removed on GitHub. A changed file is kept, so autosave writes the buffer back.
-        this.notices.show({
-          key: "kept-buffer",
-          tone: "info",
-          text: `${file} was removed on GitHub while you were typing. Your text is kept and saved under its name again.`,
-        });
-      }
+    if (file === null) return;
+    const paths = changes?.flatMap((c: FileChange | string) => (typeof c === "string" ? [c] : changedPaths([c])));
+    if (paths && !paths.includes(file)) return;
+    if (this.entries.some((e) => e.file === file)) {
+      await this.current.reloadIfClean();
+      return;
     }
-    if (conflicts.length) this.notices.show(conflictNotice(conflicts));
+    if (this.current.dirty) return;
+    const renamed = changes?.find((c: FileChange | string): c is FileChange => typeof c !== "string" && c.oldPath === file)?.path;
+    if (renamed && this.entries.some((e) => e.file === renamed)) this.current.load(await this.api.readEntry(renamed));
+    else this.current.close();
   }
 
   #armFetchTimer(): void {
@@ -629,29 +930,18 @@ export class AppState {
 
   #report(e: unknown): void {
     const error = toApiError(e);
+    // Someone started a merge with the git CLI: the state shows it.
+    if (error.kind === "merge_in_progress") this.refreshSync();
     if (error.kind === "reauth") {
       this.notices.show({
         key: "reauth",
         tone: "error",
         text: "Your GitHub sign-in has expired. Sign in again to keep syncing.",
-        action: { label: "Settings", run: () => (this.overlay = "settings") },
+        actions: [{ label: "Settings", run: () => (this.overlay = "settings") }],
       });
     } else {
       // A failed save replaces the entry's own notice about it, which a later save dismisses.
       this.notices.show({ key: e instanceof SaveError ? "save-error" : undefined, tone: "error", text: error.message });
     }
   }
-}
-
-/** Entries in the list link to them; other files (images) are only named. */
-function conflictNotice(conflicts: Conflict[]): Omit<Notice, "id"> {
-  const named = (path: string, label = path) => ({ label, file: isEntryFile(path) ? path : undefined });
-  return {
-    key: "conflicts",
-    tone: "info",
-    text: `${plural(conflicts.length, "file")} changed on both sides. GitHub's version keeps the name; yours is saved next to it, so nothing was lost:`,
-    files: conflicts.map((c) =>
-      c.copy ? named(c.copy) : named(c.path, `${c.path} (deleted here, kept GitHub's version)`),
-    ),
-  };
 }

@@ -140,7 +140,7 @@ test("with the red dot showing, Pull still pulls", async ({ page }) => {
 
 test("focusing and leaving the title renames nothing, even a name not in slug form", async ({ page }) => {
   await start(page);
-  const files = ["2026-11-15-0900-My_Notes.md", "2026-11-14-2130-ideas.conflict-1825.md"];
+  const files = ["2026-11-15-0900-My_Notes.md", "2026-11-14-2130-ideas.from-github-1825.md"];
   for (const file of files) await addFile(page, file, "Text.\n");
   await refocus(page);
   const title = page.getByLabel("Title");

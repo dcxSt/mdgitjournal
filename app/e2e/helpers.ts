@@ -6,10 +6,49 @@ interface MockWindow {
     files: Map<string, string>;
     calls: string[];
     failNext(method: string, kind: string, message: string): void;
+    remoteCommit(file: string, content: string | null, message?: string): void;
+    editOnDisk(file: string, content: string | null): void;
+    finishMergeWithGit(): void;
+    seedOverlaps(): { clean: string; clash: string };
   };
 }
 
 export const SAMPLE = "2026-11-16-1402-morning-run.md";
+export const IDEAS = "2026-11-14-2130-ideas.md";
+export const LIST = "2026-10-28-0815-reading-list.md";
+
+/** Every file in the mock's journal folder, to compare before and after. */
+export function allFiles(page: Page): Promise<[string, string][]> {
+  return page.evaluate(() => [...(window as unknown as MockWindow).mdgjMock.files].sort(([a], [b]) => a.localeCompare(b)));
+}
+
+/** A commit lands on GitHub (null deletes the file). */
+export function remoteCommit(page: Page, file: string, content: string | null, message?: string): Promise<void> {
+  return page.evaluate(
+    ([f, c, m]) => (window as unknown as MockWindow).mdgjMock.remoteCommit(f!, c, m ?? undefined),
+    [file, content, message ?? null] as const,
+  );
+}
+
+/** An edit made outside the app, as vim or Finder would. */
+export function editOnDisk(page: Page, file: string, content: string | null): Promise<void> {
+  return page.evaluate(([f, c]) => (window as unknown as MockWindow).mdgjMock.editOnDisk(f!, c), [file, content] as const);
+}
+
+/** As `git add -A && git commit` in a terminal. */
+export function finishMergeWithGit(page: Page): Promise<void> {
+  return page.evaluate(() => (window as unknown as MockWindow).mdgjMock.finishMergeWithGit());
+}
+
+/**
+ * GitHub and this device both edit two entries: the morning run in different paragraphs (it
+ * merges cleanly) and the same line of the reading list (a clash). Then the window regains focus.
+ */
+export async function seedOverlaps(page: Page): Promise<{ clean: string; clash: string }> {
+  const seeded = await page.evaluate(() => (window as unknown as MockWindow).mdgjMock.seedOverlaps());
+  await refocus(page);
+  return seeded;
+}
 
 /** Loads the app on the mock backend and waits until the first entry is open. */
 export async function start(page: Page): Promise<void> {

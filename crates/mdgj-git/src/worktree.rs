@@ -1,4 +1,5 @@
-//! The working tree as git sees it: an in-memory snapshot, and writing a merge result back to disk.
+//! The working tree as git sees it (an in-memory snapshot), and the one careful way a pull replaces
+//! or removes files in it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -8,11 +9,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use git2::{FileMode, Index, IndexAddOption, Oid, Repository};
+use git2::{Index, IndexAddOption, IndexEntry, IndexTime, ObjectType, Oid, Repository, Tree};
 
-use crate::merge::copy_path;
 use crate::repo::{lossy, workdir};
-use crate::{Conflict, Error, Result};
+use crate::{Error, Result};
 
 /// Repository path -> (blob id, file mode).
 pub(crate) type Files = BTreeMap<Vec<u8>, (Oid, u32)>;
@@ -21,17 +21,19 @@ pub(crate) type Files = BTreeMap<Vec<u8>, (Oid, u32)>;
 /// stray file in the journal.
 const TEMP_FILE: &str = "mdgitjournal-write.tmp";
 const MEMPACK_PRIORITY: i32 = 1000;
+pub(crate) const BLOB: u32 = 0o100644;
+pub(crate) const EXECUTABLE: u32 = 0o100755;
+/// Symbolic links: a pull never writes one from the remote, as it could point the journal anywhere.
+pub(crate) const LINK: u32 = 0o120000;
 /// Submodules are recorded, never written; git leaves them alone on checkout too.
-const GITLINK: u32 = 0o160000;
-/// Symbolic links are never written: a link from the remote could point the journal anywhere.
-const LINK: u32 = 0o120000;
+pub(crate) const GITLINK: u32 = 0o160000;
 /// The merge stage bits of an index entry's flags; 0 for a resolved entry.
-pub(crate) const STAGE_MASK: u16 = 0x3000;
+const STAGE_MASK: u16 = 0x3000;
 
 /// The working tree (tracked and untracked files, minus ignored ones) as a tree.
 pub(crate) struct Snapshot {
-    /// A separate handle whose new objects stay in memory: snapshots never write to the real index
-    /// or object store. Merges with the snapshot must run on this handle.
+    /// A separate handle whose new objects stay in memory: snapshots, previews and the review's
+    /// trial merges never write to the real index or object store.
     pub repo: Repository,
     pub tree: Oid,
     pub files: Files,
@@ -39,8 +41,7 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     pub fn take(git: &Repository) -> Result<Snapshot> {
-        let repo = Repository::open(workdir(git)?)?;
-        repo.odb()?.add_new_mempack_backend(MEMPACK_PRIORITY)?;
+        let repo = scratch(git)?;
         // Starts from the on-disk index so its stat cache spares rehashing unchanged files; the
         // index is never written back.
         let mut index = repo.index()?;
@@ -52,6 +53,14 @@ impl Snapshot {
     }
 }
 
+/// A second handle on the repository whose new objects (hashes of files, trial merges) stay in
+/// memory.
+pub(crate) fn scratch(git: &Repository) -> Result<Repository> {
+    let repo = Repository::open(workdir(git)?)?;
+    repo.odb()?.add_new_mempack_backend(MEMPACK_PRIORITY)?;
+    Ok(repo)
+}
+
 /// Stage-0 entries of `index`.
 pub(crate) fn files(index: &Index) -> Files {
     index
@@ -61,95 +70,254 @@ pub(crate) fn files(index: &Index) -> Files {
         .collect()
 }
 
-/// Makes the working tree match `target`, given that it matched `snapshot.files` when the snapshot
-/// was taken. Only paths that differ are touched. A file whose content changed since the snapshot is
-/// never overwritten or removed: it moves to a conflict copy first, or stays in place.
-/// Returns every path written, moved or removed.
-pub(crate) fn apply(
-    snapshot: &Snapshot,
-    target: &Files,
-    stamp: &str,
-    conflicts: &mut Vec<Conflict>,
-) -> Result<Vec<String>> {
-    let repo = &snapshot.repo;
-    let current = &snapshot.files;
-    let workdir = workdir(repo)?;
-
-    // Every path is checked before the first change, so an unsafe path or a folder in the way
-    // aborts with the working tree untouched.
-    no_case_collisions(target.keys())?;
-    let mut writes = Vec::new();
-    for (path, &(id, mode)) in target {
-        if mode != GITLINK && current.get(path) != Some(&(id, mode)) {
-            if mode == LINK {
-                return Err(Error::Git(format!(
-                    "the remote has a symbolic link at \"{}\"; mdgitjournal does not write links. \
-                     Remove it from the repository with git and pull again",
-                    lossy(path)
-                )));
-            }
-            let full = checked_path(workdir, path)?;
-            not_a_folder(&full)?;
-            writes.push((path, full, id, mode));
-        }
-    }
-    let mut removals = Vec::new();
-    for (path, &(id, mode)) in current {
-        if mode != GITLINK && !target.contains_key(path) {
-            let full = checked_path(workdir, path)?;
-            not_a_folder(&full)?;
-            removals.push((path, full, id));
-        }
-    }
-
-    // New paths first: conflict copies must be on disk before the files they preserve change.
-    writes.sort_by_key(|(path, ..)| current.contains_key(*path));
-    let mut touched = Vec::new();
-    let mut written = HashSet::new();
-    for (path, full, id, mode) in writes {
-        if differs_on_disk(repo, &full, current.get(path).map(|&(id, _)| id))? {
-            let copy = copy_path(path, stamp, |p| {
-                target.contains_key(p) || current.contains_key(p) || exists(workdir, p)
-            });
-            checked_path(workdir, path)?;
-            make_parents(workdir, &copy)?;
-            fs::rename(&full, workdir.join(OsStr::from_bytes(&copy)))?;
-            touched.push(lossy(&copy));
-            conflicts.push(Conflict {
-                path: lossy(path),
-                copy: Some(lossy(&copy)),
-            });
-        }
-        make_parents(workdir, path)?;
-        write_blob(repo, &full, id, mode)?;
-        written.insert(file_id(&fs::symlink_metadata(&full)?));
-        touched.push(lossy(path));
-    }
-    for (path, full, id) in removals {
-        let Some(meta) = metadata(&full)? else {
-            continue;
-        };
-        // On a case-insensitive file system the old name can reach a file just written under
-        // another spelling.
-        if !written.contains(&file_id(&meta)) && !differs_on_disk(repo, &full, Some(id))? {
-            checked_path(workdir, path)?;
-            remove_file(workdir, &full)?;
-            touched.push(lossy(path));
-        }
-    }
-
-    touched.sort();
-    touched.dedup();
-    Ok(touched)
+/// The files of a tree.
+pub(crate) fn tree_files(tree: &Tree<'_>) -> Result<Files> {
+    let mut index = Index::new()?;
+    index.read_tree(tree)?;
+    Ok(files(&index))
 }
 
-/// Whether a file exists at `full` with content other than `expected` (`None`: no file expected),
-/// i.e. whether replacing or removing it could lose something.
-fn differs_on_disk(repo: &Repository, full: &Path, expected: Option<Oid>) -> Result<bool> {
-    match metadata(full)? {
-        None => Ok(false),
-        // Hashed through the snapshot handle, so filters match the snapshot and nothing is stored.
-        Some(_) => Ok(expected != Some(repo.blob_path(full)?)),
+/// Writes the tree holding `files` (only the trees; the blobs must already exist) through `repo`.
+pub(crate) fn build_tree(repo: &Repository, files: &Files) -> Result<Oid> {
+    let mut index = Index::new()?;
+    for (path, &(id, mode)) in files {
+        index.add(&entry(path, id, mode))?;
+    }
+    Ok(index.write_tree_to(repo)?)
+}
+
+/// An index entry with no file-system data, so git rehashes the file before trusting it.
+pub(crate) fn entry(path: &[u8], id: Oid, mode: u32) -> IndexEntry {
+    IndexEntry {
+        ctime: IndexTime::new(0, 0),
+        mtime: IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: 0,
+        flags_extended: 0,
+        path: path.to_vec(),
+    }
+}
+
+pub(crate) fn regular(mode: u32) -> bool {
+    mode == BLOB || mode == EXECUTABLE
+}
+
+/// One file a pull replaces or removes.
+pub(crate) struct Step {
+    pub path: Vec<u8>,
+    full: PathBuf,
+    /// The working tree's version (`None`: no file), as recorded for Undo.
+    pub before: Option<(Oid, u32)>,
+    /// The new version (`None`: removed).
+    pub after: Option<(Oid, u32)>,
+    /// What must be on disk right before the step. Usually `before`; for a new name that the file
+    /// system folds onto an existing file (case-only renames on APFS), that file.
+    expected: Option<(Oid, u32)>,
+}
+
+/// Every change that makes the working tree match a target, checked before anything is written.
+pub(crate) struct Plan {
+    pub steps: Vec<Step>,
+}
+
+/// Plans the changes from the snapshot's working tree to `target`. Refuses, with nothing written,
+/// anything git would need to sort out: links from the remote, names that differ only in case, a
+/// folder (or a symlinked or plain file) where a folder or file must go, an ignored file in the
+/// way, paths that could leave the working tree, and names that aren't UTF-8.
+pub(crate) fn plan(snapshot: &Snapshot, target: &Files) -> Result<Plan> {
+    let current = &snapshot.files;
+    let workdir = workdir(&snapshot.repo)?;
+    no_case_collisions(target.keys())?;
+
+    let mut removals = Vec::new();
+    for (path, &entry) in current {
+        if entry.1 != GITLINK && !target.contains_key(path) {
+            removals.push(Step {
+                full: checked(workdir, path)?,
+                path: path.clone(),
+                before: Some(entry),
+                after: None,
+                expected: Some(entry),
+            });
+        }
+    }
+    let mut steps = Vec::new();
+    for (path, &entry) in target {
+        let before = current.get(path).copied();
+        if entry.1 == GITLINK || before == Some(entry) {
+            continue;
+        }
+        if entry.1 == LINK {
+            return Err(Error::Git(format!(
+                "the remote has a symbolic link at \"{}\"; mdgitjournal does not write links. \
+                 Remove it from the repository with git and pull again",
+                lossy(path)
+            )));
+        }
+        let full = checked(workdir, path)?;
+        let expected = match (before, metadata(&full)?) {
+            (Some(_), _) | (None, None) => before,
+            (None, Some(meta)) => {
+                let alias = removals.iter().find(|removal| {
+                    metadata(&removal.full)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| file_id(&m) == file_id(&meta))
+                });
+                match alias {
+                    Some(removal) => removal.before,
+                    None => {
+                        return Err(Error::Git(format!(
+                            "\"{}\" is on this device but ignored by git, and the remote has a \
+                             file with that name; move it out of the way and try again",
+                            lossy(path)
+                        )))
+                    }
+                }
+            }
+        };
+        steps.push(Step {
+            path: path.clone(),
+            full,
+            before,
+            after: Some(entry),
+            expected,
+        });
+    }
+    steps.extend(removals);
+    Ok(Plan { steps })
+}
+
+/// What happened to each step that ran.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Done {
+    Wrote,
+    Removed,
+    /// A removal of a name that, on this file system, is the file just written under another.
+    Skipped,
+}
+
+pub(crate) struct Failed {
+    pub error: Error,
+    pub done: Vec<Done>,
+}
+
+/// Runs the plan. Each file is compared with what the plan expects immediately before it is
+/// replaced or removed; one that changed in the meantime stops everything with
+/// `Error::StaleReview`, and `rollback` puts back what was done. `repo` must be the snapshot's
+/// handle, which holds the new versions.
+pub(crate) fn execute(repo: &Repository, plan: &Plan) -> Result<Vec<Done>, Failed> {
+    let mut done = Vec::new();
+    let mut written = HashSet::new();
+    for step in &plan.steps {
+        match run(repo, step, &mut written) {
+            Ok(outcome) => done.push(outcome),
+            Err(error) => return Err(Failed { error, done }),
+        }
+    }
+    Ok(done)
+}
+
+fn run(repo: &Repository, step: &Step, written: &mut HashSet<(u64, u64)>) -> Result<Done> {
+    let workdir = workdir(repo)?;
+    let meta = metadata(&step.full)?;
+    if step.after.is_none() && meta.as_ref().is_some_and(|m| written.contains(&file_id(m))) {
+        return Ok(Done::Skipped);
+    }
+    // The folders on the way are checked again right before the change.
+    checked_path(workdir, &step.path)?;
+    let is_expected = |full: &Path| -> Result<bool> {
+        let meta = metadata(full)?;
+        Ok(hash(repo, full, meta.as_ref())? == step.expected.map(|(id, _)| id))
+    };
+    match step.after {
+        Some((id, mode)) => {
+            make_parents(workdir, &step.path)?;
+            // The new version is on disk (and synced) before the old one is checked, so the check
+            // and the replacement happen back to back.
+            let temp = stage_blob(repo, &step.full, id, mode)?;
+            if !is_expected(&step.full)? {
+                fs::remove_file(&temp)?;
+                return Err(Error::StaleReview);
+            }
+            fs::rename(&temp, &step.full)?;
+            written.insert(file_id(&fs::symlink_metadata(&step.full)?));
+            Ok(Done::Wrote)
+        }
+        None => {
+            if !is_expected(&step.full)? {
+                return Err(Error::StaleReview);
+            }
+            remove_file(workdir, &step.full)?;
+            Ok(Done::Removed)
+        }
+    }
+}
+
+/// Undoes the steps that ran, newest first, each only if its file is still as the step left it.
+pub(crate) fn rollback(repo: &Repository, plan: &Plan, done: &[Done]) -> Result<()> {
+    for (step, outcome) in plan.steps.iter().zip(done).rev() {
+        let meta = metadata(&step.full)?;
+        let untouched = match outcome {
+            Done::Wrote => hash(repo, &step.full, meta.as_ref())? == step.after.map(|(id, _)| id),
+            Done::Removed => meta.is_none(),
+            Done::Skipped => false,
+        };
+        if untouched {
+            put(repo, &step.path, step.expected)?;
+        }
+    }
+    Ok(())
+}
+
+/// The blob id of the file at `path` as git would store it (hashed through `repo`, so use a
+/// scratch handle to store nothing); `None` if there is no file, the zero id for a folder.
+pub(crate) fn on_disk(repo: &Repository, path: &[u8]) -> Result<Option<Oid>> {
+    let full = checked_path(workdir(repo)?, path)?;
+    let meta = metadata(&full)?;
+    hash(repo, &full, meta.as_ref())
+}
+
+fn hash(repo: &Repository, full: &Path, meta: Option<&fs::Metadata>) -> Result<Option<Oid>> {
+    match meta {
+        None => Ok(None),
+        Some(meta) if meta.is_dir() => Ok(Some(Oid::ZERO_SHA1)),
+        // git stores a link as its target.
+        Some(meta) if meta.file_type().is_symlink() => {
+            let target = fs::read_link(full)?;
+            Ok(Some(Oid::hash_object(
+                ObjectType::Blob,
+                target.as_os_str().as_bytes(),
+            )?))
+        }
+        // Filters apply as in the snapshot.
+        Some(_) => Ok(Some(repo.blob_path(full)?)),
+    }
+}
+
+/// Makes the file at `path` hold `entry` exactly (blob from `repo`), or removes it for `None`.
+/// Used to restore a user's own versions (Undo, Abort), so links are written back as links;
+/// submodules are left alone.
+pub(crate) fn put(repo: &Repository, path: &[u8], entry: Option<(Oid, u32)>) -> Result<()> {
+    let workdir = workdir(repo)?;
+    let full = checked_path(workdir, path)?;
+    match entry {
+        Some((_, GITLINK)) => Ok(()),
+        Some((id, mode)) => {
+            not_a_folder(&full)?;
+            make_parents(workdir, path)?;
+            write_blob(repo, &full, id, mode)
+        }
+        None => match metadata(&full)? {
+            Some(meta) if !meta.is_dir() => remove_file(workdir, &full),
+            _ => Ok(()),
+        },
     }
 }
 
@@ -180,6 +348,19 @@ pub(crate) fn exists(workdir: &Path, path: &[u8]) -> bool {
         .join(OsStr::from_bytes(path))
         .symlink_metadata()
         .is_ok()
+}
+
+/// A path the plan may write or remove: safe, UTF-8 (the undo record names it), not a folder.
+fn checked(workdir: &Path, path: &[u8]) -> Result<PathBuf> {
+    if std::str::from_utf8(path).is_err() {
+        return Err(Error::Git(format!(
+            "\"{}\" is not a UTF-8 file name; rename it with git and try again",
+            lossy(path)
+        )));
+    }
+    let full = checked_path(workdir, path)?;
+    not_a_folder(&full)?;
+    Ok(full)
 }
 
 /// `workdir`/`path`, refusing paths that could escape the working tree or reach into .git: `..`,
@@ -265,23 +446,36 @@ fn no_case_collisions<'a>(paths: impl Iterator<Item = &'a Vec<u8>>) -> Result<()
     Ok(())
 }
 
-/// Atomically replaces `full` with the blob's bytes, exactly as stored.
+/// Atomically replaces `full` with the blob's bytes, exactly as stored (a link's target, for a
+/// link).
 fn write_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<()> {
+    let temp = stage_blob(repo, full, id, mode)?;
+    fs::rename(&temp, full)?;
+    Ok(())
+}
+
+/// Writes the blob for `full` to the temp file in the git directory, synced, ready to be renamed
+/// into place.
+fn stage_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<PathBuf> {
     let blob = repo.find_blob(id)?;
     let temp = repo.path().join(TEMP_FILE);
     match fs::remove_file(&temp) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
-    let permissions = if mode == u32::from(FileMode::Blob) {
-        0o666
-    } else if mode == u32::from(FileMode::BlobExecutable) {
-        0o777
-    } else {
-        return Err(Error::Git(format!(
-            "{} has an unsupported file type (mode {mode:o})",
-            full.display()
-        )));
+    let permissions = match mode {
+        BLOB => 0o666,
+        EXECUTABLE => 0o777,
+        LINK => {
+            std::os::unix::fs::symlink(OsStr::from_bytes(blob.content()), &temp)?;
+            return Ok(temp);
+        }
+        _ => {
+            return Err(Error::Git(format!(
+                "{} has an unsupported file type (mode {mode:o})",
+                full.display()
+            )))
+        }
     };
     let mut file = OpenOptions::new()
         .write(true)
@@ -290,8 +484,7 @@ fn write_blob(repo: &Repository, full: &Path, id: Oid, mode: u32) -> Result<()> 
         .open(&temp)?;
     file.write_all(blob.content())?;
     file.sync_all()?;
-    fs::rename(&temp, full)?;
-    Ok(())
+    Ok(temp)
 }
 
 /// Removes a file, then any folders it leaves empty (as git does).
@@ -317,6 +510,17 @@ mod tests {
         (dir, repo)
     }
 
+    fn apply(snapshot: &Snapshot, target: &Files) -> Result<()> {
+        let plan = plan(snapshot, target)?;
+        match execute(&snapshot.repo, &plan) {
+            Ok(_) => Ok(()),
+            Err(failed) => {
+                rollback(&snapshot.repo, &plan, &failed.done).unwrap();
+                Err(failed.error)
+            }
+        }
+    }
+
     #[test]
     fn snapshot_stores_nothing() {
         let (dir, repo) = setup();
@@ -329,37 +533,90 @@ mod tests {
     }
 
     #[test]
-    fn files_edited_after_the_snapshot_are_kept() {
+    fn a_file_edited_after_the_snapshot_stops_everything_and_nothing_is_lost() {
         let (dir, repo) = setup();
         let path = |name: &str| dir.path().join(name);
         fs::write(path("a.md"), "before\n").unwrap();
         fs::write(path("b.md"), "before\n").unwrap();
         let snapshot = Snapshot::take(&repo).unwrap();
-        fs::write(path("a.md"), "typed during the pull\n").unwrap();
-        fs::write(path("b.md"), "typed during the pull\n").unwrap();
-
-        // The target replaces a.md and drops b.md.
         let remote = snapshot.repo.blob(b"remote\n").unwrap();
-        let target = Files::from([(b"a.md".to_vec(), (remote, u32::from(FileMode::Blob)))]);
-        let mut conflicts = Vec::new();
-        let touched = apply(&snapshot, &target, "0930", &mut conflicts).unwrap();
-
-        assert_eq!(fs::read_to_string(path("a.md")).unwrap(), "remote\n");
-        assert_eq!(
-            fs::read_to_string(path("a.conflict-0930.md")).unwrap(),
-            "typed during the pull\n"
-        );
+        // The target adds new.md, replaces a.md and drops b.md; b.md changes after the snapshot.
+        let target = Files::from([
+            (b"a.md".to_vec(), (remote, BLOB)),
+            (b"new.md".to_vec(), (remote, BLOB)),
+        ]);
+        fs::write(path("b.md"), "typed during the pull\n").unwrap();
+        assert_eq!(apply(&snapshot, &target), Err(Error::StaleReview));
+        assert_eq!(fs::read_to_string(path("a.md")).unwrap(), "before\n");
         assert_eq!(
             fs::read_to_string(path("b.md")).unwrap(),
             "typed during the pull\n"
         );
-        assert_eq!(touched, ["a.conflict-0930.md", "a.md"]);
+        assert!(!path("new.md").exists());
+
+        // The same with the first file to be replaced.
+        fs::write(path("a.md"), "typed again\n").unwrap();
+        assert_eq!(apply(&snapshot, &target), Err(Error::StaleReview));
+        assert_eq!(fs::read_to_string(path("a.md")).unwrap(), "typed again\n");
+        assert!(!path("new.md").exists());
+
+        // A file that appeared where a new one goes.
+        let snapshot = Snapshot::take(&repo).unwrap();
+        let remote = snapshot.repo.blob(b"remote\n").unwrap();
+        let mut target = snapshot.files.clone();
+        target.insert(b"c.md".to_vec(), (remote, BLOB));
+        let plan = plan(&snapshot, &target).unwrap();
+        fs::write(path("c.md"), "mine\n").unwrap();
+        assert!(matches!(
+            execute(&snapshot.repo, &plan),
+            Err(Failed {
+                error: Error::StaleReview,
+                ..
+            })
+        ));
+        assert_eq!(fs::read_to_string(path("c.md")).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn plans_write_only_what_differs() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join("same.md"), "same\n").unwrap();
+        fs::write(dir.path().join("gone.md"), "gone\n").unwrap();
+        let snapshot = Snapshot::take(&repo).unwrap();
+        let new = snapshot.repo.blob(b"new\n").unwrap();
+        let mut target = snapshot.files.clone();
+        target.remove(b"gone.md".as_slice());
+        target.insert(b"dir/new.md".to_vec(), (new, BLOB));
+        let plan = plan(&snapshot, &target).unwrap();
+        let paths: Vec<_> = plan.steps.iter().map(|s| lossy(&s.path)).collect();
+        assert_eq!(paths, ["dir/new.md", "gone.md"]);
+        let done = execute(&snapshot.repo, &plan).ok().unwrap();
         assert_eq!(
-            conflicts,
-            [Conflict {
-                path: "a.md".into(),
-                copy: Some("a.conflict-0930.md".into())
-            }]
+            fs::read_to_string(dir.path().join("dir/new.md")).unwrap(),
+            "new\n"
+        );
+        assert!(!dir.path().join("gone.md").exists());
+        rollback(&snapshot.repo, &plan, &done).unwrap();
+        assert!(!dir.path().join("dir").exists(), "emptied folders go too");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("gone.md")).unwrap(),
+            "gone\n"
+        );
+    }
+
+    #[test]
+    fn ignored_files_in_the_way_are_refused() {
+        let (dir, repo) = setup();
+        fs::write(dir.path().join(".gitignore"), "*.local\n").unwrap();
+        fs::write(dir.path().join("notes.local"), "private\n").unwrap();
+        let snapshot = Snapshot::take(&repo).unwrap();
+        let blob = snapshot.repo.blob(b"remote\n").unwrap();
+        let mut target = snapshot.files.clone();
+        target.insert(b"notes.local".to_vec(), (blob, BLOB));
+        let result = plan(&snapshot, &target).map(|_| ());
+        assert!(
+            matches!(&result, Err(Error::Git(m)) if m.contains("ignored")),
+            "{result:?}"
         );
     }
 
@@ -368,12 +625,18 @@ mod tests {
         let (dir, repo) = setup();
         let snapshot = Snapshot::take(&repo).unwrap();
         let blob = snapshot.repo.blob(b"x").unwrap();
-        for bad in [&b"../escape.md"[..], b".git/config", b"a//b.md", b"./a.md"] {
+        for bad in [
+            &b"../escape.md"[..],
+            b".git/config",
+            b"a//b.md",
+            b"./a.md",
+            b"\xff.md",
+        ] {
             let target = Files::from([
-                (b"aaa-first.md".to_vec(), (blob, u32::from(FileMode::Blob))),
-                (bad.to_vec(), (blob, u32::from(FileMode::Blob))),
+                (b"aaa-first.md".to_vec(), (blob, BLOB)),
+                (bad.to_vec(), (blob, BLOB)),
             ]);
-            assert!(apply(&snapshot, &target, "0000", &mut Vec::new()).is_err());
+            assert!(apply(&snapshot, &target).is_err());
             assert!(!dir.path().join("aaa-first.md").exists());
         }
     }
@@ -385,10 +648,10 @@ mod tests {
         let link = snapshot.repo.blob(b"../outside").unwrap();
         let blob = snapshot.repo.blob(b"x").unwrap();
         let target = Files::from([
-            (b"aaa-first.md".to_vec(), (blob, u32::from(FileMode::Blob))),
+            (b"aaa-first.md".to_vec(), (blob, BLOB)),
             (b"link".to_vec(), (link, LINK)),
         ]);
-        let result = apply(&snapshot, &target, "0000", &mut Vec::new());
+        let result = apply(&snapshot, &target);
         assert!(
             matches!(&result, Err(Error::Git(m)) if m.contains("symbolic link")),
             "{result:?}"
@@ -404,8 +667,8 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).unwrap();
         let snapshot = Snapshot::take(&repo).unwrap();
         let blob = snapshot.repo.blob(b"x").unwrap();
-        let target = Files::from([(b"a/x.md".to_vec(), (blob, u32::from(FileMode::Blob)))]);
-        assert!(apply(&snapshot, &target, "0000", &mut Vec::new()).is_err());
+        let target = Files::from([(b"a/x.md".to_vec(), (blob, BLOB))]);
+        assert!(apply(&snapshot, &target).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 
         // A link that appears after planning is caught when the folder is made.
@@ -423,12 +686,30 @@ mod tests {
         let snapshot = Snapshot::take(&repo).unwrap();
         let blob = snapshot.repo.blob(b"x").unwrap();
         let target = Files::from([
-            (b"A".to_vec(), (blob, u32::from(FileMode::Blob))),
-            (b"a/x.md".to_vec(), (blob, u32::from(FileMode::Blob))),
-            (b"aaa-first.md".to_vec(), (blob, u32::from(FileMode::Blob))),
+            (b"A".to_vec(), (blob, BLOB)),
+            (b"a/x.md".to_vec(), (blob, BLOB)),
+            (b"aaa-first.md".to_vec(), (blob, BLOB)),
         ]);
-        assert!(apply(&snapshot, &target, "0000", &mut Vec::new()).is_err());
+        assert!(apply(&snapshot, &target).is_err());
         assert!(!dir.path().join("aaa-first.md").exists());
         assert!(!dir.path().join("A").exists());
+    }
+
+    #[test]
+    fn put_restores_links_and_files() {
+        let (dir, repo) = setup();
+        let target = repo.blob(b"elsewhere").unwrap();
+        let text = repo.blob(b"text\n").unwrap();
+        put(&repo, b"sub/link", Some((target, LINK))).unwrap();
+        put(&repo, b"sub/file.md", Some((text, BLOB))).unwrap();
+        let link = dir.path().join("sub/link");
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("elsewhere"));
+        assert_eq!(on_disk(&repo, b"sub/link").unwrap(), Some(target));
+        assert_eq!(on_disk(&repo, b"sub/file.md").unwrap(), Some(text));
+        assert_eq!(on_disk(&repo, b"sub").unwrap(), Some(Oid::ZERO_SHA1));
+        put(&repo, b"sub/link", None).unwrap();
+        put(&repo, b"sub/file.md", None).unwrap();
+        assert!(!dir.path().join("sub").exists());
+        assert_eq!(on_disk(&repo, b"sub/file.md").unwrap(), None);
     }
 }

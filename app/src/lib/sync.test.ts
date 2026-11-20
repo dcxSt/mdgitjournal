@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { EMPTY_VIEW } from "./defaults";
-import { commitButton, commitMessageValid, isPushOnly, pullButton } from "./sync";
-import type { FileChange, SyncView } from "./types";
+import {
+  commitButton,
+  commitMessageValid,
+  isPushOnly,
+  isSyncFailure,
+  MERGE_TITLE,
+  pullButton,
+  rebasedText,
+  relativeTime,
+  summaryText,
+} from "./sync";
+import type { FileChange, SyncSummary, SyncView } from "./types";
 
 const change: FileChange = { path: "2026-11-16-1402-morning-run.md", kind: "modified" };
 const view = (patch: Partial<SyncView>): SyncView => ({ ...EMPTY_VIEW, connected: true, repo: "o/r", ...patch });
@@ -74,5 +84,64 @@ describe("commit message", () => {
     expect(isPushOnly(view({ ahead: 1, changes: [change] }))).toBe(false);
     expect(isPushOnly(view({}))).toBe(false);
     expect(isPushOnly({ ...EMPTY_VIEW, ahead: 1 })).toBe(false);
+  });
+});
+
+describe("a merge in progress", () => {
+  const merging = view({ behind: 2, changes: [change], merge: { conflicted: [change.path], startedByApp: true } });
+
+  it("disables Pull and Commit & Push, saying why", () => {
+    expect(pullButton(merging, [])).toMatchObject({ disabled: true, accent: false, title: MERGE_TITLE });
+    expect(commitButton(merging, [])).toMatchObject({ disabled: true, accent: false, hint: null, title: MERGE_TITLE });
+  });
+
+  it("Pull is enabled again once it is over", () => {
+    expect(pullButton({ ...merging, merge: null }, []).disabled).toBe(false);
+  });
+
+  it("Pull is disabled while a pull or another git change runs", () => {
+    expect(pullButton(view({}), ["pull"]).disabled).toBe(true);
+    expect(pullButton(view({}), ["apply"])).toMatchObject({ disabled: true, busy: true, title: "Updating files…" });
+    expect(pullButton(view({}), ["fetch"]).disabled).toBe(false);
+  });
+});
+
+describe("summary words", () => {
+  const summary = (patch: Partial<SyncSummary>): SyncSummary => ({
+    at: 0,
+    plan: "fast_forward",
+    incoming: [],
+    incomingCount: 3,
+    rebased: 0,
+    mergeCommit: null,
+    files: [change, { path: "b.md", kind: "added" }],
+    resolved: [],
+    ...patch,
+  });
+
+  it("counts commits and files, and says where unpushed commits went", () => {
+    expect(summaryText(summary({}))).toBe("Pulled 3 commits from GitHub · 2 files changed");
+    expect(summaryText(summary({ incomingCount: 1, files: [], rebased: 2, plan: "rebase" }))).toBe(
+      "Pulled 1 commit from GitHub · your 2 unpushed commits were placed after them",
+    );
+    expect(rebasedText({ rebased: 2, incomingCount: 3 })).toBe("Your 2 unpushed commits were placed after the 3 from GitHub.");
+    expect(rebasedText({ rebased: 1, incomingCount: 1 })).toBe("Your 1 unpushed commit was placed after the 1 from GitHub.");
+  });
+
+  it("says how long ago", () => {
+    const now = new Date(2026, 10, 19, 15, 0).getTime();
+    expect(relativeTime(now - 20_000, now)).toBe("just now");
+    expect(relativeTime(now - 5 * 60_000, now)).toBe("5 min ago");
+    expect(relativeTime(now - 3 * 3600_000, now)).toBe("3 h ago");
+    expect(relativeTime(new Date(2026, 10, 18, 23, 0).getTime(), now)).toBe("yesterday");
+  });
+});
+
+describe("errors", () => {
+  it("only real sync failures light the red dot", () => {
+    for (const kind of ["auth", "reauth", "network", "not_connected", "io", "git"]) expect(isSyncFailure(kind)).toBe(true);
+    for (const kind of ["stale_review", "merge_in_progress", "undo_refused", "invalid", "empty_message"]) {
+      expect(isSyncFailure(kind)).toBe(false);
+    }
   });
 });

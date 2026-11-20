@@ -1,12 +1,13 @@
 //! What the commands share: the journal, its git repository, settings and the GitHub sign-in.
 
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use mdgj_core::{ImageOpts, Journal, RemoteConfig, Settings};
-use mdgj_git::{Author, Creds, Repo, SyncState};
+use mdgj_git::{Author, Creds, FileDiff, Repo, SyncState};
 use mdgj_github::{
     DeviceCode, GitHub, Http, KeyringStore, ReqwestHttp, StoredAuth, TokenManager, TokenStore, User,
 };
@@ -43,13 +44,23 @@ pub struct AppState {
     last_error: Mutex<Option<Error>>,
 }
 
+/// Where the settings and the sign-in are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDir {
+    pub path: PathBuf,
+    /// Set by `MDGJ_CONFIG_DIR`: the sign-in is kept in a file in `path` and never in the OS
+    /// keyring, which is one item per user and would be shared by every instance.
+    pub file_only: bool,
+}
+
 impl AppState {
     pub fn open(app: &AppHandle) -> Result<Self> {
         let dir = journal_dir(app)?;
-        let config = app
-            .path()
-            .app_config_dir()
-            .map_err(|err| Error::io("could not find the settings folder", err))?;
+        let config = config_location(std::env::var_os("MDGJ_CONFIG_DIR"), || {
+            app.path()
+                .app_config_dir()
+                .map_err(|err| Error::io("could not find the settings folder", err))
+        })?;
         let state = Self::new(dir, &config)?;
         app.asset_protocol_scope()
             .allow_directory(state.journal.root().join("assets"), true)
@@ -58,14 +69,19 @@ impl AppState {
     }
 
     /// The journal in `dir`, with the settings and the sign-in kept in `config`.
-    fn new(dir: PathBuf, config: &Path) -> Result<Self> {
+    fn new(dir: PathBuf, config: &ConfigDir) -> Result<Self> {
         let journal = Journal::open(dir)?;
         let repo = Repo::open_or_init(journal.root())?;
         let reader = Repo::open_or_init(journal.root())?;
         // Only a safeguard: a journal that can't take it still opens.
         let _ = exclude_clutter(journal.root());
-        let settings_path = config.join("settings.json");
-        let store = KeyringStore::new(config.join("credentials.json"));
+        let settings_path = config.path.join("settings.json");
+        let credentials = config.path.join("credentials.json");
+        let store = if config.file_only {
+            KeyringStore::file_only(credentials)
+        } else {
+            KeyringStore::new(credentials)
+        };
         Ok(Self {
             journal,
             repo: Mutex::new(repo),
@@ -155,8 +171,15 @@ impl AppState {
         Ok(self.view(&repo, state))
     }
 
-    /// Runs a git operation that changes or checks the sync state, remembers whether it failed,
-    /// and sends the UI the new state either way.
+    /// One changed file against HEAD. Read-only, so like [`Self::sync_view`] it doesn't wait for an
+    /// operation in progress: the commit sheet shows diffs while a fetch is still out.
+    pub fn diff(&self, path: &str) -> Result<FileDiff> {
+        Ok(lock(&self.reader).diff(path)?)
+    }
+
+    /// Runs a git operation that changes or checks the sync state, remembers whether it failed
+    /// (only failures of the sync itself; see [`Kind::is_sync_failure`]), and sends the UI the new
+    /// state either way.
     pub fn sync<T>(
         &self,
         app: &AppHandle,
@@ -171,8 +194,9 @@ impl AppState {
                 Ok((view, value))
             }
             Err(err) => {
-                // An empty commit message is for the commit sheet to show, not a sync failure.
-                if err.kind != Kind::EmptyMessage {
+                // An empty message, a stale review or a refused Undo is for the sheet that asked
+                // to show; it leaves the red dot as it was.
+                if err.kind.is_sync_failure() {
                     *lock(&self.last_error) = Some(err.clone());
                 }
                 if let Ok(state) = repo.sync_state() {
@@ -235,6 +259,32 @@ fn journal_dir(app: &AppHandle) -> Result<PathBuf> {
     let base = app.path().app_data_dir();
     let base = base.map_err(|err| Error::io("could not find the app's data folder", err))?;
     Ok(base.join("journal"))
+}
+
+/// `MDGJ_CONFIG_DIR` (`env`) if set and not empty, made absolute and created if missing, with a
+/// file-only token store; else `default()`, the app's config folder, with the keyring.
+fn config_location(
+    env: Option<OsString>,
+    default: impl FnOnce() -> Result<PathBuf>,
+) -> Result<ConfigDir> {
+    let Some(dir) = env.filter(|dir| !dir.is_empty()) else {
+        return Ok(ConfigDir {
+            path: default()?,
+            file_only: false,
+        });
+    };
+    let path = std::path::absolute(dir)
+        .map_err(|err| Error::io("MDGJ_CONFIG_DIR is not a usable folder", err))?;
+    fs::create_dir_all(&path).map_err(|err| {
+        Error::io(
+            &format!("could not create MDGJ_CONFIG_DIR ({})", path.display()),
+            err,
+        )
+    })?;
+    Ok(ConfigDir {
+        path,
+        file_only: true,
+    })
 }
 
 /// Keeps files the user never wrote out of commits: the `.mdgj-tmp-*` files mdgj-core saves
@@ -533,10 +583,145 @@ mod tests {
         );
     }
 
+    /// A config folder as `MDGJ_CONFIG_DIR` gives: no keyring.
+    fn scratch_config(dir: &Path) -> ConfigDir {
+        ConfigDir {
+            path: dir.join("config"),
+            file_only: true,
+        }
+    }
+
+    /// Counts keyring entries built in this test binary, and fails each one, so no test can reach
+    /// the real keychain even by mistake.
+    fn keyring_builds() -> usize {
+        use std::any::Any;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Once;
+
+        use keyring::credential::{Credential, CredentialBuilderApi};
+
+        static BUILDS: AtomicUsize = AtomicUsize::new(0);
+        static INSTALL: Once = Once::new();
+        struct Counting;
+        impl CredentialBuilderApi for Counting {
+            fn build(&self, _: Option<&str>, _: &str, _: &str) -> keyring::Result<Box<Credential>> {
+                BUILDS.fetch_add(1, Ordering::SeqCst);
+                Err(keyring::Error::NoStorageAccess(
+                    "the shell's tests never use the real keychain".into(),
+                ))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        INSTALL.call_once(|| keyring::set_default_credential_builder(Box::new(Counting)));
+        BUILDS.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn config_dir_from_the_environment_is_absolute_created_and_file_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let wanted = dir.path().join("device-a/config");
+        let config = config_location(Some(wanted.clone().into()), || {
+            panic!("the app's folder isn't looked up when MDGJ_CONFIG_DIR is set")
+        })
+        .unwrap();
+        assert_eq!(
+            config,
+            ConfigDir {
+                path: wanted.clone(),
+                file_only: true
+            }
+        );
+        assert!(wanted.is_dir());
+
+        // Relative to the working directory, made absolute.
+        let relative = config_location(Some("mdgj-config-rel".into()), || unreachable!()).unwrap();
+        assert!(relative.path.is_absolute(), "{relative:?}");
+        assert!(relative.path.ends_with("mdgj-config-rel"));
+        let _ = fs::remove_dir(&relative.path);
+    }
+
+    #[test]
+    fn config_dir_defaults_to_the_apps_with_the_keyring() {
+        let default = || Ok(PathBuf::from("/app/config"));
+        for env in [None, Some(OsString::new())] {
+            assert_eq!(
+                config_location(env, default).unwrap(),
+                ConfigDir {
+                    path: "/app/config".into(),
+                    file_only: false
+                }
+            );
+        }
+        let err = config_location(None, || Err(Error::io("no folder", "none"))).unwrap_err();
+        assert_eq!(err.kind, Kind::Io);
+    }
+
+    #[test]
+    fn config_dir_that_cant_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        fs::write(&file, "").unwrap();
+        let err = config_location(Some(file.join("config").into()), || unreachable!()).unwrap_err();
+        assert_eq!(err.kind, Kind::Io);
+        assert!(err.message.contains("MDGJ_CONFIG_DIR"), "{err:?}");
+    }
+
+    #[test]
+    fn a_config_dir_keeps_settings_and_sign_in_without_the_keyring() {
+        let before = keyring_builds();
+        let dir = tempfile::tempdir().unwrap();
+        let config = scratch_config(dir.path());
+        let state = AppState::new(dir.path().join("journal"), &config).unwrap();
+        // "file" from the start: the keyring isn't tried and found wanting, it isn't there.
+        assert_eq!(state.tokens.store().backend(), "file");
+
+        let saved = state
+            .save_settings(Settings {
+                vim: true,
+                ..Settings::default()
+            })
+            .unwrap();
+        assert!(saved.vim);
+        assert!(config.path.join("settings.json").is_file());
+
+        let auth = StoredAuth {
+            kind: mdgj_github::AuthKind::Pat,
+            tokens: mdgj_github::Tokens {
+                access_token: "ghp_test".into(),
+                expires_at: None,
+                refresh_token: None,
+                refresh_expires_at: None,
+            },
+            login: Some("dcxSt".into()),
+        };
+        state.sign_in(&auth, None).unwrap();
+        let credentials = config.path.join("credentials.json");
+        assert!(credentials.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&credentials).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert_eq!(state.stored_auth().unwrap(), Some(auth));
+        assert_eq!(state.tokens.store().backend(), "file");
+
+        // A second instance with its own folder has its own (no) sign-in.
+        let other = tempfile::tempdir().unwrap();
+        let b = AppState::new(other.path().join("journal"), &scratch_config(other.path())).unwrap();
+        assert_eq!(b.stored_auth().unwrap(), None);
+
+        state.sign_out().unwrap();
+        assert!(!credentials.exists());
+        assert_eq!(keyring_builds(), before, "a keyring entry was built");
+    }
+
     #[test]
     fn sync_state_does_not_wait_for_a_git_operation() {
         let dir = tempfile::tempdir().unwrap();
-        let state = AppState::new(dir.path().join("journal"), &dir.path().join("config")).unwrap();
+        let state = AppState::new(dir.path().join("journal"), &scratch_config(dir.path())).unwrap();
         fs::write(state.journal.root().join("2026-11-16-1402-run.md"), "ran\n").unwrap();
         // As a fetch waiting on the network does.
         let busy = lock(&state.repo);
