@@ -20,7 +20,8 @@ A minimal, fast markdown journal for macOS, Linux and iPhone. Every entry is a p
 - Two views of the same text: **Source** (monospace, line numbers) and **Styled** (serif, markdown syntax kept but dimmed). Switching is instant and lossless.
 - One flat folder of entries named `yyyy-mm-dd-hhmm-title.md`; rename an entry by editing its title.
 - Git history built in. You write every commit message.
-- Optional GitHub sync. Pull merges your edits with incoming ones; a true conflict keeps both versions side by side (`…-title.conflict-hhmm.md`), so text is never lost and no conflict markers appear.
+- Optional GitHub sync where you stay in charge of merges. A file changed on only one side arrives at once, with a summary and **Undo**. A file changed on both sides waits for you in the **Sync review**: keep yours, keep GitHub's, keep both, or merge them in an editor that has already applied the edits that don't clash and asks only about the ones that do. Prefer vim or `git mergetool`? **Resolve with git** leaves an ordinary git merge for you to finish.
+- You choose which changed files go into each commit, and can look at each file's diff first.
 - Paste or drop images: they are stored in `assets/` as small JPEGs (longest side 1024 px, quality 60) with all metadata, including location, removed.
 - Filename and full-text search, word count, optional Vim keys, light and dark themes that follow the system.
 
@@ -78,7 +79,7 @@ For Arch, [`packaging/aur`](packaging/aur) has the PKGBUILDs of `mdgitjournal` (
 
 ```sh
 pnpm -C app tauri dev                                  # app with hot reload
-MDGJ_JOURNAL_DIR=/tmp/journal pnpm -C app tauri dev    # same, on a scratch journal
+MDGJ_JOURNAL_DIR=/tmp/journal MDGJ_CONFIG_DIR=/tmp/config pnpm -C app tauri dev  # same, on a scratch journal and sign-in
 pnpm -C app dev                                        # UI only, in a browser, on a mock backend
 ```
 
@@ -97,13 +98,23 @@ pnpm -C app e2e      # the UI in WebKit, on the mock backend; once: pnpm -C app 
 
 End-to-end tests that need github.com are marked `#[ignore]`, so these commands run offline.
 
+### Two devices on one machine
+
+To try syncing without a second computer, build the app (`pnpm -C app tauri build --bundles app` on macOS, `--no-bundle` on Linux) and run
+
+```sh
+scripts/two-devices.sh            # --reset starts from empty journals; --dev uses the debug build and `pnpm -C app dev`
+```
+
+It opens two windows, *mdgitjournal — Device A* and *— Device B*, each with its own journal, settings and sign-in under `~/mdgitjournal-test-devices/`, kept between runs. Sign in and connect both to the same (test) repository, then edit, commit and pull on either side. Your real journal and keychain are not touched.
+
 ## Connecting GitHub
 
 Optional. In **Settings › Connect GitHub**:
 
 1. **Sign in with GitHub.** The app shows a short code; approve it in the browser.
 2. **Install the mdgitjournal GitHub App on one repository**, e.g. a new private `journal` repository. The app can only see repositories you install it on.
-3. **Connect.** An empty repository receives your local history; an existing one is merged with it.
+3. **Connect.** An empty repository receives your local history. An existing one is pulled by the same rules as **Pull**: files only one side has arrive at once, and a file both sides have with different content waits for you in the Sync review.
 
 Alternatively, paste a fine-grained personal access token limited to that repository (*Contents: read and write*) and type `owner/repo`. Source builds without a registered GitHub App use this path. [docs/github-app.md](docs/github-app.md) covers both, including registering your own GitHub App.
 
@@ -112,6 +123,8 @@ Alternatively, paste a fine-grained personal access token limited to that reposi
 | Variable | When | Effect |
 |---|---|---|
 | `MDGJ_JOURNAL_DIR` | run time | Use this directory as the journal instead of the default. |
+| `MDGJ_CONFIG_DIR` | run time | Keep `settings.json` and the sign-in in this directory. The sign-in is then stored only in a `0600` file there, never in the keychain, so instances with different directories are fully separate. |
+| `MDGJ_DEVICE_NAME` | run time | Adds ` — <name>` to the window title, to tell instances apart. |
 | `MDGJ_GITHUB_CLIENT_ID` | build time | Client ID of the GitHub App to sign in with; overrides the one in `.cargo/config.toml`. Without either, only personal access tokens work. |
 | `MDGJ_GITHUB_APP_SLUG` | build time | URL name of that GitHub App, if it isn't `mdgitjournal`. |
 

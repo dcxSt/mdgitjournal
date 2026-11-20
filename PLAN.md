@@ -4,6 +4,8 @@ A minimal, fast markdown journal for **macOS, Linux and iPhone**. Out of the box
 
 Personal project of `dcxSt` (Stephen Fay). Bundle ID `xyz.stephenfay.mdgitjournal`, homepage `mdgitjournal.stephenfay.xyz`.
 
+Changes since v4: sync never merges, overwrites or copies a file changed on both sides without asking. Pull applies one-sided changes at once (with Undo) and opens a **Sync review** for the rest (§5); commits take a chosen subset of files, with diffs.
+
 Changes since v3: renamed to **mdgitjournal** · you write every commit message · serif, "wordcell" typography · Apple signing via your brother's developer team · repo public under MIT.
 
 Changes since v2:
@@ -89,8 +91,8 @@ The app is fully usable with no sign-in. Settings → **Connect GitHub**:
    - Permissions: *Contents: read & write* and *Metadata: read*, on **that repo only**.
 3. **Connect.** The app fetches the remote:
    - If the remote is empty, it pushes your local history.
-   - If the remote has history, it rebases your local commits on top of it. Unrelated histories are fine because filenames are unique.
-   - Any filename clash is resolved by the keep-both rule in §5.
+   - If the remote has history, it places your local commits after it, by the rules of a pull (§5). Unrelated histories are fine because filenames are unique.
+   - Any file that exists on both sides with different content goes through the Sync review in §5.
 4. **Tokens:**
    - The user token expires after 8 hours and is refreshed silently.
    - The refresh token lasts 6 months and rotates on every use, so you **sign in once per device**. You only need to sign in again if you don't open the app for 6 months, and it's one tap.
@@ -105,7 +107,13 @@ The GitHub App is registered by you, once, at github.com/settings/apps, using th
 
 Its client ID is public and is compiled in. Until you register it, the code uses a **placeholder** (`MDGJ_GITHUB_CLIENT_ID`). Source builders can supply their own.
 
-## 5. Sync: two buttons
+## 5. Sync: two buttons, and you decide
+
+The problem this app solves is editing on two devices. The rule:
+
+> **A file changed on only one side flows automatically. A file changed on both sides waits for you.**
+
+Nothing is merged, overwritten or copied without you seeing it, every pull can be undone, and the journal stays an ordinary git repository throughout.
 
 Without GitHub connected there is one button, **Commit**. It makes a local commit with a message.
 
@@ -116,23 +124,35 @@ With GitHub connected:
 | **⬇ Pull** | grey when up to date · **accent colour + badge** when the remote has new commits · spinner while busy · red dot when an error happened (tap to see it) |
 | **⬆ Commit & Push** | grey when nothing has changed · highlighted with a badge showing the number of changed files · **disabled with the hint "Pull first"** when the remote is ahead |
 
-The app runs `fetch` on launch, when it regains focus, and every 5 minutes (configurable or off). Pull-to-refresh on the phone also runs `fetch`.
+The app runs `fetch` on launch, when it regains focus, and every 5 minutes (configurable or off). Pull-to-refresh on the phone also runs `fetch`. Fetching only updates what the buttons show; it never changes your files.
 
 **Commit & Push:**
-1. A small sheet opens with the changed files and an **empty** message box that has focus. You write the message; it can't be empty. `⌘Enter`/`Enter` or the Commit & Push button confirms, and `Esc` cancels.
-2. The app fetches immediately before pushing.
-3. If something arrived in the meantime, nothing is pushed. The Pull button lights up. The commit is already made locally, so nothing is lost.
-4. If the push is rejected (a race with another device), the outcome is the same as step 3.
+1. A sheet lists the changed files, each with a **checkbox** (all ticked). Untick what shouldn't go in this commit. Click a file to see its **diff** against the last commit (images just say "image added/changed/deleted").
+2. The message box is **empty** and has focus. It can't be empty. `⌘Enter`/`Enter` or the button confirms, and `Esc` cancels. Without GitHub, **Commit** has the same sheet.
+3. The app fetches immediately before pushing. If something arrived in the meantime, or the push is rejected (a race with another device), nothing is pushed and the Pull button lights up. The commit is already made locally, so nothing is lost.
 
-**Pull is graceful, even with uncommitted edits:**
-1. If incoming changes touch **no files you've edited**, it is a plain fast-forward. Your edits are untouched. This is the usual case, since each entry is its own file.
-2. If the same file was edited on both sides, the app runs a **three-way merge** (libgit2 `merge_file`). Separate edits to different parts of the file merge cleanly, and the result stays in your working copy as uncommitted changes.
-3. If there is a **true conflict** (the same lines changed on both sides):
-   - The remote version wins at the original path.
-   - Your version is saved next to it as `…-title.conflict-hhmm.md`.
-   - A banner says so.
-   - **Text is never lost** and no conflict markers appear in your journal.
-4. Local commits that haven't been pushed are rebased onto the remote, using the same merge rules.
+**Pull, when only one side changed each file** (the usual case: each entry is its own file):
+1. The incoming changes are applied at once. Your uncommitted edits to other files are untouched.
+2. If you also have unpushed commits, they are placed after GitHub's, keeping history a straight line.
+3. A summary says what happened: "**3 commits from GitHub**", each with its message, author and time; the files that were added, updated, deleted or renamed; and, if it applies, "Your 2 unpushed commits were placed after the 3 from GitHub."
+4. The summary has **Undo**, which puts back exactly what was there before the pull: the branch and every file the pull touched. If you've edited one of those files since, Undo refuses and says which, rather than overwrite newer text.
+
+**Pull, when a file changed on both sides** (uncommitted or unpushed, even different paragraphs of one entry): **nothing changes on disk.** The **Sync review** opens instead:
+- Each file changed on both sides is listed (entries by title and date, other files by path) with a choice:
+  - **Keep mine** — your version stays.
+  - **Keep GitHub's** — GitHub's replaces yours.
+  - **Keep both** — yours stays; GitHub's is saved next to it as `…-title.from-github-hhmm.md`.
+  - **Merge…** — opens the merge view (text files only).
+  - A file deleted on one side and edited on the other offers just **Keep mine** and **Keep GitHub's** (which keeps or deletes it).
+- Below, collapsed, the files that changed on one side only, marked "will apply automatically", and GitHub's commits, so you see the whole picture.
+- A file whose edits don't clash (different paragraphs) starts out set to **Merge**, already prepared; one look and **Apply**. A file with a real clash has no default; Apply stays disabled until you choose.
+- **Apply** writes your choices. If you had unpushed commits that touched those files, it makes a real git merge commit, with the message prefilled ("Merge from GitHub" and what you chose for each file) and editable. Otherwise your resolved files are simply left as uncommitted changes on top of GitHub's commits, as your edits were before.
+- **Cancel** leaves everything exactly as it was.
+- If anything changed since the review opened (another fetch, an edit made elsewhere), Apply writes nothing, says "Something changed since you opened the review", and opens a fresh one.
+
+**The merge view** is one editable document, prefilled with the merge: changes from both sides that don't clash are already in, and highlighted (yours and GitHub's in different tints) so you can check them. Each real clash is a block showing both versions with **Use mine**, **Use GitHub's** and **Use both**. You can also edit freely. **Done** returns to the review. No conflict markers are ever written to your files this way.
+
+**Resolve with git** (in the review) is the escape hatch for people who'd rather use vim, `git mergetool` or the command line. It leaves a standard git merge in progress: conflict markers in the files, `MERGE_HEAD` set. If you have uncommitted edits, you first write a commit message for them, so git can merge them and Abort can restore them exactly. Until the merge is finished, a banner says "Merge in progress — finish it with git", Pull and Commit & Push are disabled, and **Abort merge** puts everything back as it was before the merge. When you finish the merge with git (`git commit`), the app notices and returns to normal.
 
 All git work runs on one Rust worker thread, so it never blocks the UI and operations never overlap.
 
@@ -237,10 +257,11 @@ The convention is to take a domain you own, reversed, so nobody else can collide
 ## 10. Repo layout
 
 ```
-crates/mdgj-{core,git,github}/      entries, slug, git ops, merge/conflict, github auth, keyring, images  (+ tests)
+crates/mdgj-{core,git,github}/      entries, slug, git ops, sync review & merges, github auth, keyring, images  (+ tests)
 app/src-tauri/        Tauri commands, worker thread, events; tauri.conf (mac/linux/ios)
-app/src/              Svelte UI: Sidebar, EntryHeader, SyncBar, CommitSheet, Settings, ConnectGitHub, Search
-app/src/editor/       CodeMirror setup, source theme, styled-mode decorations, vim, image paste
+app/src/              Svelte UI: Sidebar, EntryHeader, SyncBar, CommitSheet, SyncReview, MergeView, Settings, ConnectGitHub, Search
+app/src/editor/       CodeMirror setup, source theme, styled-mode decorations, vim, image paste, merge editor
+scripts/              two-devices.sh: two instances on one Mac, as Device A and Device B
 docs/                 github-app.md, architecture.md, privacy.md
 packaging/aur/        PKGBUILD
 .github/workflows/    ci.yml (lint, test, build mac/linux/ios-sim), release.yml
@@ -250,13 +271,14 @@ packaging/aur/        PKGBUILD
 
 - **`mdgj-*` crates unit tests:**
   - slug, filename parse/format, rename keeps the timestamp
-  - collision and conflict naming
+  - collision naming, and `.from-github-hhmm` names for Keep both
   - image pipeline: output under 200 KB for a 12 MP test photo, EXIF stripped, orientation applied
 - **`mdgj-*` crates integration tests** against local bare repos:
   - init, commit, connect to an empty remote, connect to a non-empty remote
   - fetch with ahead/behind counts
   - Commit & Push blocked when behind
-  - pull with dirty unrelated files, a clean three-way merge, and a true conflict (keep-both)
+  - pull with dirty unrelated files (applied at once), diverged commits (rebased) and Undo
+  - files changed on both sides: the review changes nothing until Apply; every choice; the merge view's prefill; a stale review; Resolve with git, Abort, and finishing it with the git CLI
   - push rejected after a race
 - **Editor tests:**
   - load → toggle mode N times → save gives byte-identical output (property test, including CRLF and a missing trailing newline)
@@ -265,6 +287,7 @@ packaging/aur/        PKGBUILD
   - `tauri build` on macOS, launched and screenshotted
   - Linux build in CI
   - `tauri ios build` for the **Simulator**, launched and screenshotted
+- **Two devices on one machine:** `scripts/two-devices.sh` starts two instances with separate journals, settings and sign-ins (`MDGJ_JOURNAL_DIR`, `MDGJ_CONFIG_DIR`), titled "— Device A" and "— Device B", for trying every sync path by hand.
 - **Real end-to-end:** blocked until the GitHub App is registered (placeholder ID). The plumbing will be tested against `dcxSt/mdgitjournal-test` using a `gh` token through the same HTTPS code path. Device flow itself gets a manual test once you've registered the app.
 
 ## 12. Risks
@@ -276,7 +299,7 @@ packaging/aur/        PKGBUILD
 ## 13. Build order
 
 1. `mdgj-*` crates: entries and slug, local git (init/commit), images.
-2. `mdgj-*` crates: remote ops (fetch, ahead/behind, pull with merge and keep-both, push, connect), tested on local bare repos.
+2. `mdgj-*` crates: remote ops (fetch, ahead/behind, pull with review, resolutions and undo, push, connect), tested on local bare repos.
 3. GitHub auth: device flow, refresh, keyring, repo list/create, behind a trait.
 4. Tauri shell: commands, worker, sync-state events.
 5. Editor: Source + Vim, Styled decorations, lossless tests, image paste.
