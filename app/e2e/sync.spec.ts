@@ -25,15 +25,18 @@ const commitButton = (page: Page) => footer(page).getByRole("button", { name: /^
 const review = (page: Page) => page.getByRole("dialog", { name: "Sync review" });
 const choices = (page: Page, title: string) => review(page).getByRole("group", { name: `What to keep of ${title}` });
 
-/** Opens an entry from the sidebar and puts the cursor at the end of its `line`th line. */
+/**
+ * Opens the entry `title` and types `text` at the end of its `line`th line (1-based). The cursor
+ * gets there by a click, not by keys: Ctrl+Home and wrapped lines don't behave alike on every
+ * platform (on Linux CI the text once landed at the end of the document).
+ */
 async function typeAtLine(page: Page, title: string, line: number, text: string) {
   await page.getByRole("navigation", { name: "Entries" }).getByRole("button", { name: new RegExp(title) }).click();
   await expect(page.getByLabel("Title")).toHaveValue(title);
-  const mod = await modKey(page);
-  await page.locator(".cm-content").click();
-  await page.keyboard.press(`${mod}+Home`);
-  for (let i = 1; i < line; i++) await page.keyboard.press("ArrowDown");
-  await page.keyboard.press("End");
+  const target = page.locator(".cm-content .cm-line").nth(line - 1);
+  const box = (await target.boundingBox())!;
+  // Bottom right: the end of the line, even if it wraps.
+  await target.click({ position: { x: box.width - 2, y: box.height - 2 } });
   await page.keyboard.type(text);
 }
 
@@ -126,10 +129,9 @@ test("different paragraphs: the review prefills the merge, the merge view shows 
 test("a clash needs a choice before Apply; the merge view picks one, and Done takes it", async ({ page }) => {
   await connected(page);
   const mod = await modKey(page);
-  await typeAtLine(page, "ideas", 1, "");
-  await page.keyboard.press(`${mod}+End`);
-  await page.keyboard.type("Typed here.");
-  await expect.poll(() => fileText(page, IDEAS)).toContain("Typed here.");
+  // The empty line after the last paragraph: right where GitHub appended its line.
+  await typeAtLine(page, "ideas", 6, "Typed here.");
+  await expect.poll(() => fileText(page, IDEAS)).toContain("**Bold** thoughts and _quiet_ ones.\nTyped here.");
 
   await pullButton(page).click();
   const apply = review(page).getByRole("button", { name: "Apply" });
